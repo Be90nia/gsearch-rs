@@ -164,3 +164,13 @@ pub fn spawn_handler(handler: Handler) -> tokio::task::JoinHandle<()> {
         }
     })
 }
+
+/// 关 Chrome 并等进程死透。chromiumoxide 0.9 的 close 只 background kill，
+/// 不调 wait() 直接 Drop 会报 "was not closed manually" WARN，且 profile 锁残留。
+/// 顶层命令（search/browse/login/dl）+ shell 退出统一走这条，避免下一次 launch 撞 profile 锁。
+pub async fn graceful_close(browser: &mut Browser) {
+    if let Err(e) = browser.close().await {
+        tracing::warn!("close browser 失败: {e}");
+    }
+    let _ = browser.wait().await;
+}

@@ -17,7 +17,18 @@ use chromiumoxide::browser::Browser;
 use gsearch::browser;
 use gsearch::output::print_text;
 use gsearch::search::{SearchConfig, is_captcha, run_search};
+use gsearch::skeleton::{extract_adaptive, format_adaptive, format_headings_only, format_json};
 use gsearch::types::SearchResult;
+use gsearch::util::{b64_decode, filename_from_url};
+
+/// M9 shell `read` / `browse` 选项集。与 postproc::ReadOpts / general::BrowseOpts 字段一致。
+#[derive(Debug, Clone, Default)]
+struct ReadShellOpts {
+    full: bool,
+    json: bool,
+    headings_only: bool,
+    from: usize,
+}
 
 const TEXT_MAX_CHARS: usize = 5000;
 const PAGE_TIMEOUT_SECS: u64 = 30;
@@ -85,7 +96,6 @@ pub async fn run_shell() -> Result<ExitCode> {
             }
         }
     }
-
     graceful_close(&mut ctx.browser).await;
     Ok(ExitCode::SUCCESS)
 }
@@ -98,7 +108,8 @@ async fn graceful_close(browser: &mut Browser) {
     let _ = browser.wait().await;
 }
 
-/// 分派单条 shell 命令到具体 handler。命令名不识别走 error。
+
+/// 分派单条 shell 命令
 async fn dispatch(cmd: &str, args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     match cmd {
         "help" | "?" => {
@@ -128,7 +139,8 @@ fn print_help() {
         "shell 命令集：\n\
          search <query> [--limit N]   Google 搜索，结果存入 last_results\n\
          click <N> / open <N>         跳到 last_results[N-1].url\n\
-         read                         打印当前页 body.innerText（前 5000 字）\n\
+         read                         打印当前页（默认 AdaptiveRead 三段）\n\
+         read [--full|--json|--headings-only|--from K]   同 read，但切换输出模式\n\
          dl [N]                       下载 last_results[N-1].url（N 缺省走 current_url）\n\
          browse <url>                 goto <url> 并更新 current_url\n\
          login <url>                  切有头窗人工登录；关窗后提示是否切回 headless\n\
@@ -183,6 +195,28 @@ fn parse_search_args(args: &[&str]) -> Result<(String, usize)> {
     Ok((query_parts.join(" "), limit))
 }
 
+/// shell `read` / `browse` 通用 flag → ReadShellOpts。支持 `--full` / `--json` / `--headings-only` / `--from K`。
+/// 与顶层 CLI 的 flag 名一致（agent 心智统一）；非零退出码 = 错误（含未知 flag）。
+fn parse_shell_read_opts(args: &[&str], cmd_name: &str) -> Result<ReadShellOpts> {
+    let mut opts = ReadShellOpts::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--full" => opts.full = true,
+            "--json" => opts.json = true,
+            "--headings-only" => opts.headings_only = true,
+            "--from" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| anyhow!("--from 缺值"))?;
+                opts.from = v.parse().map_err(|_| anyhow!("--from 非数字: {v:?}"))?;
+            }
+            other => return Err(anyhow!("{cmd_name} 未知 flag: {other:?}")),
+        }
+        i += 1;
+    }
+    Ok(opts)
+}
+
 async fn cmd_click(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     let n = args.first().ok_or_else(|| anyhow!("click 缺 N"))?;
     let n: usize = n.parse().map_err(|_| anyhow!("click N 非数字: {n:?}"))?;
@@ -196,12 +230,26 @@ async fn cmd_click(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_read(_args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
+async fn cmd_read(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
+    let opts = parse_shell_read_opts(args, "read")?;
     let html = ctx.page.content().await.unwrap_or_default();
     if is_captcha(&html) {
         return Err(anyhow!(
             "当前页遇 CAPTCHA：用 `login <url>` 切有头窗人工验证后再回 shell"
         ));
+    }
+    // --full：纯 innerText 5000 字
+    if opts.full {
+        let text = ctx
+            .page
+            .evaluate("document.body.innerText")
+            .await?
+            .into_value::<String>()
+            .unwrap_or_default();
+        let text: String = text.chars().take(TEXT_MAX_CHARS).collect();
+        let cur = if ctx.current_url.is_empty() { "(未设)" } else { &ctx.current_url };
+        println!("=== {cur} ===\n{text}");
+        return Ok(());
     }
     let title = ctx
         .page
@@ -209,15 +257,17 @@ async fn cmd_read(_args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
         .await?
         .into_value::<String>()
         .unwrap_or_default();
-    let text = ctx
-        .page
-        .evaluate("document.body.innerText")
-        .await?
-        .into_value::<String>()
-        .unwrap_or_default();
-    let text: String = text.chars().take(TEXT_MAX_CHARS).collect();
-    let cur = if ctx.current_url.is_empty() { "(未设)" } else { &ctx.current_url };
-    println!("=== {cur} | {title} ===\n{text}");
+    let mut read = extract_adaptive(&html);
+    read.url = if ctx.current_url.is_empty() { "(未设)".into() } else { ctx.current_url.clone() };
+    read.title = title;
+    let out = if opts.json {
+        format_json(&read)
+    } else if opts.headings_only {
+        format_headings_only(&read)
+    } else {
+        format_adaptive(&read, opts.from)
+    };
+    println!("{out}");
     Ok(())
 }
 
@@ -405,48 +455,6 @@ async fn goto(page: &Page, url: &str) -> Result<()> {
     Ok(())
 }
 
-/// 手写 base64 解码：标准字母表 + '=' padding，无空白（输入来自页面 btoa）。
-/// 不引 base64 crate，20 行手写，postproc.rs 同款逻辑（那边私有不跨模块）。
-fn b64_decode(s: &str) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let mut acc: u32 = 0;
-    let mut bits = 0u32;
-    for c in s.chars() {
-        if c == '=' {
-            break;
-        }
-        let v = match c {
-            'A'..='Z' => c as u32 - 'A' as u32,
-            'a'..='z' => c as u32 - 'a' as u32 + 26,
-            '0'..='9' => c as u32 - '0' as u32 + 52,
-            '+' => 62,
-            '/' => 63,
-            _ => return Err(anyhow!("base64 非法字符 {c:?}")),
-        };
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Ok(out)
-}
-
-/// URL 末段文件名（去 query/hash、剥 scheme://authority）；空则 download.bin。
-fn filename_from_url(url: &str) -> String {
-    let path = url.split(['#', '?']).next().unwrap_or(url);
-    let path = match path.find("://") {
-        Some(i) => path[i + 3..].find('/').map_or("", |j| &path[i + 3 + j..]),
-        None => path,
-    };
-    let last = path.rsplit('/').next().unwrap_or("");
-    if last.is_empty() {
-        "download.bin".into()
-    } else {
-        last.into()
-    }
-}
 
 #[cfg(test)]
 mod tests {

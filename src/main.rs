@@ -43,11 +43,19 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Google 搜索（M2 实现）
+    /// Google 搜索（M2 实现；M9 `--read N` 默认 AdaptiveRead）
     Search(SearchArgs),
-    /// 任意 URL → 渲染后页面 title（M1 主验收点）
+    /// 任意 URL → 渲染后页面正文（M1 主验收点；M9 默认 AdaptiveRead）
     Browse {
         url: String,
+        #[arg(long, default_value_t = false)]
+        full: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long)]
+        from: Option<usize>,
+        #[arg(long, default_value_t = false)]
+        headings_only: bool,
     },
     /// 有头窗人工登录，cookie 落 profile
     Login {
@@ -68,14 +76,24 @@ struct SearchArgs {
     query: String,
     #[arg(long, default_value_t = 10)]
     limit: usize,
-    #[arg(long, default_value_t = false)]
-    json: bool,
     #[arg(long)]
     read: Option<usize>,
     #[arg(long)]
     dl: Option<usize>,
     #[arg(long)]
     open: Option<usize>,
+    /// `--read N` 输出兜底纯 innerText（5000 字截断），覆盖默认 AdaptiveRead
+    #[arg(long, default_value_t = false)]
+    full: bool,
+    /// `--read N` 输出 AdaptiveRead 结构化 JSON
+    #[arg(long, default_value_t = false)]
+    json: bool,
+    /// `--read N --from K`：摘要段从第 K 段开始（1-based；默认 0 = 从首段）
+    #[arg(long)]
+    from: Option<usize>,
+    /// `--read N --headings-only`：只输出目录（最省 token fast path）
+    #[arg(long, default_value_t = false)]
+    headings_only: bool,
 }
 
 fn init_tracing() {
@@ -95,7 +113,15 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result: Result<ExitCode> = match cli.cmd {
         Command::Search(args) => cmd_search(args).await,
-        Command::Browse { url } => general::cmd_browse(&url).await,
+        Command::Browse { url, full, json, from, headings_only } => {
+            let opts = general::BrowseOpts {
+                full,
+                json,
+                from: from.unwrap_or(0),
+                headings_only,
+            };
+            general::cmd_browse(&url, &opts).await
+        }
         Command::Login { url } => general::cmd_login(&url).await,
         Command::Dl { url, output } => general::cmd_dl(&url, output.as_deref()).await,
         Command::Shell => shell::run_shell().await,
@@ -141,7 +167,17 @@ async fn cmd_search(args: SearchArgs) -> Result<ExitCode> {
             postproc::open(&results, n)?;
         }
         if let Some(n) = args.read {
-            postproc::read(&browser, &results, n).await?;
+            let opts = postproc::ReadOpts {
+                full: args.full,
+                json: args.json,
+                headings_only: args.headings_only,
+                from: args.from.unwrap_or(0),
+            };
+            if opts.full {
+                postproc::read_full(&browser, &results, n).await?;
+            } else {
+                postproc::read(&browser, &results, n, &opts).await?;
+            }
         }
         if let Some(n) = args.dl {
             postproc::dl(&browser, &results, n).await?;
@@ -150,15 +186,14 @@ async fn cmd_search(args: SearchArgs) -> Result<ExitCode> {
     }
     .await;
 
-    let close = browser.close().await;
-    // 等 Chrome 进程真死透，避免下一进程 launch 撞 profile 锁（M7 发现 45 残留）
+    if let Err(e) = browser.close().await {
+        tracing::warn!("close browser 失败: {e}");
+    }
     let _ = browser.wait().await;
     if let Err(e) = post {
-        // 后处理错误（越界/跨源/超时等）exit 2，与"未找到结果"同档；优先于 close 错误上报
         eprintln!("error: {e}");
         return Ok(ExitCode::from(2));
     }
-    close?;
 
     if results.is_empty() {
         eprintln!("未找到结果");

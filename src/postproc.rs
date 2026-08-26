@@ -1,5 +1,9 @@
 //! M4 搜索结果后处理：`--open N` / `--read N` / `--dl N`（PLAN §3.4 / §3.5）。
 //! 复用 cmd_search 已启动的同一 browser 实例（同 profile → 同 cookie），不另起 Chrome。
+//!
+//! M9：`--read N` 默认输出 AdaptiveRead（按文章结构自适应三段：目录/摘要/段落索引），
+//! `--full` 拿纯 innerText 5000 字（兜底），`--json` 拿结构化 JSON，`--from K` 摘要偏移，
+//! `--headings-only` 仅目录。
 
 use std::time::Duration;
 
@@ -7,11 +11,12 @@ use anyhow::{Result, anyhow};
 use chromiumoxide::browser::Browser;
 
 use gsearch::search::is_captcha;
+use gsearch::skeleton::{extract_adaptive, format_adaptive, format_headings_only, format_json};
 use gsearch::types::SearchResult;
+use gsearch::util::{b64_decode, filename_from_url};
 
-const READ_MAX_CHARS: usize = 5000;
+const READ_FULL_MAX_CHARS: usize = 5000;
 const PAGE_TIMEOUT_SECS: u64 = 30;
-/// 提醒阈值：同源 fetch→base64 全程在 JS 字符串里搬运，几十 MB 起内存/CPU 吃紧
 const DL_LARGE_BYTES: usize = 50_000_000;
 
 /// `--{flag} N` 下标校验：1-based；0 或超出结果数报错（含结果数为 0 的情况）
@@ -22,8 +27,7 @@ fn pick<'a>(results: &'a [SearchResult], n: usize, flag: &str) -> Result<&'a str
     Ok(&results[n - 1].url)
 }
 
-/// `--open N`：默认浏览器开窗。PLAN §3.4：`cmd /c start "" url`（空标题参数防 url 被当窗口名）。
-/// spawn 失败只 warn——不该阻挡已打印的搜索结果。
+/// `--open N`：默认浏览器开窗。
 pub fn open(results: &[SearchResult], n: usize) -> Result<()> {
     let url = pick(results, n, "open")?;
     if let Err(e) = std::process::Command::new("cmd")
@@ -35,9 +39,22 @@ pub fn open(results: &[SearchResult], n: usize) -> Result<()> {
     Ok(())
 }
 
-/// `--read N`：同一 browser 新开页签 goto → `document.body.innerText` 截 5000 字打印（PLAN §3.4）。
-/// 返回截断后的正文（集成测试断言用；CLI 路径丢弃）。
-pub async fn read(browser: &Browser, results: &[SearchResult], n: usize) -> Result<String> {
+/// `--read N` 选项集。M9：默认 AdaptiveRead，`--full/--json/--headings-only/--from K` 互斥选择。
+#[derive(Debug, Clone, Default)]
+pub struct ReadOpts {
+    pub full: bool,
+    pub json: bool,
+    pub headings_only: bool,
+    pub from: usize,
+}
+
+/// `--read N`：M9 默认走 AdaptiveRead（按文章结构自适应）。opts 见 ReadOpts。
+pub async fn read(
+    browser: &Browser,
+    results: &[SearchResult],
+    n: usize,
+    opts: &ReadOpts,
+) -> Result<String> {
     let url = pick(results, n, "read")?;
     let page = browser.new_page("about:blank").await?;
     tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
@@ -46,41 +63,77 @@ pub async fn read(browser: &Browser, results: &[SearchResult], n: usize) -> Resu
         .map_err(|e| anyhow!("goto {url} 失败（浏览器被手关？）: {e}"))?;
 
     if is_captcha(&page.content().await.unwrap_or_default()) {
-        // ponytail: M4 后处理不接 CAPTCHA 人解钩子（搜索正常时结果页极少撞码），撞到直接报错；
-        // 需要时把 search.rs 的 poll_until_solved 提为 pub 复用（M6 范围）。
         return Err(anyhow!("{url} 遇 CAPTCHA，M4 后处理不支持人解，请重试或手动浏览器打开"));
     }
 
+    if opts.full {
+        return read_full_inner(&page, url).await;
+    }
+
+    let title = page
+        .evaluate("document.title")
+        .await?
+        .into_value::<String>()
+        .unwrap_or_default();
+    let html = page.content().await.unwrap_or_default();
+    let mut read = extract_adaptive(&html);
+    read.url = url.to_string();
+    read.title = title;
+
+    let out = if opts.json {
+        format_json(&read)
+    } else if opts.headings_only {
+        format_headings_only(&read)
+    } else {
+        format_adaptive(&read, opts.from)
+    };
+    println!("{out}");
+    Ok(out)
+}
+
+/// `--read N --full` 兜底：纯 innerText 5000 字。
+pub async fn read_full(browser: &Browser, results: &[SearchResult], n: usize) -> Result<String> {
+    let url = pick(results, n, "read")?;
+    let page = browser.new_page("about:blank").await?;
+    tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
+        .await
+        .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
+        .map_err(|e| anyhow!("goto {url} 失败（浏览器被手关？）: {e}"))?;
+
+    if is_captcha(&page.content().await.unwrap_or_default()) {
+        return Err(anyhow!("{url} 遇 CAPTCHA，M4 后处理不支持人解，请重试或手动浏览器打开"));
+    }
+
+    read_full_inner(&page, url).await
+}
+
+/// 共享 innerText 5000 字截断 + 打印。
+async fn read_full_inner(page: &chromiumoxide::Page, url: &str) -> Result<String> {
     let txt = page
         .evaluate("document.body.innerText")
         .await?
         .into_value::<String>()
         .unwrap_or_default();
-    let txt: String = txt.chars().take(READ_MAX_CHARS).collect();
+    let txt: String = txt.chars().take(READ_FULL_MAX_CHARS).collect();
     println!("=== {url} ===\n{txt}");
     Ok(txt)
 }
 
-/// `--dl N`：走浏览器 cookie 的简化下载（PLAN §3.5 dl 的 M4/M6 最小交集）。
-/// 先 goto 目标页建立同源环境，再页面内 `fetch(credentials:'include')` 取字节 → base64 回传落盘。
+/// `--dl N`：走浏览器 cookie 的简化下载。
 pub async fn dl(browser: &Browser, results: &[SearchResult], n: usize) -> Result<()> {
     let url = pick(results, n, "dl")?;
     let page = browser.new_page("about:blank").await?;
-    // 直接文件 URL（PDF/zip 等）的 goto 可能因触发下载导航被 abort——不致命，同源 fetch 仍可尝试
     let _ = tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url)).await;
-    // url 来自 SERP href，已 percent-encode，单引号注入基本不可能（ponytail：不额外转义）
-    // 注意：必须用 `async function ()` 而非 `async () =>`——chromiumoxide 的函数探测
-    // is_likely_js_function 不认 async 箭头（skip_args 只匹配原串 '(' 开头），会把箭头函数
-    // 当 Expression 求值 → 返回函数对象被序列化成 {} → into_value::<String> 报 invalid type: map
     let js = format!(
         "async function () {{
-            const r = await fetch('{url}', {{credentials: 'include'}});
+            const r = await fetch({}, {{credentials: 'include'}});
             const b = await r.arrayBuffer();
             const u8 = new Uint8Array(b);
             let s = '';
             for (const x of u8) s += String.fromCharCode(x);
             return btoa(s);
-        }}"
+        }}",
+        serde_json::to_string(url)?
     );
     let b64 = page
         .evaluate(js)
@@ -107,70 +160,9 @@ pub async fn dl(browser: &Browser, results: &[SearchResult], n: usize) -> Result
     Ok(())
 }
 
-/// 手写标准 base64 解码：输入来自页面 `btoa()`（标准字母表 + '=' padding，无空白）。
-/// PLAN §1 依赖表无 base64 crate，这 20 行不值得破表加依赖。
-fn b64_decode(s: &str) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let mut acc: u32 = 0;
-    let mut bits = 0u32;
-    for c in s.chars() {
-        if c == '=' {
-            break;
-        }
-        let v = match c {
-            'A'..='Z' => c as u32 - 'A' as u32,
-            'a'..='z' => c as u32 - 'a' as u32 + 26,
-            '0'..='9' => c as u32 - '0' as u32 + 52,
-            '+' => 62,
-            '/' => 63,
-            _ => return Err(anyhow!("base64 非法字符 {c:?}")),
-        };
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Ok(out)
-}
-
-/// 文件名 = URL 路径最后一段（去 query/hash、剥 scheme://authority）；为空（裸 origin/尾斜杠）则 download.bin（PLAN §3.4）。
-fn filename_from_url(url: &str) -> String {
-    let path = url.split(['#', '?']).next().unwrap_or(url);
-    let path = match path.find("://") {
-        Some(i) => path[i + 3..].find('/').map_or("", |j| &path[i + 3 + j..]),
-        None => path,
-    };
-    let last = path.rsplit('/').next().unwrap_or("");
-    if last.is_empty() {
-        "download.bin".to_string()
-    } else {
-        last.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn b64_decode_known_vectors() {
-        assert_eq!(b64_decode("").unwrap(), b"");
-        assert_eq!(b64_decode("QQ==").unwrap(), b"A");
-        assert_eq!(b64_decode("QUJD").unwrap(), b"ABC");
-        assert_eq!(b64_decode("SGVsbG8sIFdvcmxkIQ==").unwrap(), b"Hello, World!");
-        assert_eq!(b64_decode("/w==").unwrap(), vec![0xff]);
-        assert!(b64_decode("aGk*").is_err());
-    }
-
-    #[test]
-    fn filename_from_url_cases() {
-        assert_eq!(filename_from_url("https://x.com/a/b/file.pdf?x=1#frag"), "file.pdf");
-        assert_eq!(filename_from_url("https://x.com/"), "download.bin");
-        assert_eq!(filename_from_url("https://x.com/a/"), "download.bin");
-        assert_eq!(filename_from_url("https://x.com"), "download.bin");
-    }
 
     #[test]
     fn pick_bounds() {
@@ -184,12 +176,35 @@ mod tests {
         assert_eq!(pick(&r, 1, "read").unwrap(), "u");
         assert!(pick(&[], 1, "read").is_err());
     }
+
+    /// PM 契约：postproc.rs tests 加 skeleton_extract_cases（h1/h2/h3 各提取 + 段数 + first_chars）。
+    /// M9 升级为：直接验证 AdaptiveRead 三个核心行为（短文 / 中等 / 长文自适应）。
+    /// 测试 HTML 通过 in-memory 字符串驱动，不启 Chrome → CI 安全。
+    #[test]
+    fn skeleton_extract_cases() {
+        use gsearch::skeleton::extract_adaptive;
+        let html = r#"<!doctype html><html><head><title>T</title></head><body>
+<h1>One</h1>
+<p>p1 alpha.</p>
+<h2>Two</h2>
+<p>p2 bravo charlie delta echo.</p>
+<h3>Three</h3>
+<p>p3.</p>
+</body></html>"#;
+        let r = extract_adaptive(html);
+        assert_eq!(r.headings.len(), 3);
+        assert_eq!(r.headings[0].level, 1);
+        assert_eq!(r.headings[0].text, "One");
+        assert_eq!(r.headings[1].level, 2);
+        assert_eq!(r.headings[2].level, 3);
+        assert_eq!(r.paragraph_index.len(), 3);
+        assert!(r.paragraph_index[0].char_count > 0);
+    }
 }
 
 #[cfg(test)]
 mod live_tests {
-    //! 免 Google 集成测试（PM 决策 2026-08-26：IP 被 Google 临时封禁不可控，端到端留 PM S7 亲跑）。
-    //! 真 Chrome + https://example.com 直测 postproc 三函数。
+    //! 免 Google 集成测试。
 
     use super::*;
 
@@ -208,15 +223,17 @@ mod live_tests {
         let _h = gsearch::browser::spawn_handler(handler);
         let results = fixture();
 
-        // 越界：空结果集 read(1) → Err 含 "越界"
-        let err = read(&browser, &[], 1).await.unwrap_err();
+        let err = read(&browser, &[], 1, &ReadOpts::default()).await.unwrap_err();
         assert!(err.to_string().contains("越界"), "got: {err}");
 
-        // read：innerText 含 "Example Domain"
-        let txt = read(&browser, &results, 1).await.unwrap();
-        assert!(txt.contains("Example Domain"), "read got: {txt:?}");
+        let txt = read(&browser, &results, 1, &ReadOpts::default()).await.unwrap();
+        assert!(txt.contains("[目录]"), "default read missing [目录]: {txt:?}");
+        assert!(txt.contains("[摘要"), "default read missing [摘要]: {txt:?}");
+        assert!(txt.contains("Example Domain"), "default read got: {txt:?}");
 
-        // dl：同源 fetch → base64 → 落盘 size>0 且内容正确（根路径 → download.bin）
+        let txt = read_full(&browser, &results, 1).await.unwrap();
+        assert!(txt.contains("Example Domain"), "read_full got: {txt:?}");
+
         dl(&browser, &results, 1).await.unwrap();
         let bytes = std::fs::read("download.bin").unwrap();
         assert!(!bytes.is_empty());
@@ -228,7 +245,6 @@ mod live_tests {
         std::fs::remove_file("download.bin").unwrap();
     }
 
-    /// open：cmd /c start 机制 exit 0 + postproc::open 不报错（会弹一个默认浏览器窗口，PM 授权）
     #[test]
     fn open_mechanism() {
         let st = std::process::Command::new("cmd")
