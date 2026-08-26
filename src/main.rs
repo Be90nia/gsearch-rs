@@ -108,14 +108,15 @@ struct SearchArgs {
     query: String,
     #[arg(long, default_value_t = 10)]
     limit: usize,
-    #[arg(long)]
+    /// `--open / --read / --dl` 互斥：每次只能指定一个；不可同时传。
+    #[arg(long, group = "post")]
     read: Option<usize>,
-    #[arg(long)]
+    #[arg(long, group = "post")]
     dl: Option<usize>,
-    #[arg(long)]
+    #[arg(long, group = "post")]
     open: Option<usize>,
-    #[arg(long, default_value_t = false)]
     /// 启用 fingerprint 补丁 + Google 搜索前 warmup（opt-in；新 profile/裸搜可能撞码时建议 off）。
+    #[arg(long, default_value_t = false)]
     humanize: bool,
     /// `--read N` 输出兜底纯 innerText（5000 字截断），覆盖默认 AdaptiveRead
     #[arg(long, default_value_t = false)]
@@ -202,11 +203,8 @@ mod tests {
         assert!(!gsearch::search::is_captcha("normal results"));
     }
 }
+
 async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode> {
-    // 互斥检查放最前：撞码场景下 search 会卡 120s，但互斥错应立刻拒绝（不让用户等）。
-    let n_post = [args.open.is_some(), args.read.is_some(), args.dl.is_some()]
-        .iter().filter(|x| **x).count();
-    anyhow::ensure!(n_post <= 1, "--open / --read / --dl 互斥，每次只能指定一个（当前 {n_post} 个）");
     let browser_kind = browser_arg_to_kind(args.browser);
     let (mut browser, handler) = gsearch::browser::launch_with_kind_proxy(true, browser_kind, proxy)
         .await
@@ -231,11 +229,8 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     } else {
         gsearch::output::print_text(&results);
     }
-
-    // M4 后处理（PLAN §3.4）：--open / --read / --dl 互斥（复用同一 browser + profile cookie）
+    // M4 后处理（PLAN §3.4）：clap ArgGroup \"post\" 保证 --open/--read/--dl 互斥；仅剩运行时分发。
     let post = async {
-        let n_post = [args.open.is_some(), args.read.is_some(), args.dl.is_some()].iter().filter(|x| **x).count();
-        anyhow::ensure!(n_post <= 1, "--open / --read / --dl 互斥，每次只能指定一个（当前 {n_post} 个）");
         if let Some(n) = args.open {
             postproc::open(&results, n)?;
         }
