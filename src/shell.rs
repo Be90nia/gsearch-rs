@@ -391,16 +391,12 @@ async fn cmd_login(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     }
     Ok(())
 }
-
-/// 内联 swap_to_headed 逻辑：search.rs 私有 + 不允许改 search.rs。
+/// close 当前 browser 并同 profile 起重起有头实例。
 /// 等价 plsearch AppContext.reveal_for_captcha（main.py:133-137）。
 async fn swap_to_headed(browser: &mut Browser) -> Result<()> {
-    browser.close().await.map_err(|e| anyhow!("close 当前 browser 失败: {e}"))?;
-    let (new_browser, handler) = browser::launch(false).await?;
-    *browser = new_browser;
-    browser::spawn_handler(handler);
-    Ok(())
+    browser::swap_to_headed(browser).await
 }
+
 
 async fn browser_alive(browser: &Browser) -> bool {
     browser.version().await.is_ok()

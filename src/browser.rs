@@ -172,6 +172,17 @@ pub async fn launch(headless: bool) -> Result<(Browser, Handler)> {
     launch_with_kind(headless, None).await
 }
 
+/// close 当前 browser 并同 profile 起重起**有头**实例。
+/// CAPTCHA 双模式（M3）核心：cookie 落盘保留（Playwright 做不到热切换，同款方案）。
+/// 等价 plsearch AppContext.reveal_for_captcha（main.py:133-137）。
+pub async fn swap_to_headed(browser: &mut Browser) -> Result<()> {
+    browser.close().await.map_err(|e| anyhow!("close 当前 browser 失败: {e}"))?;
+    let (new_browser, handler) = launch(false).await?;
+    *browser = new_browser;
+    spawn_handler(handler);
+    Ok(())
+}
+
 /// 启动浏览器并返回 (Browser, Handler)。`kind = None` 自动兑底；
 /// `kind = Some(_)` 时若指定浏览器不可用则兑底到第一个可用浏览器（不报错）。
 pub async fn launch_with_kind(headless: bool, kind: Option<BrowserKind>) -> Result<(Browser, Handler)> {

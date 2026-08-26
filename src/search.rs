@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow};
 use chromiumoxide::Page;
 use chromiumoxide::browser::Browser;
 
-use crate::browser::{self, spawn_handler};
+use crate::browser;
 use crate::parse::parse_serp;
 use crate::types::SearchResult;
 
@@ -126,11 +126,7 @@ pub async fn run_search_on_page(
 /// close 当前 browser 并同 profile 起重起有头实例。
 /// 等价 plsearch AppContext.reveal_for_captcha（main.py:133-137）。
 async fn swap_to_headed(browser: &mut Browser) -> Result<()> {
-    browser.close().await.map_err(|e| anyhow!("close 当前 browser 失败: {e}"))?;
-    let (new_browser, handler) = browser::launch(false).await?;
-    *browser = new_browser;
-    spawn_handler(handler);
-    Ok(())
+    browser::swap_to_headed(browser).await
 }
 
 /// 轮询 page content 直到非 captcha 或超时。等价 plsearch wait_until_captcha_solved（config.py:117-139）。
@@ -138,6 +134,7 @@ async fn swap_to_headed(browser: &mut Browser) -> Result<()> {
 /// 返回 Some(html) 表示解完；None 表示超时；Err 表示浏览器已被手关（连接断开）。
 async fn poll_until_solved(page: &Page, timeout_secs: u64) -> Result<Option<String>> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut since_last_log = 0u64;
     loop {
         match page.content().await {
             Ok(html) if !is_captcha(&html) => return Ok(Some(html)),
@@ -150,6 +147,12 @@ async fn poll_until_solved(page: &Page, timeout_secs: u64) -> Result<Option<Stri
             tracing::warn!("CAPTCHA 亲解超时");
             return Ok(None);
         }
+        // 心跳：每 15s 报一次剩余时间（120s 默认下用户会看到 8 条进度）。
+        if since_last_log == 0 || since_last_log.is_multiple_of(15) {
+            let remaining = (deadline - Instant::now()).as_secs();
+            tracing::info!("CAPTCHA 轮询中（还剩约 {remaining}s/{timeout_secs}s，解完请关窗）");
+        }
+        since_last_log += CAPTCHA_POLL_SECS;
         tokio::time::sleep(Duration::from_secs(CAPTCHA_POLL_SECS)).await;
     }
 }

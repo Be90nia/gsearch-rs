@@ -35,7 +35,6 @@ pub struct BrowseOpts {
     pub headings_only: bool,
     pub from: usize,
     /// M11 浏览器选择；None = 自动检测
-    /// M11 浏览器选择；None = 自动检测
     pub browser: Option<BrowserKind>,
 }
 

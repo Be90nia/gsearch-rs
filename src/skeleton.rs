@@ -125,7 +125,7 @@ fn first_sentence(p: &str) -> String {
         }
         // ASCII 标点要求后随空白 / 串尾；全角直接切
         let ok = if is_ascii_punct {
-            chars.get(i + 1).map_or(true, |&nx| nx.is_whitespace())
+            chars.get(i + 1).is_none_or(|&nx| nx.is_whitespace())
         } else {
             true
         };

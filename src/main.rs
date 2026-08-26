@@ -196,6 +196,10 @@ mod tests {
     }
 }
 async fn cmd_search(args: SearchArgs) -> Result<ExitCode> {
+    // 互斥检查放最前：撞码场景下 search 会卡 120s，但互斥错应立刻拒绝（不让用户等）。
+    let n_post = [args.open.is_some(), args.read.is_some(), args.dl.is_some()]
+        .iter().filter(|x| **x).count();
+    anyhow::ensure!(n_post <= 1, "--open / --read / --dl 互斥，每次只能指定一个（当前 {n_post} 个）");
     let browser_kind = browser_arg_to_kind(args.browser);
     let (mut browser, handler) = gsearch::browser::launch_with_kind(true, browser_kind)
         .await
@@ -221,8 +225,10 @@ async fn cmd_search(args: SearchArgs) -> Result<ExitCode> {
         gsearch::output::print_text(&results);
     }
 
-    // M4 后处理（PLAN §3.4）：--open/--read/--dl 独立判断、可并存，复用同一 browser（同 profile cookie）
+    // M4 后处理（PLAN §3.4）：--open / --read / --dl 互斥（复用同一 browser + profile cookie）
     let post = async {
+        let n_post = [args.open.is_some(), args.read.is_some(), args.dl.is_some()].iter().filter(|x| **x).count();
+        anyhow::ensure!(n_post <= 1, "--open / --read / --dl 互斥，每次只能指定一个（当前 {n_post} 个）");
         if let Some(n) = args.open {
             postproc::open(&results, n)?;
         }
@@ -251,10 +257,8 @@ async fn cmd_search(args: SearchArgs) -> Result<ExitCode> {
     }
     let _ = browser.wait().await;
     if let Err(e) = post {
-        eprintln!("error: {e}");
-        return Ok(ExitCode::from(2));
+        eprintln!("postproc 失败: {e}");
     }
-
     if results.is_empty() {
         eprintln!("未找到结果");
         Ok(ExitCode::from(2))
@@ -274,13 +278,15 @@ fn browser_arg_to_kind(arg: BrowserArg) -> Option<gsearch::browser::BrowserKind>
 /// doctor 总耗时 <3s；不启动 Chrome。每项输出 `[OK] 描述 + 路径 / [WARN] ... / [FAIL] ...`。
 /// 全部 OK 退出 0；任意 FAIL 退出 1；仅 WARN 退出 0。
 async fn cmd_doctor() -> Result<ExitCode> {
+    let started = std::time::Instant::now();
     println!("gsearch doctor");
     let mut fail = 0;
     let mut warn = 0;
 
     // 1) Chrome 可用
-    let chrome_ok = match gsearch::browser::BrowserKind::Chrome {
-        k => find_with_kind_display(k),
+    let chrome_ok = {
+        let k = gsearch::browser::BrowserKind::Chrome;
+        find_with_kind_display(k)
     };
     match &chrome_ok {
         Some(_) => println!("[ OK ] Chrome: {}", chrome_ok.as_ref().unwrap()),
@@ -365,14 +371,15 @@ async fn cmd_doctor() -> Result<ExitCode> {
         _ => println!("[ OK ] GSEARCH_PROFILE 未设置（默认 ~/.gsearch/profiles/default/）"),
     }
 
+    let elapsed_ms = started.elapsed().as_millis();
     if fail > 0 {
-        println!("\n[{fail} 项 FAIL] 检查上面建议。");
+        println!("\n[{fail} 项 FAIL] 检查上面建议。（耗时 {elapsed_ms}ms）");
         Ok(ExitCode::from(1))
     } else if warn > 0 {
-        println!("\n[{warn} 项 WARN] 整体可用。");
+        println!("\n[{warn} 项 WARN] 整体可用。（耗时 {elapsed_ms}ms）");
         Ok(ExitCode::SUCCESS)
     } else {
-        println!("\n所有检查通过 ✓");
+        println!("\n所有检查通过 ✓（耗时 {elapsed_ms}ms）");
         Ok(ExitCode::SUCCESS)
     }
 }
