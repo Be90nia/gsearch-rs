@@ -215,6 +215,8 @@ mod tests {
 #[cfg(test)]
 mod live_tests {
     //! 免 Google 集成测试。
+    //! 起真 Chrome 且独占 profile：并行会因 profile 锁竞态挂（ExitStatus(21)），
+    //! 必须串行跑 `cargo test -- --test-threads=1`（CI 已 skip live，不受影响）。
 
     use super::*;
 

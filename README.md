@@ -132,3 +132,11 @@ cargo build --release
 ## 设计
 
 项目根 PLAN.md 为权威设计文档。
+
+## License
+
+MIT，见 [LICENSE](LICENSE)。
+
+## Companion tools
+
+需要多搜索引擎 provider（Bing / DuckDuckGo / Brave 等）互补时，推荐搭配 paperfoot 或 search-cli；gsearch 专注 Google 搜索 + 通用浏览器代理这一条单刀路径。

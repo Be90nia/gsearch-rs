@@ -176,10 +176,10 @@ fn report_from_headers(headers: &str) -> Option<(u16, Vec<String>)> {
             if let Some(code) = line.split_whitespace().nth(1).and_then(|t| t.parse().ok()) {
                 status = Some(code);
             }
-        } else if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("location") {
-                pending = Some(value.trim().to_owned());
-            }
+        } else if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("location")
+        {
+            pending = Some(value.trim().to_owned());
         }
     }
     status.map(|s| (s, chain))

@@ -202,7 +202,20 @@ fn profile_name(raw: &str) -> Result<String> {
     if name.is_empty() || name == ".." || name == "." || name == "/" {
         return Err(anyhow!("GSEARCH_PROFILE 路径末段非法: {raw:?}"));
     }
+    if is_windows_reserved(name) {
+        return Err(anyhow!("GSEARCH_PROFILE 是 Windows 保留设备名: {raw:?}"));
+    }
     Ok(name.to_owned())
+}
+
+/// Windows 保留设备名（CON/NUL/PRN/AUX/COM1-9/LPT1-9，含 `CON.txt` 带扩展形态）：
+/// 作目录名在 Windows 上非法/行为未定义；profile 会 zip 换机携带，全平台统一拒绝。
+fn is_windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    match stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT")) {
+        Some(d) => d.len() == 1 && (b'1'..=b'9').contains(&d.as_bytes()[0]),
+        None => matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL"),
+    }
 }
 
 /// M14-1B：取 meta 头部用的 profile 末段名（不创建目录、纯查询）。
@@ -280,6 +293,23 @@ pub async fn launch_with_kind(headless: bool, kind: Option<BrowserKind>) -> Resu
     launch_with_kind_proxy(headless, kind, proxy).await
 }
 
+
+/// 代理串凭据脱敏：`scheme://user:pass@host` 的 userinfo 段（含只有 user 的形态）
+/// 整段替换为 `***`，无凭据原样返回。打日志前必走，防凭据进 CI/用户贴出的日志。
+fn redact_proxy(proxy: &str) -> String {
+    let Some(scheme_end) = proxy.find("://") else {
+        return proxy.to_owned();
+    };
+    let auth_start = scheme_end + 3;
+    // authority 段止于首个 '/'；密码里未编码的 '@' 按 URL 惯例取最后一个
+    let auth_end = proxy[auth_start..]
+        .find('/')
+        .map_or(proxy.len(), |i| auth_start + i);
+    match proxy[auth_start..auth_end].rfind('@') {
+        Some(at) => format!("{}***{}", &proxy[..auth_start], &proxy[auth_start + at..]),
+        None => proxy.to_owned(),
+    }
+}
 /// 启动浏览器并返回 (Browser, Handler)。`kind = None` 自动兑底；`proxy = None` 不走代理。
 /// ponytail: 拆出 `proxy` 参数主要为了让上层调用不关心 env 细节（CLI 也走同一路径）。
 pub async fn launch_with_kind_proxy(
@@ -307,7 +337,7 @@ pub async fn launch_with_kind_proxy(
         .disable_default_args();
     if let Some(proxy) = &proxy {
         // ponytail: Chrome 只识别 --proxy-server=protocol://host:port；不引 chromiumoxide proxy builder（M12 调试期足以）。
-        tracing::info!("代理: {proxy}");
+        tracing::info!("代理: {}", redact_proxy(proxy));
         builder = builder.arg(format!("--proxy-server={proxy}"));
     }
     let safe_args: &[&str] = if headless {
@@ -458,7 +488,7 @@ pub async fn graceful_close(browser: &mut Browser) {
 
 #[cfg(test)]
 mod tests {
-    use super::profile_name;
+    use super::{profile_name, redact_proxy};
 
     #[test]
     fn profile_name_uses_last_path_component() {
@@ -466,6 +496,27 @@ mod tests {
         assert_eq!(profile_name("D:/foo/bar/").unwrap(), "bar");
         assert!(profile_name("..").is_err());
         assert!(profile_name("/").is_err());
+    }
+    /// Windows 保留设备名作目录名非法（profile 会 zip 换机携带，全平台统一拒）。
+    #[test]
+    fn profile_name_rejects_windows_reserved_names() {
+        for bad in ["CON", "con", "NUL", "nul", "PRN", "Aux", "COM1", "com9", "LPT1", "lpt9"] {
+            assert!(profile_name(bad).is_err(), "应拒绝 Windows 保留名: {bad}");
+        }
+        assert!(profile_name("C:/x/CON.txt").is_err(), "带扩展名的保留名形态也应拒绝");
+    }
+
+    #[test]
+    fn redact_proxy_masks_userinfo() {
+        // 带凭据 / 只有 user：userinfo 段整段替换为 ***
+        assert_eq!(redact_proxy("http://user:pass@proxy.example.com:8080"), "http://***@proxy.example.com:8080");
+        assert_eq!(redact_proxy("socks5://alice@10.0.0.1:1080"), "socks5://***@10.0.0.1:1080");
+        assert_eq!(redact_proxy("http://u:p@h:1/api"), "http://***@h:1/api");
+    }
+
+    #[test]
+    fn redact_proxy_keeps_credential_free_input() {
+        assert_eq!(redact_proxy("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
     }
 }
 

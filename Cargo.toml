@@ -2,6 +2,7 @@
 name = "gsearch"
 version = "0.2.0"
 edition = "2024"
+license = "MIT"
 
 [features]
 # M14-2A chaser-stealth：默认关闭。on 时 launch 层启用 transport stealth（CDP 序列补丁）。
