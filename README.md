@@ -28,6 +28,39 @@ gsearch dl    https://.../file.pdf -o DIR   # 下载到指定目录（不存在�
 - **dl**：CDP `Browser.setDownloadBehavior` 走 Chrome 原生下载（登录态、重定向、大文件均支持）；
   渲染型 URL（普通网页不触发下载）自动回退页内 fetch 落盘（同源 cookie），默认存当前目录
 
+### shell（交互模式，可选）
+
+`gsearch shell` 起一次 Chrome 后台会话，prompt `gsearch> ` 持续读 stdin，cookie / 页面状态跨命令延续。
+单 exe 「用完即走」原则不破：shell 是可选模式，顶层一次性命令全部保留。
+
+```
+$ gsearch shell
+进入 gsearch shell（输入 help 查命令，exit / quit / Ctrl+D 退出）
+gsearch> search python asyncio --limit 2
+1. asyncio — Asynchronous I/O
+   https://docs.python.org/3/library/asyncio.html
+   ...
+2. Python's asyncio: A Hands-On Walkthrough
+   https://realpython.com/async-io-python/
+   ...
+gsearch> click 1
+已跳转到: https://docs.python.org/3/library/asyncio.html
+gsearch> read
+=== https://docs.python.org/3/library/asyncio.html | asyncio — Asynchronous I/O === ...
+gsearch> status
+current_url : https://docs.python.org/3/library/asyncio.html
+title       : asyncio — Asynchronous I/O
+results     : 2
+profile     : C:\Users\Begonia\AppData\Local\gsearch\profile
+gsearch> dl                # 下载 current_url 到当前目录（按 URL 末段自动命名）
+已下载: asyncio.html (25375 bytes)
+gsearch> <Ctrl+D>          # EOF 优雅退出，Chrome 自动关
+```
+
+可用命令：`search <query> [--limit N]` / `click <N>`（或 `open <N>`）/ `read` / `dl [N]` / `browse <url>` /
+`login <url>` / `back` / `status` / `help` / `exit` / `quit`。
+EOF（Ctrl+D / Ctrl+Z+Enter）才真正退出；单条命令出错只打印 `error:` 不退出 shell。
+
 ### Profile
 
 - 路径优先级：env `GSEARCH_PROFILE` > `%LOCALAPPDATA%/gsearch/profile`

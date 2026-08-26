@@ -1,23 +1,43 @@
-# Build artifacts
-target/
+# ─── Rust / Cargo ───
+/target/
 **/*.rs.bk
+*.pdb
 
-# Test artifacts
-1Mb.dat
-download.bin
-*.bin
-target/s7-dl/
-target/shell-test.txt
-target/test-profile-marker
-target/err*.log
-target/race*.log
+# ─── 测试 / 临时产物（根目录散落）───
+/err*.log
+/json-out.txt
+/asyncio.html
+/1Mb.dat
+/download.bin
+/headless-clear*.ps1
+/headless-open*.ps1
+/test-profile-marker
 
-# OS / IDE
+# 测试 profile + 临时目录
+/target/dl-test/
+/target/m2-fresh*/
+/target/s1-fresh/
+/target/s7-dl/
+/target/serp-dump.html
+/target/shell-test.txt
+/target/test-profile-marker
+/target/err*.log
+/target/race*.log
+/target/headed-*.ps1
+/target/flycheck0/
+
+# ─── 知识图谱 / 本地状态 ───
+/.codebase-memory/
+
+# ─── OS / IDE ───
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
 *.swp
+*.swo
 
-# Local env
+# ─── 本地环境 ───
 .env
+.env.*
+!.env.example
