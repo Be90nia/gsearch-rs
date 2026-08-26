@@ -10,6 +10,7 @@ use tracing_subscriber::EnvFilter;
 mod general;
 mod postproc;
 mod shell;
+mod stealth;
 
 // Windows 控制台 UTF-8：让 println! / eprintln! 正确输出中文标题与 SERP 摘要。
 // 走 extern "system" 直接调 Win32，不引 windows-sys（PLAN §1 依赖表未列）。
@@ -70,7 +71,6 @@ enum Command {
     /// 交互式 shell：起一次 Chrome 会话复用（M7 追加里程碑）
     Shell,
 }
-
 #[derive(Args, Debug)]
 struct SearchArgs {
     query: String,
@@ -82,6 +82,9 @@ struct SearchArgs {
     dl: Option<usize>,
     #[arg(long)]
     open: Option<usize>,
+    #[arg(long, default_value_t = false)]
+    /// 启用 fingerprint 补丁 + Google 搜索前 warmup（opt-in；新 profile/裸搜可能撞码时建议 off）。
+    humanize: bool,
     /// `--read N` 输出兜底纯 innerText（5000 字截断），覆盖默认 AdaptiveRead
     #[arg(long, default_value_t = false)]
     full: bool,
@@ -139,22 +142,47 @@ async fn main() -> ExitCode {
         }
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn humanize_defaults_to_false() {
+        let cli = Cli::try_parse_from(["gsearch", "search", "test"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert!(!args.humanize);
+    }
+
+    #[test]
+    fn captcha_prompts_are_detected_case_insensitively() {
+        assert!(gsearch::search::unusual_traffic("UnUsUaL TrAfFiC"));
+        assert!(gsearch::search::is_captcha("Our systems have detected traffic"));
+        assert!(gsearch::search::is_captcha("/sorry/index?x=1"));
+        assert!(!gsearch::search::is_captcha("normal results"));
+    }
+}
 
 async fn cmd_search(args: SearchArgs) -> Result<ExitCode> {
     let (mut browser, handler) = gsearch::browser::launch(true)
         .await
         .context("启动 Chrome 失败：检查 GSEARCH_CHROME 是否指向 chrome.exe，或 profile 被另一实例占用")?;
     let _h = gsearch::browser::spawn_handler(handler);
+    let page = browser.new_page("about:blank").await?;
+    if args.humanize {
+        stealth::install_init_script(&page).await?;
+        stealth::warmup(&page).await?;
+    }
 
-    let results = gsearch::search::run_search(
+    let results = gsearch::search::run_search_on_page(
         &mut browser,
         gsearch::search::SearchConfig {
             query: args.query,
             limit: args.limit,
         },
+        page,
     )
     .await?;
-
     if args.json {
         gsearch::output::print_json(&results)?;
     } else {

@@ -9,10 +9,13 @@ Google 搜索 + 通用浏览器代理 CLI：单 exe、零扩展、零运行时�
 ```
 gsearch search "python asyncio" --limit 10
 gsearch search "fastapi tutorial" --json
-gsearch search "..." --read 1   # 读第 1 条正文
-gsearch search "..." --dl 1     # 下载第 1 个文件（走同源 cookie）
-gsearch search "..." --open 1   # 弹默认浏览器打开第 1 条
+gsearch search "..." --humanize=false   # 跳过搜索前 warmup
+gsearch search "..." --read 1
+gsearch search "..." --dl 1
+gsearch search "..." --open 1
 ```
+
+`--humanize` 默认启用：Google 搜索前随机访问 Wikipedia/GitHub/HN，滚动并短暂停留；指纹补丁仅用于 search，不改变 browse/login。
 
 ### browse / login / dl（通用代理）
 
@@ -63,14 +66,15 @@ EOF（Ctrl+D / Ctrl+Z+Enter）才真正退出；单条命令出错只打印 `err
 
 ### Profile
 
-- 路径优先级：env `GSEARCH_PROFILE` > `%LOCALAPPDATA%/gsearch/profile`
+- 默认命名 profile：`~/.gsearch/profiles/default/`
+- `GSEARCH_PROFILE=work`：使用 `~/.gsearch/profiles/work/`；`GSEARCH_PROFILE=D:/foo/bar/` 使用末段 `bar`
+- 空的末段、`..` 或根路径会报错，不回退覆盖已有 profile
 - 首次冷启动养号，可能遇 CAPTCHA，人工解一次后养熟
 - Profile 可整目录 zip 携走，换机只需放同位置
-- 本机已有 `D:/Sdk/plsearch-profile` 是 Python 版养的号，设 env 即可继承
 
 ### 环境变量
 
-- `GSEARCH_PROFILE`：覆盖默认 profile 路径
+- `GSEARCH_PROFILE`：profile 名或任意输入路径（统一取末段名）
 - `GSEARCH_CHROME`：覆盖默认 Chrome 路径
 - `RUST_LOG=debug`：查详细信息
 

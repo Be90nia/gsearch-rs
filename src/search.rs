@@ -28,18 +28,32 @@ pub struct SearchConfig {
     pub limit: usize,
 }
 
-/// CAPTCHA 子串判定（plsearch config.py:112-114 is_captcha_page）。
 pub fn is_captcha(html: &str) -> bool {
-    html.contains("captcha-form") || html.contains("recaptcha")
+    html.contains("captcha-form")
+        || html.contains("recaptcha")
+        || unusual_traffic(html)
+}
+
+pub fn unusual_traffic(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    lower.contains("unusual traffic")
+        || lower.contains("our systems have detected")
+        || lower.contains("/sorry/index")
 }
 
 /// 翻页搜索直到凑满 limit / 空页 / 打满 MAX_PAGES；中途首页撞 CAPTCHA 切有头轮询等人解。
-/// `&mut Browser`：撞码时 close + relaunch（headless=false）；同一 profile 保 cookie（PLAN §3.1）。
 pub async fn run_search(browser: &mut Browser, cfg: SearchConfig) -> Result<Vec<SearchResult>> {
     let page = browser.new_page("about:blank").await?;
-    let mut collected: Vec<SearchResult> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    run_search_on_page(browser, cfg, page).await
+}
 
+pub async fn run_search_on_page(
+    browser: &mut Browser,
+    cfg: SearchConfig,
+    page: Page,
+) -> Result<Vec<SearchResult>> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut collected: Vec<SearchResult> = Vec::new();
     tracing::info!("搜索 {:?}（limit={}）", cfg.query, cfg.limit);
     'pages: for page_idx in 0..MAX_PAGES {
         if collected.len() >= cfg.limit {
@@ -149,6 +163,24 @@ async fn load(page: &Page, url: &str) -> Result<String> {
     .await
     .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
     .map_err(|e| anyhow!("加载 {url} 失败: {e}"))
+}
+#[cfg(test)]
+mod tests {
+    use super::{is_captcha, unusual_traffic};
+
+    #[test]
+    fn captcha_prompts_are_early_detected() {
+        assert!(is_captcha("<p>Unusual traffic from your computer network</p>"));
+        assert!(is_captcha("Our systems have detected unusual traffic"));
+        assert!(is_captcha("<title>Google</title><a href=\"/sorry/index?x=1\">"));
+        assert!(!is_captcha("ordinary search results"));
+    }
+
+    #[test]
+    fn unusual_traffic_is_case_insensitive() {
+        assert!(unusual_traffic("Our Systems Have Detected traffic"));
+        assert!(unusual_traffic("UNUSUAL TRAFFIC"));
+    }
 }
 
 /// 查询串 percent-encode，等价 Python `urllib.parse.quote`（字母数字与 -_.~/ 直通，其余 %XX）。

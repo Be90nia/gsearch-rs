@@ -45,21 +45,27 @@ pub fn find_chrome() -> Result<PathBuf> {
     ))
 }
 
-/// Profile 目录：env `GSEARCH_PROFILE` > `%LOCALAPPDATA%/gsearch/profile`，不存在则自动创建。
+/// Profile 目录：env `GSEARCH_PROFILE` 取末段名放进 `~/.gsearch/profiles/`，未设时用 `default`。
 pub fn profile_dir() -> Result<PathBuf> {
-    let path = std::env::var("GSEARCH_PROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let local = std::env::var("LOCALAPPDATA")
-                .context("LOCALAPPDATA env 未设置，无法定位默认 profile 目录")
-                .unwrap();
-            PathBuf::from(local).join("gsearch").join("profile")
-        });
-    // Chrome 对相对 --user-data-dir 按自身进程 CWD 解析（实测 Windows 上起不来），
-    // 统一转绝对路径；不检查存在性，纯词法拼接。
-    let path = std::path::absolute(path)?;
+    let name = match std::env::var("GSEARCH_PROFILE") {
+        Ok(raw) if !raw.trim().is_empty() => profile_name(&raw)?,
+        _ => "default".to_owned(),
+    };
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .context("HOME/USERPROFILE env 未设置，无法定位默认 profile 目录")?;
+    let path = std::path::absolute(PathBuf::from(home).join(".gsearch").join("profiles").join(name))?;
     ensure_dir(&path)?;
     Ok(path)
+}
+
+fn profile_name(raw: &str) -> Result<String> {
+    let path = Path::new(raw.trim()).to_path_buf();
+    let name = path.file_name().and_then(|part| part.to_str()).unwrap_or_default();
+    if name.is_empty() || name == ".." || name == "." || name == "/" {
+        return Err(anyhow!("GSEARCH_PROFILE 路径末段非法: {raw:?}"));
+    }
+    Ok(name.to_owned())
 }
 
 fn ensure_dir(path: &Path) -> Result<()> {
@@ -173,4 +179,17 @@ pub async fn graceful_close(browser: &mut Browser) {
         tracing::warn!("close browser 失败: {e}");
     }
     let _ = browser.wait().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::profile_name;
+
+    #[test]
+    fn profile_name_uses_last_path_component() {
+        assert_eq!(profile_name("work").unwrap(), "work");
+        assert_eq!(profile_name("D:/foo/bar/").unwrap(), "bar");
+        assert!(profile_name("..").is_err());
+        assert!(profile_name("/").is_err());
+    }
 }
