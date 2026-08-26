@@ -1,0 +1,23 @@
+# Build artifacts
+target/
+**/*.rs.bk
+
+# Test artifacts
+1Mb.dat
+download.bin
+*.bin
+target/s7-dl/
+target/shell-test.txt
+target/test-profile-marker
+target/err*.log
+target/race*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Local env
+.env
