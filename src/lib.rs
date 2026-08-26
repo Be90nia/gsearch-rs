@@ -5,5 +5,6 @@ pub mod parse;
 pub mod search;
 pub mod types;
 pub mod util;
+pub mod verify;
 
 pub use types::SearchResult;

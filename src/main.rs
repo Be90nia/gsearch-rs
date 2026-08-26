@@ -102,6 +102,13 @@ enum Command {
     Shell,
     /// 检测浏览器 / profile / 网络连通性 / 出口 IP（M11 doctor）
     Doctor,
+    /// HEADless URL 健康检查：HEAD/GET + redirect 链 + SSL + 延迟（M14-1A，无需 Chrome）
+    Verify {
+        url: String,
+        /// 输出结构化 JSON（默认人类可读 text）
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 #[derive(Args, Debug)]
 struct SearchArgs {
@@ -172,6 +179,7 @@ async fn main() -> ExitCode {
         Command::Dl { url, output, browser } => general::cmd_dl(&url, output.as_deref(), browser.into(), proxy.clone()).await,
         Command::Shell => shell::run_shell().await,
         Command::Doctor => cmd_doctor().await,
+        Command::Verify { url, json } => gsearch::verify::cmd_verify(&url, json, proxy.as_deref()),
     };
 
     match result {
@@ -188,8 +196,21 @@ async fn main() -> ExitCode {
 }
 
 async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode> {
+    let started = std::time::Instant::now();
+    // M14-1B：早解析浏览器路径 → meta 头部字段（与 launch 实际选用的 kind 一致）。
     let browser_kind = browser_arg_to_kind(args.browser);
-    let (mut browser, handler) = gsearch::browser::launch_with_kind_proxy(true, browser_kind, proxy)
+    let (browser_path, resolved_kind) = match browser_kind {
+        Some(k) => gsearch::browser::find_specific(k)
+            .or_else(|| gsearch::browser::find_browser().ok())
+            .unwrap_or_else(|| {
+                // 兑底：连 find_browser 都失败 → 留空让下面 launch 自己报错。
+                (std::path::PathBuf::new(), k)
+            }),
+        None => gsearch::browser::find_browser().unwrap_or_else(|_| {
+            (std::path::PathBuf::new(), gsearch::browser::BrowserKind::Chrome)
+        }),
+    };
+    let (mut browser, handler) = gsearch::browser::launch_with_kind_proxy(true, browser_kind, proxy.clone())
         .await
         .context("启动 Chrome/Edge 失败：检查 GSEARCH_CHROME 是否指向 chrome.exe/msedge.exe，或 profile 被另一实例占用")?;
     let _h = gsearch::browser::spawn_handler(handler);
@@ -201,14 +222,31 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     let results = gsearch::search::run_search_on_page(
         &mut browser,
         gsearch::search::SearchConfig {
-            query: args.query,
+            query: args.query.clone(),
             limit: args.limit,
         },
         page,
     )
     .await?;
     if args.json {
-        gsearch::output::print_json(&results)?;
+        // M14-1B：--json 输出 self-describing 信封 `{meta, results}`。query 填查询串；
+        // browse / dl 留空（schema 唯一对应 search 的 [{title,url,snippet}...] 形状）。
+        let meta = gsearch::types::MetaOutput {
+            tool: "gsearch",
+            version: env!("CARGO_PKG_VERSION"),
+            query: args.query.clone(),
+            profile: gsearch::browser::profile_name_only(),
+            browser_kind: format!("{resolved_kind:?}"),
+            browser_path: browser_path.to_string_lossy().into_owned(),
+            proxy: proxy.clone(),
+            humanize: args.humanize,
+            limit: args.limit,
+            elapsed_ms: started.elapsed().as_millis(),
+            results_count: results.len(),
+            truncated: results.len() >= args.limit,
+        };
+        let envelope = gsearch::types::OutputEnvelope { meta, results: &results };
+        gsearch::output::print_envelope_json(&envelope)?;
     } else {
         gsearch::output::print_text(&results);
     }
@@ -470,5 +508,18 @@ mod tests {
         // 单用 OK
         let r = Cli::try_parse_from(["gsearch", "search", "x", "--read", "1"]);
         assert!(r.is_ok(), "--read 单用应通过");
+    }
+
+    /// M14-1A：verify 子命令 + --json flag 正常解析。
+    #[test]
+    fn verify_subcommand_parses_with_json_flag() {
+        let cli = Cli::try_parse_from(["gsearch", "verify", "https://example.com", "--json"]).unwrap();
+        let Command::Verify { url, json } = cli.cmd else { panic!("expected verify") };
+        assert_eq!(url, "https://example.com");
+        assert!(json);
+        // 不带 flag 默认 text
+        let cli = Cli::try_parse_from(["gsearch", "verify", "https://example.com"]).unwrap();
+        let Command::Verify { json, .. } = cli.cmd else { panic!("expected verify") };
+        assert!(!json);
     }
 }

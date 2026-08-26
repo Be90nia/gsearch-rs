@@ -66,7 +66,7 @@ pub fn find_browser() -> Result<(PathBuf, BrowserKind)> {
 }
 
 /// 给定 BrowserKind 查找对应路径；找不到返回 None（让 launch() 兑底到 find_browser）。
-fn find_specific(kind: BrowserKind) -> Option<(PathBuf, BrowserKind)> {
+pub fn find_specific(kind: BrowserKind) -> Option<(PathBuf, BrowserKind)> {
     let exe_name = match kind {
         BrowserKind::Chrome => "chrome.exe",
         BrowserKind::Edge => "msedge.exe",
@@ -114,7 +114,6 @@ pub fn profile_dir() -> Result<PathBuf> {
     ensure_dir(&path)?;
     Ok(path)
 }
-
 fn profile_name(raw: &str) -> Result<String> {
     let path = Path::new(raw.trim()).to_path_buf();
     let name = path.file_name().and_then(|part| part.to_str()).unwrap_or_default();
@@ -122,6 +121,15 @@ fn profile_name(raw: &str) -> Result<String> {
         return Err(anyhow!("GSEARCH_PROFILE 路径末段非法: {raw:?}"));
     }
     Ok(name.to_owned())
+}
+
+/// M14-1B：取 meta 头部用的 profile 末段名（不创建目录、纯查询）。
+/// ponytail: profile_dir() 会 create_dir_all 在没设 env 时副作用意外；这里只读。
+pub fn profile_name_only() -> String {
+    match std::env::var("GSEARCH_PROFILE") {
+        Ok(raw) if !raw.trim().is_empty() => profile_name(&raw).unwrap_or_else(|_| "default".into()),
+        _ => "default".into(),
+    }
 }
 
 fn ensure_dir(path: &Path) -> Result<()> {

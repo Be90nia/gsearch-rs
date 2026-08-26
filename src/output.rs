@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::types::SearchResult;
+use crate::types::{OutputEnvelope, SearchResult};
 
 /// snippet 截断长度（按字符不按字节，中文摘要不会截出乱码）
 const SNIPPET_MAX_CHARS: usize = 160;
@@ -15,8 +15,10 @@ pub fn print_text(results: &[SearchResult]) {
     }
 }
 
-/// `--json` 输出：serde_json 全量
-pub fn print_json(results: &[SearchResult]) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(results)?);
+
+/// M14-1B：`--json` 输出 `{meta, results}` 信封，agent 解析友好。
+/// 泛型让 search 数组 / browse AdaptiveRead 共用同一序列化路径。
+pub fn print_envelope_json<T: serde::Serialize>(envelope: &OutputEnvelope<T>) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(envelope)?);
     Ok(())
 }
