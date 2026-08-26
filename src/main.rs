@@ -183,26 +183,6 @@ async fn main() -> ExitCode {
         }
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::{Cli, Command};
-    use clap::Parser;
-
-    #[test]
-    fn humanize_defaults_to_false() {
-        let cli = Cli::try_parse_from(["gsearch", "search", "test"]).unwrap();
-        let Command::Search(args) = cli.cmd else { panic!("expected search") };
-        assert!(!args.humanize);
-    }
-
-    #[test]
-    fn captcha_prompts_are_detected_case_insensitively() {
-        assert!(gsearch::search::unusual_traffic("UnUsUaL TrAfFiC"));
-        assert!(gsearch::search::is_captcha("Our systems have detected traffic"));
-        assert!(gsearch::search::is_captcha("/sorry/index?x=1"));
-        assert!(!gsearch::search::is_captcha("normal results"));
-    }
-}
 
 async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode> {
     let browser_kind = browser_arg_to_kind(args.browser);
@@ -455,4 +435,37 @@ async fn fetch_public_ip() -> anyhow::Result<String> {
         anyhow::bail!("空响应: {text}");
     }
     Ok(ip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn humanize_defaults_to_false() {
+        let cli = Cli::try_parse_from(["gsearch", "search", "test"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert!(!args.humanize);
+    }
+
+    #[test]
+    fn captcha_prompts_are_detected_case_insensitively() {
+        assert!(gsearch::search::unusual_traffic("UnUsUaL TrAfFiC"));
+        assert!(gsearch::search::is_captcha("Our systems have detected traffic"));
+        assert!(gsearch::search::is_captcha("/sorry/index?x=1"));
+        assert!(!gsearch::search::is_captcha("normal results"));
+    }
+
+    /// M12 互斥：--open/--read/--dl 三个 flag 在 clap 解析阶段就拒绝。
+    #[test]
+    fn post_flags_mutually_exclusive() {
+        let r = Cli::try_parse_from(["gsearch", "search", "x", "--open", "1", "--read", "1"]);
+        assert!(r.is_err(), "--open + --read 应在 clap 阶段被拒绝");
+        let r = Cli::try_parse_from(["gsearch", "search", "x", "--read", "1", "--dl", "1"]);
+        assert!(r.is_err(), "--read + --dl 应在 clap 阶段被拒绝");
+        // 单用 OK
+        let r = Cli::try_parse_from(["gsearch", "search", "x", "--read", "1"]);
+        assert!(r.is_ok(), "--read 单用应通过");
+    }
 }

@@ -167,10 +167,24 @@ async fn load(page: &Page, url: &str) -> Result<String> {
     .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
     .map_err(|e| anyhow!("加载 {url} 失败: {e}"))
 }
+
+/// ponytail: 查询串就几十字节，手写 10 行不引 percent_encoding crate。
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_captcha, unusual_traffic};
-
     #[test]
     fn captcha_prompts_are_early_detected() {
         assert!(is_captcha("<p>Unusual traffic from your computer network</p>"));
@@ -184,19 +198,4 @@ mod tests {
         assert!(unusual_traffic("Our Systems Have Detected traffic"));
         assert!(unusual_traffic("UNUSUAL TRAFFIC"));
     }
-}
-
-/// 查询串 percent-encode，等价 Python `urllib.parse.quote`（字母数字与 -_.~/ 直通，其余 %XX）。
-/// 查询串就几十字节，手写 10 行，不引 percent_encoding crate。
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }

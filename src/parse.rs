@@ -59,3 +59,56 @@ pub fn parse_serp(html: &str) -> Vec<SearchResult> {
 fn text_of(el: &ElementRef) -> String {
     el.text().collect::<String>().replace('\u{a0}', " ").trim().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_serp;
+
+    /// 单 listing：h3 标题 + VwiC3b 摘要 + 链接 + 去 nbsp
+    #[test]
+    fn parse_serp_single_listing() {
+        let html = r#"<!doctype html><html><body>
+            <a href="https://example.com/foo"><h3>Example Title</h3></a>
+            <div class="VwiC3b">An example snippet for testing purposes here.</div>
+        </body></html>"#;
+        let r = parse_serp(html);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].title, "Example Title");
+        assert_eq!(r[0].url, "https://example.com/foo");
+        assert!(r[0].snippet.contains("An example snippet"));
+    }
+
+    /// 多 listing：snippet 流式配对；VwiC3b 跟着的多个未配 title 都被填
+    #[test]
+    fn parse_serp_pairing_pending() {
+        let html = r#"<!doctype html><html><body>
+            <a href="https://a.com"><h3>Title A</h3></a>
+            <a href="https://b.com"><h3>Title B</h3></a>
+            <div class="VwiC3b">Snippet for both A and B.</div>
+        </body></html>"#;
+        let r = parse_serp(html);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].snippet, r[1].snippet);
+        assert_eq!(r[0].snippet, "Snippet for both A and B.");
+    }
+
+    /// 同 URL 跨段重复应去重保首次
+    #[test]
+    fn parse_serp_dedup_same_url() {
+        let html = r#"<!doctype html><html><body>
+            <a href="https://dup.com"><h3>First</h3></a>
+            <a href="https://dup.com"><h3>Second</h3></a>
+        </body></html>"#;
+        let r = parse_serp(html);
+        assert_eq!(r.len(), 1, "URL 去重保首次");
+        assert_eq!(r[0].title, "First");
+    }
+
+    /// 零结果：返回空（warning 在 tracing 层，不在这里断言）
+    #[test]
+    fn parse_serp_empty_returns_empty() {
+        let html = "<!doctype html><html><body>no results here</body></html>";
+        let r = parse_serp(html);
+        assert!(r.is_empty());
+    }
+}
