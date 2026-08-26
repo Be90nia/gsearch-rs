@@ -13,7 +13,7 @@ use chromiumoxide::cdp::browser_protocol::browser::{
     SetDownloadBehaviorBehavior, SetDownloadBehaviorParams,
 };
 
-use gsearch::browser::{launch, spawn_handler};
+use gsearch::browser::{BrowserKind, launch_with_kind, spawn_handler};
 use gsearch::search::is_captcha;
 use gsearch::skeleton::{extract_adaptive, format_adaptive, format_headings_only, format_json};
 use gsearch::util::filename_from_url;
@@ -34,14 +34,16 @@ pub struct BrowseOpts {
     pub json: bool,
     pub headings_only: bool,
     pub from: usize,
+    /// M11 浏览器选择；None = 自动检测
+    /// M11 浏览器选择；None = 自动检测
+    pub browser: Option<BrowserKind>,
 }
 
 /// `browse <url>`：headless 渲染 → 默认 AdaptiveRead（M9），`--full` 拿纯 innerText 5000 字。
 /// CAPTCHA 路径：撞码报错退出，提示用 login 手工验证。
 pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
-    let (mut browser, handler) = launch(true).await?;
+    let (mut browser, handler) = launch_with_kind(true, opts.browser).await?;
     let _h = spawn_handler(handler);
-
     let page = browser.new_page("about:blank").await?;
     tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
         .await
@@ -98,11 +100,11 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
 
 /// `login <url>`：有头窗人工登录，轮询不限时；人关窗（或关页签）= 完成，cookie 随 profile 落盘。
 /// 不判 CAPTCHA（登录页是真人登录页，PLAN §3.5）。
-pub async fn cmd_login(url: &str) -> Result<ExitCode> {
-    let (browser, handler) = launch(false).await?;
+pub async fn cmd_login(url: &str, browser: Option<BrowserKind>) -> Result<ExitCode> {
+    let (browser_inst, handler) = launch_with_kind(false, browser).await?;
     let _h = spawn_handler(handler);
 
-    let page = browser.new_page("about:blank").await?;
+    let page = browser_inst.new_page("about:blank").await?;
     tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
         .await
         .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
@@ -114,8 +116,8 @@ pub async fn cmd_login(url: &str) -> Result<ExitCode> {
         if page.evaluate("1").await.is_ok() {
             continue;
         }
-        if browser_alive(&browser).await
-            && browser
+        if browser_alive(&browser_inst).await
+            && browser_inst
                 .pages()
                 .await
                 .map(|ps| ps.iter().any(|p| p.target_id() == page.target_id()))
@@ -135,11 +137,11 @@ async fn browser_alive(browser: &chromiumoxide::Browser) -> bool {
 
 /// `dl <url> [-o PATH]`：CDP `Browser.setDownloadBehavior` 走 Chrome 原生下载（带 profile 登录态）。
 /// 渲染型 URL（普通网页，Chrome 不触发下载）回退页内 fetch 落盘（PLAN §3.5 raw-file 路径，同源 cookie）。
-pub async fn cmd_dl(url: &str, output: Option<&Path>) -> Result<ExitCode> {
+pub async fn cmd_dl(url: &str, output: Option<&Path>, browser: Option<BrowserKind>) -> Result<ExitCode> {
     let dir: PathBuf = std::path::absolute(output.unwrap_or(Path::new(".")))?;
     std::fs::create_dir_all(&dir).with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
 
-    let (mut browser, handler) = launch(true).await?;
+    let (mut browser_inst, handler) = launch_with_kind(true, browser).await?;
     let _h = spawn_handler(handler);
 
     let params = SetDownloadBehaviorParams::builder()
@@ -147,13 +149,13 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>) -> Result<ExitCode> {
         .download_path(dir.to_string_lossy().into_owned())
         .build()
         .map_err(|e| anyhow!("构造 setDownloadBehavior 参数失败: {e}"))?;
-    browser
+    browser_inst
         .execute(params)
         .await
         .context("设置下载行为失败（Browser.setDownloadBehavior）")?;
 
     let before = list_dir(&dir)?;
-    let page = browser.new_page("about:blank").await?;
+    let page = browser_inst.new_page("about:blank").await?;
     let _ = tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url)).await;
 
     match wait_new_file(&dir, &before).await? {
@@ -164,7 +166,7 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>) -> Result<ExitCode> {
         None => {
             let bytes = fetch_in_page(&page, url).await?;
             if bytes.is_empty() {
-                return Err(anyhow!("下载内容为空（{url}）"));
+                return Err(anyhow!("下载内容为空（{url}"));
             }
             let name = filename_from_url(url);
             let path = dir.join(&name);
@@ -173,10 +175,10 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>) -> Result<ExitCode> {
         }
     }
 
-    if let Err(e) = browser.close().await {
+    if let Err(e) = browser_inst.close().await {
         tracing::warn!("close browser 失败: {e}");
     }
-    let _ = browser.wait().await;
+    let _ = browser_inst.wait().await;
     Ok(ExitCode::SUCCESS)
 }
 

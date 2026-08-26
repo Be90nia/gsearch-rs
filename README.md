@@ -78,6 +78,48 @@ EOF（Ctrl+D / Ctrl+Z+Enter）才真正退出；单条命令出错只打印 `err
 - `GSEARCH_CHROME`：覆盖默认 Chrome 路径
 - `RUST_LOG=debug`：查详细信息
 
+### `--browser <chrome|edge|auto>`（M11 多浏览器兑底）
+
+所有顶层子命令（`search` / `browse` / `login` / `dl`）接受 `--browser`：
+
+```
+gsearch search "rust" --browser edge               # 强制走 Edge
+gsearch search "rust" --browser chrome             # 强制走 Chrome
+gsearch search "rust"             # 默认 auto：优先 Chrome，缺则兑底 Edge
+```
+
+检测顺序：
+1. `GSEARCH_CHROME` env（指向 chrome.exe / msedge.exe 都行，含 `msedge` 自动判 Edge）
+2. Chrome 默认安装路径（`C:/Program Files/Google/Chrome/Application/chrome.exe`）
+3. Edge 默认安装路径（`C:/Program Files/Microsoft/Edge/Application/msedge.exe` + x86 路径）
+4. `where chrome.exe` / `where msedge.exe`
+
+显式指定不可用时仍兑底到第一个可用浏览器，不报错。Edge 是 Chromium 内核，与 Chrome 参数完全兼容。
+
+### `gsearch doctor`（M11 健康检查）
+
+不启动浏览器；3 秒内完成 6 项自检，每项标 `[OK]` / `[WARN]` / `[FAIL]`：
+
+```
+$ gsearch doctor
+gsearch doctor
+[ OK ] Chrome: C:\Program Files\Google\Chrome\Application\chrome.exe
+[ OK ] Edge:   C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
+[ OK ] profile 可写: C:\Users\Begonia\.gsearch\profiles\default
+[ OK ] 出口 IP: 61.144.188.80
+[ OK ] 网络连通 (www.google.com:443)
+[ OK ] GSEARCH_PROFILE 未设置（默认 ~/.gsearch/profiles/default/）
+
+所有检查通过 ✓
+```
+
+- **Chrome / Edge**：路径是否找到；Edge 缺仅给 WARN（仍可跑）
+- **profile 可写**：在默认 / 自定义 profile 目录建一个临时探针文件做读写验证
+- **出口 IP**：明文 HTTP GET `http://ipv4.icanhazip.com/` 取公网 IP。**撞码时可以这里查 IP 被封状况**（出口 IP 异常/变了都提示 VPN/代理需切换）
+- **网络连通**：TCP connect `www.google.com:443`，2 秒超时
+- **GSEARCH_PROFILE**：环境变量检查，缺/空用默认；路径不存在仅 WARN（首次启动会建）
+
+任意 FAIL 退出码 1；WARN 整体可用；都 OK 退出 0。CI 或首次安装后跑一次可快速定位是浏览器路径、profile 权限、网络出口哪一类故障。
 ### 安装与构建
 
 ```

@@ -10,39 +10,95 @@ use futures::StreamExt;
 pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 
 const DEFAULT_CHROME: &str = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserKind {
+    Chrome,
+    Edge,
+}
 
-/// Chrome 定位顺序：GSEARCH_CHROME env → 默认安装路径 → PATH 里 chrome.exe
-pub fn find_chrome() -> Result<PathBuf> {
+const DEFAULT_EDGE: &str = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";
+const DEFAULT_EDGE_64: &str = r"C:\Program Files\Microsoft\Edge\Application\msedge.exe";
+
+/// 浏览器定位顺序（M11）：Chrome env → Chrome 默认安装路径 → Edge 默认安装路径 →
+/// `where chrome.exe` / `where msedge.exe`。Edge 是 Chromium 内核，参数与 Chrome 兼容。
+/// 返回的 `(path, kind)` 供 `launch()` 决定是否需要任何浏览器特定逻辑。
+pub fn find_browser() -> Result<(PathBuf, BrowserKind)> {
     if let Ok(p) = std::env::var("GSEARCH_CHROME") {
         let path = PathBuf::from(p);
         if path.is_file() {
-            return Ok(path);
+            let kind = if path.to_string_lossy().to_ascii_lowercase().contains("msedge") {
+                BrowserKind::Edge
+            } else {
+                BrowserKind::Chrome
+            };
+            return Ok((path, kind));
         }
     }
 
     let default = PathBuf::from(DEFAULT_CHROME);
     if default.is_file() {
-        return Ok(default);
+        return Ok((default, BrowserKind::Chrome));
     }
 
-    let out = std::process::Command::new("where")
-        .arg("chrome.exe")
-        .output();
-    if let Ok(o) = out
-        && o.status.success()
-    {
-        let s = String::from_utf8_lossy(&o.stdout);
-        if let Some(first) = s.lines().next() {
+    for default in [DEFAULT_EDGE_64, DEFAULT_EDGE] {
+        let p = PathBuf::from(default);
+        if p.is_file() {
+            return Ok((p, BrowserKind::Edge));
+        }
+    }
+
+    for (exe_name, kind) in [("chrome.exe", BrowserKind::Chrome), ("msedge.exe", BrowserKind::Edge)] {
+        let out = std::process::Command::new("where").arg(exe_name).output();
+        if let Ok(o) = out
+            && o.status.success()
+            && let Some(first) = String::from_utf8_lossy(&o.stdout).lines().next()
+        {
             let p = PathBuf::from(first.trim());
             if p.is_file() {
-                return Ok(p);
+                return Ok((p, kind));
             }
         }
     }
 
     Err(anyhow!(
-        "找不到 Chrome，请设 GSEARCH_CHROME env 或安装 Chrome 到 {DEFAULT_CHROME}"
+        "找不到 Chrome 或 Edge；请装 Chrome 到 {DEFAULT_CHROME}，或 Edge 到 {DEFAULT_EDGE}，或设 GSEARCH_CHROME env"
     ))
+}
+
+/// 给定 BrowserKind 查找对应路径；找不到返回 None（让 launch() 兑底到 find_browser）。
+fn find_specific(kind: BrowserKind) -> Option<(PathBuf, BrowserKind)> {
+    let exe_name = match kind {
+        BrowserKind::Chrome => "chrome.exe",
+        BrowserKind::Edge => "msedge.exe",
+    };
+    let defaults: &[&str] = match kind {
+        BrowserKind::Chrome => &[DEFAULT_CHROME],
+        BrowserKind::Edge => &[DEFAULT_EDGE_64, DEFAULT_EDGE],
+    };
+    for d in defaults {
+        let p = PathBuf::from(d);
+        if p.is_file() {
+            return Some((p, kind));
+        }
+    }
+    if let Ok(o) = std::process::Command::new("where").arg(exe_name).output()
+        && o.status.success()
+        && let Some(first) = String::from_utf8_lossy(&o.stdout).lines().next()
+    {
+        let p = PathBuf::from(first.trim());
+        if p.is_file() {
+            return Some((p, kind));
+        }
+    }
+    None
+}
+
+
+/// 仅返回 Chrome 路径的便捷别名（M11 兼容旧调用方）。Chrome 不可用时回落到 Edge，
+/// 但 launch(BrowserKind) 推荐显式接收 `(path, kind)`。
+pub fn find_chrome() -> Result<PathBuf> {
+    let (p, _kind) = find_browser()?;
+    Ok(p)
 }
 
 /// Profile 目录：env `GSEARCH_PROFILE` 取末段名放进 `~/.gsearch/profiles/`，未设时用 `default`。
@@ -110,17 +166,30 @@ pub fn cleanup_stale_locks(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 启动 Chrome 并返回 (Browser, Handler)。
+/// 启动浏览器，默认走自动兑底（Chrome 优先，回落 Edge）；兼容旧调用方。
 /// handler 是 Stream<Item = Result<()>>，必须 spawn 到独立 task 持续 poll，否则 CDP 通信会卡死。
 pub async fn launch(headless: bool) -> Result<(Browser, Handler)> {
-    let chrome = find_chrome()?;
+    launch_with_kind(headless, None).await
+}
+
+/// 启动浏览器并返回 (Browser, Handler)。`kind = None` 自动兑底；
+/// `kind = Some(_)` 时若指定浏览器不可用则兑底到第一个可用浏览器（不报错）。
+pub async fn launch_with_kind(headless: bool, kind: Option<BrowserKind>) -> Result<(Browser, Handler)> {
+    // ponytail: 兑底路径与 find_browser 合并一次查询；MVP 上层已解析 '--browser chrome/edge'。
+    let (browser_exe, browser_kind) = match kind {
+        Some(requested) => match find_specific(requested) {
+            Some(found) => found,
+            None => find_browser()?,
+        },
+        None => find_browser()?,
+    };
+    tracing::info!("使用浏览器: {browser_kind:?} -> {}", browser_exe.display());
     let profile = profile_dir()?;
     cleanup_stale_locks(&profile)?;
-
     // disable_default_args：chromiumoxide 默认参数与持久 profile 组合在 Windows 上
     // 触发 Chrome ExitStatus(21)（实锺复现）；关掉后只加显式安全子集。
     let mut builder = BrowserConfig::builder()
-        .chrome_executable(chrome)
+        .chrome_executable(&browser_exe)
         .user_data_dir(&profile)
         .arg("--disable-blink-features=AutomationControlled")
         .arg(format!("--user-agent={UA}"))
