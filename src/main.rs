@@ -5,7 +5,6 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
 
 mod general;
 mod postproc;
@@ -38,10 +37,15 @@ fn enable_utf8_console() {}
     about = "Google 搜索 + 通用浏览器代理 CLI（真 Chrome + 持久 profile）"
 )]
 struct Cli {
+    /// RUST_LOG-style 详细日志：debug / info / warn（默认 info）
+    #[arg(long, global = true, default_value = "info")]
+    verbose: String,
+    /// 浏览器代理，例：http://127.0.0.1:7890 / socks5://127.0.0.1:1080；走环境 GSEARCH_PROXY 同效。
+    #[arg(long, global = true)]
+    proxy: Option<String>,
     #[command(subcommand)]
     cmd: Command,
 }
-
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
 enum BrowserArg {
     #[default]
@@ -130,8 +134,9 @@ struct SearchArgs {
     browser: BrowserArg,
  }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+fn init_tracing(level: &str) {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -142,11 +147,12 @@ fn init_tracing() {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     enable_utf8_console();
-    init_tracing();
-
     let cli = Cli::parse();
+    init_tracing(&cli.verbose);
+    // GSEARCH_PROXY env 作为默认值（CLI --proxy 覆盖）
+    let proxy = cli.proxy.clone().or_else(|| std::env::var("GSEARCH_PROXY").ok().filter(|s| !s.is_empty()));
     let result: Result<ExitCode> = match cli.cmd {
-        Command::Search(args) => cmd_search(args).await,
+        Command::Search(args) => cmd_search(args, proxy.clone()).await,
         Command::Browse { url, full, json, from, headings_only, browser } => {
             let opts = general::BrowseOpts {
                 full,
@@ -154,11 +160,12 @@ async fn main() -> ExitCode {
                 from: from.unwrap_or(0),
                 headings_only,
                 browser: browser.into(),
+                proxy: proxy.clone(),
             };
             general::cmd_browse(&url, &opts).await
         }
-        Command::Login { url, browser } => general::cmd_login(&url, browser.into()).await,
-        Command::Dl { url, output, browser } => general::cmd_dl(&url, output.as_deref(), browser.into()).await,
+        Command::Login { url, browser } => general::cmd_login(&url, browser.into(), proxy.clone()).await,
+        Command::Dl { url, output, browser } => general::cmd_dl(&url, output.as_deref(), browser.into(), proxy.clone()).await,
         Command::Shell => shell::run_shell().await,
         Command::Doctor => cmd_doctor().await,
     };
@@ -170,7 +177,7 @@ async fn main() -> ExitCode {
             for cause in e.chain().skip(1) {
                 eprintln!("  原因: {cause}");
             }
-            eprintln!("（设 RUST_LOG=debug 查详细）");
+            eprintln!("（用 --verbose debug 查详细）");
             ExitCode::from(1)
         }
     }
@@ -195,13 +202,13 @@ mod tests {
         assert!(!gsearch::search::is_captcha("normal results"));
     }
 }
-async fn cmd_search(args: SearchArgs) -> Result<ExitCode> {
+async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode> {
     // 互斥检查放最前：撞码场景下 search 会卡 120s，但互斥错应立刻拒绝（不让用户等）。
     let n_post = [args.open.is_some(), args.read.is_some(), args.dl.is_some()]
         .iter().filter(|x| **x).count();
     anyhow::ensure!(n_post <= 1, "--open / --read / --dl 互斥，每次只能指定一个（当前 {n_post} 个）");
     let browser_kind = browser_arg_to_kind(args.browser);
-    let (mut browser, handler) = gsearch::browser::launch_with_kind(true, browser_kind)
+    let (mut browser, handler) = gsearch::browser::launch_with_kind_proxy(true, browser_kind, proxy)
         .await
         .context("启动 Chrome/Edge 失败：检查 GSEARCH_CHROME 是否指向 chrome.exe/msedge.exe，或 profile 被另一实例占用")?;
     let _h = gsearch::browser::spawn_handler(handler);

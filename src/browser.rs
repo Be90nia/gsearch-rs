@@ -186,7 +186,17 @@ pub async fn swap_to_headed(browser: &mut Browser) -> Result<()> {
 /// 启动浏览器并返回 (Browser, Handler)。`kind = None` 自动兑底；
 /// `kind = Some(_)` 时若指定浏览器不可用则兑底到第一个可用浏览器（不报错）。
 pub async fn launch_with_kind(headless: bool, kind: Option<BrowserKind>) -> Result<(Browser, Handler)> {
-    // ponytail: 兑底路径与 find_browser 合并一次查询；MVP 上层已解析 '--browser chrome/edge'。
+    let proxy = std::env::var("GSEARCH_PROXY").ok().filter(|s| !s.is_empty());
+    launch_with_kind_proxy(headless, kind, proxy).await
+}
+
+/// 启动浏览器并返回 (Browser, Handler)。`kind = None` 自动兑底；`proxy = None` 不走代理。
+/// ponytail: 拆出 `proxy` 参数主要为了让上层调用不关心 env 细节（CLI 也走同一路径）。
+pub async fn launch_with_kind_proxy(
+    headless: bool,
+    kind: Option<BrowserKind>,
+    proxy: Option<String>,
+) -> Result<(Browser, Handler)> {
     let (browser_exe, browser_kind) = match kind {
         Some(requested) => match find_specific(requested) {
             Some(found) => found,
@@ -198,13 +208,18 @@ pub async fn launch_with_kind(headless: bool, kind: Option<BrowserKind>) -> Resu
     let profile = profile_dir()?;
     cleanup_stale_locks(&profile)?;
     // disable_default_args：chromiumoxide 默认参数与持久 profile 组合在 Windows 上
-    // 触发 Chrome ExitStatus(21)（实锺复现）；关掉后只加显式安全子集。
+    // 触发 Chrome ExitStatus(21)（实测复现）；关掉后只加显式安全子集。
     let mut builder = BrowserConfig::builder()
         .chrome_executable(&browser_exe)
         .user_data_dir(&profile)
         .arg("--disable-blink-features=AutomationControlled")
         .arg(format!("--user-agent={UA}"))
         .disable_default_args();
+    if let Some(proxy) = &proxy {
+        // ponytail: Chrome 只识别 --proxy-server=protocol://host:port；不引 chromiumoxide proxy builder（M12 调试期足以）。
+        tracing::info!("代理: {proxy}");
+        builder = builder.arg(format!("--proxy-server={proxy}"));
+    }
     let safe_args: &[&str] = if headless {
         ["--headless=new", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"].as_slice()
     } else {
@@ -225,6 +240,7 @@ pub async fn launch_with_kind(headless: bool, kind: Option<BrowserKind>) -> Resu
     let (browser, handler) = launch_with_retry(config).await?;
     Ok((browser, handler))
 }
+
 
 /// 瞬态失败重试一次（≤1s 退避）：上一实例 Chrome 后台 kill 未死透的 profile 锁竞态、
 /// Windows Defender 扫新生 exe 的文件锁（OS error 5）等；二次失败才上抛。

@@ -13,7 +13,7 @@ use chromiumoxide::cdp::browser_protocol::browser::{
     SetDownloadBehaviorBehavior, SetDownloadBehaviorParams,
 };
 
-use gsearch::browser::{BrowserKind, launch_with_kind, spawn_handler};
+use gsearch::browser::{BrowserKind, launch_with_kind_proxy, spawn_handler};
 use gsearch::search::is_captcha;
 use gsearch::skeleton::{extract_adaptive, format_adaptive, format_headings_only, format_json};
 use gsearch::util::filename_from_url;
@@ -36,12 +36,14 @@ pub struct BrowseOpts {
     pub from: usize,
     /// M11 浏览器选择；None = 自动检测
     pub browser: Option<BrowserKind>,
+    /// M12 浏览器代理；None = 走直连
+    pub proxy: Option<String>,
 }
 
 /// `browse <url>`：headless 渲染 → 默认 AdaptiveRead（M9），`--full` 拿纯 innerText 5000 字。
 /// CAPTCHA 路径：撞码报错退出，提示用 login 手工验证。
 pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
-    let (mut browser, handler) = launch_with_kind(true, opts.browser).await?;
+    let (mut browser, handler) = launch_with_kind_proxy(true, opts.browser, opts.proxy.clone()).await?;
     let _h = spawn_handler(handler);
     let page = browser.new_page("about:blank").await?;
     tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
@@ -99,8 +101,8 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
 
 /// `login <url>`：有头窗人工登录，轮询不限时；人关窗（或关页签）= 完成，cookie 随 profile 落盘。
 /// 不判 CAPTCHA（登录页是真人登录页，PLAN §3.5）。
-pub async fn cmd_login(url: &str, browser: Option<BrowserKind>) -> Result<ExitCode> {
-    let (browser_inst, handler) = launch_with_kind(false, browser).await?;
+pub async fn cmd_login(url: &str, browser: Option<BrowserKind>, proxy: Option<String>) -> Result<ExitCode> {
+    let (browser_inst, handler) = launch_with_kind_proxy(false, browser, proxy).await?;
     let _h = spawn_handler(handler);
 
     let page = browser_inst.new_page("about:blank").await?;
@@ -136,11 +138,10 @@ async fn browser_alive(browser: &chromiumoxide::Browser) -> bool {
 
 /// `dl <url> [-o PATH]`：CDP `Browser.setDownloadBehavior` 走 Chrome 原生下载（带 profile 登录态）。
 /// 渲染型 URL（普通网页，Chrome 不触发下载）回退页内 fetch 落盘（PLAN §3.5 raw-file 路径，同源 cookie）。
-pub async fn cmd_dl(url: &str, output: Option<&Path>, browser: Option<BrowserKind>) -> Result<ExitCode> {
+pub async fn cmd_dl(url: &str, output: Option<&Path>, browser: Option<BrowserKind>, proxy: Option<String>) -> Result<ExitCode> {
     let dir: PathBuf = std::path::absolute(output.unwrap_or(Path::new(".")))?;
     std::fs::create_dir_all(&dir).with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
-
-    let (mut browser_inst, handler) = launch_with_kind(true, browser).await?;
+    let (mut browser_inst, handler) = launch_with_kind_proxy(true, browser, proxy).await?;
     let _h = spawn_handler(handler);
 
     let params = SetDownloadBehaviorParams::builder()
