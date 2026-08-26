@@ -50,6 +50,8 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn b64_decode_known_vectors() {
@@ -66,5 +68,68 @@ mod tests {
         assert_eq!(filename_from_url("https://example.com/"), "download.bin");
         assert_eq!(filename_from_url("https://example.com"), "download.bin");
         assert_eq!(filename_from_url("https://example.com/index.html"), "index.html");
+    }
+
+    /// M13 三处下载路径一致性基线：filename_from_url + Path::join + std::fs::write
+    /// 与 postproc::dl / shell::dl_in_page / general::cmd_dl 都走相同 shape。
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "gsearch-dl-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+    fn cleanup(p: &PathBuf) {
+        let _ = fs::remove_dir_all(p);
+    }
+
+    #[test]
+    fn dl_join_root_url_picks_download_bin() {
+        let dir = fresh_dir("root");
+        let url = "https://example.com/";
+        let path = dir.join(filename_from_url(url));
+        assert_eq!(path, dir.join("download.bin"));
+        fs::write(&path, b"x").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"x");
+        cleanup(&dir);
+    }
+    #[test]
+    fn dl_join_relative_output_dir() {
+        let dir = fresh_dir("rel");
+        let url = "https://x.com/a/b/file.pdf";
+        let path = dir.join(filename_from_url(url));
+        assert_eq!(path, dir.join("file.pdf"));
+        fs::write(&path, b"x").unwrap();
+        cleanup(&dir);
+    }
+    #[test]
+    fn dl_join_path_with_spaces() {
+        let dir = fresh_dir("space subdir");
+        assert!(dir.to_string_lossy().contains(' '), "dir 自身含空格才能验");
+        let url = "https://cdn.example.com/release notes v2.zip";
+        let filename = filename_from_url(url);
+        assert_eq!(filename, "release notes v2.zip", "URL 末段天然支持空格");
+        let path = dir.join(&filename);
+        assert!(path.to_string_lossy().contains(' '));
+        fs::write(&path, b"x").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 1);
+        cleanup(&dir);
+    }
+    #[test]
+    fn dl_join_overwrites_existing_same_name() {
+        let dir = fresh_dir("overwrite");
+        let url = "https://example.com/file.pdf";
+        let path = dir.join(filename_from_url(url));
+        fs::write(&path, b"old").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        fs::write(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        cleanup(&dir);
     }
 }

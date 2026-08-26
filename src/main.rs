@@ -130,10 +130,13 @@ struct SearchArgs {
     /// `--read N --headings-only`：只输出目录（最省 token fast path）
     #[arg(long, default_value_t = false)]
     headings_only: bool,
+    /// `--dl N -o DIR`：把下载文件落到 DIR 下（按 URL 末段命名）；DIR 缺省落 CWD。M13 修复两处不一致。
+    #[arg(short = 'o', long = "output")]
+    output: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = BrowserArg::Auto)]
     /// 选择浏览器：auto = Chrome 优先缺则 Edge，强制选 chrome/edge。M11。
     browser: BrowserArg,
- }
+}
 
 fn init_tracing(level: &str) {
     use tracing_subscriber::EnvFilter;
@@ -228,7 +231,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             }
         }
         if let Some(n) = args.dl {
-            postproc::dl(&browser, &results, n).await?;
+            postproc::dl(&browser, &results, n, args.output.as_deref()).await?;
         }
         anyhow::Ok(())
     }

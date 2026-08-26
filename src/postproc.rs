@@ -5,6 +5,7 @@
 //! `--full` 拿纯 innerText 5000 字（兜底），`--json` 拿结构化 JSON，`--from K` 摘要偏移，
 //! `--headings-only` 仅目录。
 
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -118,9 +119,16 @@ async fn read_full_inner(page: &chromiumoxide::Page, url: &str) -> Result<String
     println!("=== {url} ===\n{txt}");
     Ok(txt)
 }
-
-/// `--dl N`：走浏览器 cookie 的简化下载。
-pub async fn dl(browser: &Browser, results: &[SearchResult], n: usize) -> Result<()> {
+/// `--dl N [-o DIR]`：走浏览器 cookie 的简化下载（M13 加 `-o`）。
+/// `-o DIR` 把文件落到 DIR 下（按 URL 末段命名）；缺省落 CWD（M4 历史行为）。
+/// ponytail: `general::cmd_dl` 已对（同名 `output: Option<&Path>` + `dir.join(filename_from_url(url))`），
+/// 此处只把 `postproc::dl` 改一致，不动 general。
+pub async fn dl(
+    browser: &Browser,
+    results: &[SearchResult],
+    n: usize,
+    output: Option<&Path>,
+) -> Result<()> {
     let url = pick(results, n, "dl")?;
     let page = browser.new_page("about:blank").await?;
     let _ = tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url)).await;
@@ -148,15 +156,17 @@ pub async fn dl(browser: &Browser, results: &[SearchResult], n: usize) -> Result
         return Err(anyhow!("下载内容为空（{url}）"));
     }
 
-    let filename = filename_from_url(url);
-    std::fs::write(&filename, &bytes).map_err(|e| anyhow!("写文件 {filename} 失败: {e}"))?;
+    let dir = std::path::absolute(output.unwrap_or_else(|| Path::new(".")))?;
+    std::fs::create_dir_all(&dir).map_err(|e| anyhow!("创建下载目录 {} 失败: {e}", dir.display()))?;
+    let path = dir.join(filename_from_url(url));
+    std::fs::write(&path, &bytes).map_err(|e| anyhow!("写文件 {} 失败: {e}", path.display()))?;
     if bytes.len() > DL_LARGE_BYTES {
         tracing::warn!(
             "下载文件 {} MB，fetch→base64 路径吃内存，考虑 M6 Page download flow",
             bytes.len() / 1_000_000
         );
     }
-    println!("已下载: {filename} ({} bytes)", bytes.len());
+    println!("已下载: {} ({} bytes)", path.display(), bytes.len());
     Ok(())
 }
 
@@ -234,7 +244,7 @@ mod live_tests {
         let txt = read_full(&browser, &results, 1).await.unwrap();
         assert!(txt.contains("Example Domain"), "read_full got: {txt:?}");
 
-        dl(&browser, &results, 1).await.unwrap();
+        dl(&browser, &results, 1, None).await.unwrap();
         let bytes = std::fs::read("download.bin").unwrap();
         assert!(!bytes.is_empty());
         assert!(

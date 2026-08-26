@@ -6,6 +6,7 @@
 //!
 //! 单 exe "用完即走" 原则不破：shell 是可选模式，顶层命令全部不变。
 
+use std::path::Path;
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -140,8 +141,7 @@ fn print_help() {
          search <query> [--limit N]   Google 搜索，结果存入 last_results\n\
          click <N> / open <N>         跳到 last_results[N-1].url\n\
          read                         打印当前页（默认 AdaptiveRead 三段）\n\
-         read [--full|--json|--headings-only|--from K]   同 read，但切换输出模式\n\
-         dl [N]                       下载 last_results[N-1].url（N 缺省走 current_url）\n\
+         dl [N] [-o DIR]              下载 last_results[N-1].url 到 DIR 或 CWD（N 缺省走 current_url）\n\
          browse <url>                 goto <url> 并更新 current_url\n\
          login <url>                  切有头窗人工登录；关窗后提示是否切回 headless\n\
          back                         页面后退\n\
@@ -271,8 +271,33 @@ async fn cmd_read(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     Ok(())
 }
 
+/// `dl [N] [-o DIR]`：下载 last_results[N-1].url（N 缺省走 current_url）。
+/// `-o DIR` 把文件落到 DIR 下；缺省写 CWD（filename_from_url 末段）。M13 修三处一致。
+/// ponytail: 不引 clap，shell 内嵌 5 行 flag parser 同 `parse_shell_read_opts`，
+/// 同名 `-o DIR / --output DIR` 优先顺序最简单：扫一遍 args，遇 flag 收 value，遇到位置 token 收 N。
+/// 拒绝多余位置参数（不暗中吞掉）。三处一致基于 `dir = std::path::absolute(output.unwrap_or_else(|| Path::new(".")))?` + `dir.join(filename_from_url(url))` 共用式（仅出现在 dl_in_page，cmd_dl 只搬运 output）。
 async fn cmd_dl(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
-    let url = match args.first() {
+    // 解析 flag：-o DIR / --output DIR，剩余第一个 token 是 N（可缺省）。
+    let mut n_token: Option<&str> = None;
+    let mut output: Option<&Path> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "-o" | "--output" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| anyhow!("dl -o 缺值"))?;
+                output = Some(Path::new(v));
+            }
+            other => {
+                if n_token.is_some() {
+                    return Err(anyhow!("dl 多余位置参数: {other:?}（只接受 N）"));
+                }
+                n_token = Some(other);
+            }
+        }
+        i += 1;
+    }
+    let url = match n_token {
         Some(n_str) => {
             let n: usize = n_str.parse().map_err(|_| anyhow!("dl N 非数字: {n_str:?}"))?;
             if n == 0 || n > ctx.last_results.len() {
@@ -287,12 +312,13 @@ async fn cmd_dl(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
             ctx.current_url.clone()
         }
     };
-    dl_in_page(&ctx.page, &url).await
+    dl_in_page(&ctx.page, &url, output).await
 }
 
 /// 页内 fetch → 字节落盘（同 M4 dl 思路，去掉 postproc.rs 私有耦合）。
+/// `output` 缺省落 CWD；提供时 create_dir_all(DIR) + DIR.join(filename)，与 postproc::dl / general::cmd_dl 三处行为一致。
 /// credentials:'include' 带同源 cookie；`async function ()` 而非箭头（chromiumoxide 函数探测）。
-async fn dl_in_page(page: &Page, url: &str) -> Result<()> {
+async fn dl_in_page(page: &Page, url: &str, output: Option<&Path>) -> Result<()> {
     let _ = tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url)).await;
     let js = format!(
         "async function () {{
@@ -316,9 +342,11 @@ async fn dl_in_page(page: &Page, url: &str) -> Result<()> {
     if bytes.is_empty() {
         return Err(anyhow!("下载内容为空（{url}）"));
     }
-    let filename = filename_from_url(url);
-    std::fs::write(&filename, &bytes).with_context(|| format!("写文件失败: {filename}"))?;
-    println!("已下载: {filename} ({} bytes)", bytes.len());
+    let dir = std::path::absolute(output.unwrap_or_else(|| Path::new(".")))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
+    let path = dir.join(filename_from_url(url));
+    std::fs::write(&path, &bytes).with_context(|| format!("写文件失败: {}", path.display()))?;
+    println!("已下载: {} ({} bytes)", path.display(), bytes.len());
     Ok(())
 }
 
@@ -348,25 +376,38 @@ async fn cmd_login(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
         .context("有头模式创建 page 失败")?;
     goto(&ctx.page, url).await?;
     ctx.current_url = url.to_string();
+    // 记录登录页 URL；用户登录成功跳到 dashboard = URL 变化 = 登录完成（bug fix）。
+    // ponytail: 旧版只判 evaluate 失败 + page 死了；登录后跳到 dashboard，evaluate 仍成功 →
+    // 死循环，只能 Ctrl+C。复用 general.rs 的纯函数判定。
+    let initial_url = ctx
+        .page
+        .url()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| url.to_string());
     tracing::info!("已打开登录窗口: {url}，完成登录后直接关窗即可");
 
-    // 轮询直到用户关窗（page 死了 / browser 死了）
+    // 轮询直到用户关窗（page 死了 / browser 死了）或登录后 URL 变化。
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        if ctx.page.evaluate("1").await.is_ok() {
-            continue;
-        }
-        if browser_alive(&ctx.browser).await
+        let evaluate_ok = ctx.page.evaluate("1").await.is_ok();
+        let current_url = ctx.page.url().await.ok().flatten().unwrap_or_default();
+        let page_still_attached = browser_alive(&ctx.browser).await
             && ctx
                 .browser
                 .pages()
                 .await
                 .map(|ps| ps.iter().any(|p| p.target_id() == ctx.page.target_id()))
-                .unwrap_or(false)
-        {
-            continue;
+                .unwrap_or(false);
+        if crate::general::login_poll_decision(
+            evaluate_ok,
+            &initial_url,
+            &current_url,
+            page_still_attached,
+        ) {
+            break;
         }
-        break;
     }
     println!("检测到登录窗口关闭，cookie 已落 profile");
 

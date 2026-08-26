@@ -110,26 +110,66 @@ pub async fn cmd_login(url: &str, browser: Option<BrowserKind>, proxy: Option<St
         .await
         .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
         .map_err(|e| anyhow!("goto {url} 失败: {e}"))?;
+    // 记录登录页 URL；用户登录成功跳到 dashboard = URL 变化 = 登录完成（bug fix）。
+    // ponytail: 旧版只用 page.evaluate("1").await.is_ok() 判定「页面是否仍在」——
+    // 登录后跳到 dashboard，evaluate 继续成功 → 死循环，只能 Ctrl+C。
+    let initial_url = page
+        .url()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| url.to_string());
     tracing::info!("已打开登录窗口: {url}，完成登录后直接关窗（或本页签）即算完成，不限时等待");
 
     loop {
         tokio::time::sleep(Duration::from_secs(LOGIN_POLL_SECS)).await;
-        if page.evaluate("1").await.is_ok() {
-            continue;
-        }
-        if browser_alive(&browser_inst).await
+        let evaluate_ok = page.evaluate("1").await.is_ok();
+        let current_url = page
+            .url()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let page_still_attached = browser_alive(&browser_inst).await
             && browser_inst
                 .pages()
                 .await
                 .map(|ps| ps.iter().any(|p| p.target_id() == page.target_id()))
-                .unwrap_or(false)
-        {
-            tracing::debug!("evaluate 瞬态失败（页面导航中），继续等待");
-            continue;
+                .unwrap_or(false);
+        if login_poll_decision(evaluate_ok, &initial_url, &current_url, page_still_attached) {
+            tracing::info!("检测到登录完成（URL 变化或窗口关闭），cookie 已落 profile");
+            return Ok(ExitCode::SUCCESS);
         }
-        tracing::info!("用户关窗 = 登录完成，cookie 已落 profile");
-        return Ok(ExitCode::SUCCESS);
     }
+}
+
+/// `cmd_login` 单轮决策。返回 true = 本轮退出（登录完成）。
+///
+/// ponytail: 抽成纯函数好让 URL 变化退出分支可单测，不起 CDP。新增「URL 变化」作为
+/// 主退出条件；`evaluate_ok`（页面仍在）+ `page_still_attached`（page 在列表里）
+/// 兜底用户「关窗完成」路径。三条退出路径：URL 变 / evaluate 死 + page 死。
+/// ponytail ceiling: 假定「登录成功 = URL 变化」（单页 SPA 也跳 hash）。SPA 改 in-place
+/// 不动 URL 的场景需要 pushState 钩子，超出范围按需补。
+pub(crate) fn login_poll_decision(
+    evaluate_ok: bool,
+    initial_url: &str,
+    current_url: &str,
+    page_still_attached: bool,
+) -> bool {
+    // 主退出：登录后跳转（dashboard / post-login redirect）→ URL 变化。
+    if current_url != initial_url {
+        return true;
+    }
+    // 同 URL + evaluate 成功 → 用户还在登录页，继续等。
+    if evaluate_ok {
+        return false;
+    }
+    // evaluate 瞬态失败 + page 还在 → 导航中抖动，继续等。
+    if page_still_attached {
+        return false;
+    }
+    // evaluate 失败 + page 不在 → 用户关窗。
+    true
 }
 
 async fn browser_alive(browser: &chromiumoxide::Browser) -> bool {
@@ -241,4 +281,54 @@ fn list_dir(dir: &Path) -> Result<HashSet<String>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::login_poll_decision;
+
+    /// M13 C1 bug fix: 登录后 URL 变化（跳到 dashboard）= 登录完成，退出循环。
+    /// 模拟 evaluate 仍成功（dashboard 页 JS 正常）+ page 仍在列表（target_id 未变），
+    /// 这是旧版死锁的核心场景；新版靠 URL 差异退出。
+    #[test]
+    fn login_poll_decision_url_changed_exits() {
+        let initial = "https://example.com/login";
+        let current = "https://example.com/dashboard";
+        assert!(
+            login_poll_decision(true, initial, current, true),
+            "URL 变化必须触发退出，不能再依赖 evaluate 失败"
+        );
+    }
+
+    /// 用户还在登录页（同 URL + evaluate 成功）= 继续等。
+    #[test]
+    fn login_poll_decision_same_url_alive_waits() {
+        let url = "https://example.com/login";
+        assert!(!login_poll_decision(true, url, url, true));
+    }
+
+    /// evaluate 失败但 page 还在列表（导航中抖动）= 继续等，不误判用户关窗。
+    #[test]
+    fn login_poll_decision_transient_evaluate_keeps_waiting() {
+        let url = "https://example.com/login";
+        assert!(!login_poll_decision(false, url, url, true));
+    }
+
+    /// 用户关窗（evaluate 失败 + page 死）= 退出（旧行为，保留兜底）。
+    #[test]
+    fn login_poll_decision_window_closed_exits() {
+        let url = "https://example.com/login";
+        assert!(login_poll_decision(false, url, url, false));
+    }
+
+    /// 边界：URL 变化优先级最高（即便 page 已死也以 URL 变化退出）。
+    #[test]
+    fn login_poll_decision_url_changed_overrides_page_dead() {
+        assert!(login_poll_decision(
+            false,
+            "https://x.com/login",
+            "https://x.com/dashboard",
+            false,
+        ));
+    }
 }
