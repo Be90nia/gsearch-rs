@@ -9,6 +9,88 @@ use futures::StreamExt;
 /// 注意：每半年更新一次版本号；UA 过老本身也是反爬信号。
 pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 
+/// 指纹补丁脚本（M14-2A 自 bin stealth.rs 搬来作单一事实源，stealth.rs 留别名）：
+/// webdriver / userAgent / languages / hardwareConcurrency / deviceMemory /
+/// maxTouchPoints / plugins / mimeTypes / chrome.runtime / WebGL vendor /
+/// domAutomationController 等 10 项。launch 层（chaser-stealth）与 --humanize 共用。
+pub const STEALTH_INIT_SCRIPT: &str = r#"
+(() => {
+  const define = (target, key, value) => {
+    try {
+      Object.defineProperty(target, key, { configurable: true, get: () => value });
+    } catch (_) {}
+  };
+  const defineGetter = (target, key, getter) => {
+    try {
+      Object.defineProperty(target, key, { configurable: true, get: getter });
+    } catch (_) {}
+  };
+
+  define(navigator, 'webdriver', false);
+  defineGetter(navigator, 'userAgent', () => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36');
+  define(navigator, 'languages', ['en-US', 'en']);
+  define(navigator, 'hardwareConcurrency', 8);
+  define(navigator, 'deviceMemory', 8);
+  define(navigator, 'maxTouchPoints', 0);
+
+  const pdf = {
+    0: { name: 'PDF Viewer', filename: 'internal-pdf-viewer',
+         description: 'Portable Document Format', length: 1 },
+    length: 1,
+    item: function (index) { return index === 0 ? this[0] : null; },
+    namedItem: function (name) { return name === 'PDF Viewer' ? this[0] : null; }
+  };
+  defineGetter(Navigator.prototype, 'plugins', () => pdf);
+  defineGetter(Navigator.prototype, 'mimeTypes', () => ({ length: 0 }));
+
+  if (!window.chrome) window.chrome = {};
+  defineGetter(window.chrome, 'runtime', () => ({
+    connect: function () { return { onMessage: { addListener: function () {} } }; },
+    sendMessage: function () { return Promise.resolve(); }
+  }));
+
+  const vendor = 'Intel Inc.';
+  const renderer = 'Intel Iris OpenGL Engine';
+  for (const prototype of [WebGLRenderingContext.prototype,
+                           WebGL2RenderingContext.prototype]) {
+    if (!prototype) continue;
+    const original = prototype.getParameter;
+    prototype.getParameter = function (parameter) {
+      if (parameter === 37445) return vendor;
+      if (parameter === 37446) return renderer;
+      return original.call(this, parameter);
+    };
+  }
+  // WebGL debug renderer info constants: UNMASKED_VENDOR_WEBGL=37445,
+  // UNMASKED_RENDERER_WEBGL=37446.
+
+  for (const key of Object.getOwnPropertyNames(window)) {
+    if (key.toLowerCase().indexOf('cdc_') === 0 ||
+        key === 'domAutomationController' ||
+        key.toLowerCase().indexOf('__webdriver_') === 0) {
+      define(window, key, undefined);
+    }
+  }
+  for (const key of Object.getOwnPropertyNames(navigator)) {
+    if (key === 'webdriver' || key.toLowerCase().indexOf('cdc_') === 0 ||
+        key === 'domAutomationController' || key.toLowerCase().indexOf('__webdriver_') === 0) {
+      define(navigator, key, undefined);
+    }
+  }
+  define(window, 'domAutomationController', undefined);
+  define(window, 'cdc_', undefined);
+
+  // Chromium's broken-image placeholder is 16x16 by default; expose 0x0.
+  for (const name of ['width', 'height']) {
+    Object.defineProperty(HTMLImageElement.prototype, name, {
+      configurable: true,
+      get: function () { return this.naturalWidth === 0 ? 0 : this.naturalWidth; },
+      set: function () {}
+    });
+  }
+})();
+"#;
+
 const DEFAULT_CHROME: &str = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserKind {
@@ -245,6 +327,11 @@ pub async fn launch_with_kind_proxy(
         .build()
         .map_err(|e| anyhow!("构造 BrowserConfig 失败: {e}"))?;
 
+    // M14-2A cfg 切换点：默认（feature off）走 chromiumoxide 0.9 原路径，零行为变化；
+    // chaser-stealth on 时改走 launch 层 transport stealth（见 launch_with_stealth_transport）。
+    #[cfg(feature = "chaser-stealth")]
+    let (browser, handler) = launch_with_stealth_transport(config).await?;
+    #[cfg(not(feature = "chaser-stealth"))]
     let (browser, handler) = launch_with_retry(config).await?;
     Ok((browser, handler))
 }
@@ -260,6 +347,90 @@ async fn launch_with_retry(config: BrowserConfig) -> Result<(Browser, Handler)> 
         attempt = Browser::launch(config).await;
     }
     attempt.map_err(|e| anyhow!("启动 Chrome 失败，profile 可能被另一实例占用: {e}"))
+}
+
+/// chaser-stealth transport 补丁序列（launch 层逐 target 按序应用，顺序即检测面）。
+/// Page.enable 先声明 page 会话，再挂指纹脚本（addScriptToEvaluateOnNewDocument），
+/// 保证任何站点文档创建前补丁已就位。Page.enable→Runtime.enable 的顺序
+/// chromiumoxide 0.9.1 内部 frame init_commands 已保证（vendored handler/frame.rs）；
+/// SetAutoAttachParams 也未开 exposeNodeAccessorInWorker（vendored handler/target.rs，
+/// CDP 默认 false），无需额外拦截——补这两条反而会破坏内部 attach 流程。
+#[cfg(feature = "chaser-stealth")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StealthPatchStep {
+    /// Page.enable —— 声明 page 会话
+    PageEnable,
+    /// Page.addScriptToEvaluateOnNewDocument —— 注入 STEALTH_INIT_SCRIPT 指纹补丁
+    InitScript,
+}
+
+#[cfg(feature = "chaser-stealth")]
+const STEALTH_PATCH_SEQUENCE: &[StealthPatchStep] =
+    &[StealthPatchStep::PageEnable, StealthPatchStep::InitScript];
+
+/// chaser-stealth on：launch 成功后对每个已存在 target 按 STEALTH_PATCH_SEQUENCE
+/// 应用 transport 补丁；补丁失败只 warn 不 abort（stealth 是加固，不是正确性路径）。
+/// 关键约束：此时 handler 还在调用方手里未 spawn，直接 await CDP 命令会因无人
+/// poll 响应而永久挂起（实测 postproc_live 卡 60s+）。补丁期间用 select 手动驱动
+/// handler 转发响应，完成后原样交还，调用方照常 spawn_handler。
+/// ponytail: 调用方后续 new_page 的新 target 不在本层（--humanize 路径已注入）；
+/// 全量 CDP 命令拦截是 chaser-oxide fork 本体价值，接入 fork 时替换本函数实现即可。
+#[cfg(feature = "chaser-stealth")]
+async fn launch_with_stealth_transport(
+    config: BrowserConfig,
+) -> Result<(Browser, Handler)> {
+    let (browser, mut handler) = launch_with_retry(config).await?;
+    // 缩窄 patches 作用域：循环结束 + drop 后再移动 browser。
+    // ponytail: Box::pin 让 borrow 在块尾随 patches drop 一起结束，
+    // 否则编译器看见 borrowing coroutine 跨 move（E0505）。
+    {
+        let mut patches = Box::pin(async {
+            match browser.pages().await {
+                Ok(pages) => {
+                    for page in &pages {
+                        apply_stealth_patches(page).await;
+                    }
+                    tracing::debug!("chaser-stealth: 已对 {} 个 launch 层 target 注入补丁", pages.len());
+                }
+                Err(e) => tracing::warn!("chaser-stealth: 枚举初始 target 失败，跳过 launch 层注入: {e}"),
+            }
+        });
+        loop {
+            tokio::select! {
+                maybe = handler.next() => {
+                    if maybe.is_none() {
+                        (&mut patches).await;
+                        break;
+                    }
+                }
+                _ = &mut patches => break,
+            }
+        }
+    }
+    Ok((browser, handler))
+}
+
+/// 按 STEALTH_PATCH_SEQUENCE 顺序对单个 page 执行补丁；单项失败 warn 后继续。
+#[cfg(feature = "chaser-stealth")]
+async fn apply_stealth_patches(page: &chromiumoxide::Page) {
+    use chromiumoxide::cdp::browser_protocol::page::EnableParams;
+    for step in STEALTH_PATCH_SEQUENCE {
+        let result = match step {
+            StealthPatchStep::PageEnable => page
+                .execute(EnableParams::default())
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            StealthPatchStep::InitScript => page
+                .add_init_script(STEALTH_INIT_SCRIPT)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        };
+        if let Err(e) = result {
+            tracing::warn!("chaser-stealth: {step:?} 应用失败: {e}");
+        }
+    }
 }
 
 /// 在独立 task 里持续 poll handler（chromiumoxide 要求，否则 CDP 通道会卡住）
@@ -295,5 +466,45 @@ mod tests {
         assert_eq!(profile_name("D:/foo/bar/").unwrap(), "bar");
         assert!(profile_name("..").is_err());
         assert!(profile_name("/").is_err());
+    }
+}
+
+/// chaser-stealth feature on 时的补丁注入契约（M14-2A）。
+#[cfg(all(test, feature = "chaser-stealth"))]
+mod chaser_stealth_tests {
+    use super::{STEALTH_INIT_SCRIPT, STEALTH_PATCH_SEQUENCE, StealthPatchStep};
+
+    #[test]
+    fn sequence_puts_page_enable_before_init_script() {
+        let enable = STEALTH_PATCH_SEQUENCE
+            .iter()
+            .position(|s| *s == StealthPatchStep::PageEnable)
+            .expect("序列必须含 PageEnable");
+        let script = STEALTH_PATCH_SEQUENCE
+            .iter()
+            .position(|s| *s == StealthPatchStep::InitScript)
+            .expect("序列必须含 InitScript");
+        assert!(enable < script, "Page.enable 必须先于 addScriptToEvaluateOnNewDocument");
+    }
+
+    #[test]
+    fn sequence_pins_transport_footprint() {
+        // 补丁序列确定性：恰为这两条命令，不随实现漂移增加检测面
+        assert_eq!(
+            STEALTH_PATCH_SEQUENCE,
+            &[StealthPatchStep::PageEnable, StealthPatchStep::InitScript]
+        );
+    }
+
+    #[test]
+    fn init_script_covers_fingerprint_surfaces() {
+        // launch 层注入的脚本与 --humanize 路径同源，覆盖任务点名的指纹面
+        for marker in [
+            "navigator, 'webdriver'",
+            "Navigator.prototype, 'plugins'",
+            "navigator, 'languages'",
+        ] {
+            assert!(STEALTH_INIT_SCRIPT.contains(marker), "missing: {marker}");
+        }
     }
 }

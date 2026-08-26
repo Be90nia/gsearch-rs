@@ -17,83 +17,9 @@ const WARMUP_URLS: &[&str] = &[
 ];
 
 /// JavaScript installed on every new document created by a page.
-pub const INIT_SCRIPT: &str = r#"
-(() => {
-  const define = (target, key, value) => {
-    try {
-      Object.defineProperty(target, key, { configurable: true, get: () => value });
-    } catch (_) {}
-  };
-  const defineGetter = (target, key, getter) => {
-    try {
-      Object.defineProperty(target, key, { configurable: true, get: getter });
-    } catch (_) {}
-  };
-
-  define(navigator, 'webdriver', false);
-  defineGetter(navigator, 'userAgent', () => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36');
-  define(navigator, 'languages', ['en-US', 'en']);
-  define(navigator, 'hardwareConcurrency', 8);
-  define(navigator, 'deviceMemory', 8);
-  define(navigator, 'maxTouchPoints', 0);
-
-  const pdf = {
-    0: { name: 'PDF Viewer', filename: 'internal-pdf-viewer',
-         description: 'Portable Document Format', length: 1 },
-    length: 1,
-    item: function (index) { return index === 0 ? this[0] : null; },
-    namedItem: function (name) { return name === 'PDF Viewer' ? this[0] : null; }
-  };
-  defineGetter(Navigator.prototype, 'plugins', () => pdf);
-  defineGetter(Navigator.prototype, 'mimeTypes', () => ({ length: 0 }));
-
-  if (!window.chrome) window.chrome = {};
-  defineGetter(window.chrome, 'runtime', () => ({
-    connect: function () { return { onMessage: { addListener: function () {} } }; },
-    sendMessage: function () { return Promise.resolve(); }
-  }));
-
-  const vendor = 'Intel Inc.';
-  const renderer = 'Intel Iris OpenGL Engine';
-  for (const prototype of [WebGLRenderingContext.prototype,
-                           WebGL2RenderingContext.prototype]) {
-    if (!prototype) continue;
-    const original = prototype.getParameter;
-    prototype.getParameter = function (parameter) {
-      if (parameter === 37445) return vendor;
-      if (parameter === 37446) return renderer;
-      return original.call(this, parameter);
-    };
-  }
-  // WebGL debug renderer info constants: UNMASKED_VENDOR_WEBGL=37445,
-  // UNMASKED_RENDERER_WEBGL=37446.
-
-  for (const key of Object.getOwnPropertyNames(window)) {
-    if (key.toLowerCase().indexOf('cdc_') === 0 ||
-        key === 'domAutomationController' ||
-        key.toLowerCase().indexOf('__webdriver_') === 0) {
-      define(window, key, undefined);
-    }
-  }
-  for (const key of Object.getOwnPropertyNames(navigator)) {
-    if (key === 'webdriver' || key.toLowerCase().indexOf('cdc_') === 0 ||
-        key === 'domAutomationController' || key.toLowerCase().indexOf('__webdriver_') === 0) {
-      define(navigator, key, undefined);
-    }
-  }
-  define(window, 'domAutomationController', undefined);
-  define(window, 'cdc_', undefined);
-
-  // Chromium's broken-image placeholder is 16x16 by default; expose 0x0.
-  for (const name of ['width', 'height']) {
-    Object.defineProperty(HTMLImageElement.prototype, name, {
-      configurable: true,
-      get: function () { return this.naturalWidth === 0 ? 0 : this.naturalWidth; },
-      set: function () {}
-    });
-  }
-})();
-"#;
+/// M14-2A 起文本搬到 lib 单一事实源（`gsearch::browser::STEALTH_INIT_SCRIPT`），
+/// launch 层（chaser-stealth feature）与本调用方（--humanize）共用；别名保持旧路径零变化。
+pub const INIT_SCRIPT: &str = gsearch::browser::STEALTH_INIT_SCRIPT;
 
 /// Install the fingerprint patch before the first navigation.
 pub async fn install_init_script(page: &Page) -> Result<()> {

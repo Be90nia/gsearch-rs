@@ -3,6 +3,12 @@ name = "gsearch"
 version = "0.2.0"
 edition = "2024"
 
+[features]
+# M14-2A chaser-stealth：默认关闭。on 时 launch 层启用 transport stealth（CDP 序列补丁）。
+# chaser-oxide fork 本体 API 与 chromiumoxide 类型不互通（接入需全库换 CDP 客户端），
+# 按竞品扫描 §3 降级为本仓库内实现，不引 fork。
+chaser-stealth = []
+
 [dependencies]
 chromiumoxide = "0.9"
 tokio = { version = "1", features = ["full"] }
