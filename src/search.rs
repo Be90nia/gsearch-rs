@@ -29,8 +29,10 @@ pub struct SearchConfig {
 }
 
 pub fn is_captcha(html: &str) -> bool {
+    // 注意：裸 "recaptcha" 子串在正常结果页脚本里也出现（审计挂账的误报源），
+    // 只认验证页形态：captcha-form 容器 / g-recaptcha 部件 / 三条文案。
     html.contains("captcha-form")
-        || html.contains("recaptcha")
+        || html.contains("g-recaptcha")
         || unusual_traffic(html)
 }
 
@@ -136,6 +138,17 @@ async fn poll_until_solved(page: &Page, timeout_secs: u64) -> Result<Option<Stri
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut since_last_log = 0u64;
     loop {
+        // URL 先判：解完验证后页面导航到 /search?q=...，比 content 判定可靠
+        // （结果页 HTML 可能残留 "recaptcha" 子串导致 is_captcha 永真 → 假超时）。
+        if let Ok(Some(u)) = page.url().await
+            && u.contains("/search?")
+            && !u.contains("/sorry/")
+        {
+            tracing::info!("CAPTCHA 已解（页面已导航到结果页）");
+            if let Ok(html) = page.content().await {
+                return Ok(Some(html));
+            }
+        }
         match page.content().await {
             Ok(html) if !is_captcha(&html) => return Ok(Some(html)),
             Ok(_) => {} // 仍是 captcha，继续等
@@ -185,6 +198,14 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{is_captcha, unusual_traffic};
+
+    /// 结果页脚本残留 "recaptcha" 字样不得误判为验证页（真机假超时的根因）。
+    #[test]
+    fn serp_with_recaptcha_script_is_not_captcha() {
+        let serp = r#"<html><body><script src="https://www.gstatic.com/recaptcha/releases/x.js"></script><a href="https://example.com"><h3>Title</h3></a></body></html>"#;
+        assert!(!is_captcha(serp));
+    }
+
     #[test]
     fn captcha_prompts_are_early_detected() {
         assert!(is_captcha("<p>Unusual traffic from your computer network</p>"));
