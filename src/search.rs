@@ -234,4 +234,15 @@ mod tests {
         assert!(unusual_traffic("Our Systems Have Detected traffic"));
         assert!(unusual_traffic("UNUSUAL TRAFFIC"));
     }
+    #[test]
+    fn urlencode_handles_fuzz_inputs() {
+        use super::urlencode;
+        assert_eq!(urlencode("a&b=c?d"), "a%26b%3Dc%3Fd");
+        assert_eq!(urlencode("中文 query"), "%E4%B8%AD%E6%96%87%20query");
+        assert_eq!(urlencode("🦀 rust"), "%F0%9F%A6%80%20rust");
+        assert_eq!(urlencode("abc-_.~"), "abc-_.~");
+        let big = "a".repeat(2000);
+        assert_eq!(urlencode(&big).len(), 2000);
+    }
 }
+
