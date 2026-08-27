@@ -322,6 +322,9 @@ pub async fn launch(headless: bool) -> Result<(Browser, Handler)> {
 /// 等价 plsearch AppContext.reveal_for_captcha（main.py:133-137）。
 pub async fn swap_to_headed(browser: &mut Browser) -> Result<()> {
     browser.close().await.map_err(|e| anyhow!("close 当前 browser 失败: {e}"))?;
+    // 必须 wait：close 只发信号，chrome 子进程在后台跑——不 wait 就立刻 launch 会撞
+    // 上一实例尚未释放的 profile 锁（"残留锁被活 Chrome 持有"，见 cleanup_stale_locks 注释）。
+    let _ = browser.wait().await;
     let (new_browser, handler) = launch(false).await?;
     *browser = new_browser;
     spawn_handler(handler);
