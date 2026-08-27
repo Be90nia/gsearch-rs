@@ -185,19 +185,40 @@ pub fn find_chrome() -> Result<PathBuf> {
     Ok(p)
 }
 
-/// Profile 目录：env `GSEARCH_PROFILE` > 配置文件 profile 键 > default，
-/// 取末段名放进 `~/.gsearch/profiles/`。
+/// Profile 目录：env `GSEARCH_PROFILE` > 配置文件 profile 键 > default。
+/// 值为**已存在的绝对路径**时直接用作 profile 目录（换盘符存放）；
+/// 否则视为 profile 名，放进 `~/.gsearch/profiles/<名>/`。
 pub fn profile_dir() -> Result<PathBuf> {
-    let name = match effective_profile_raw() {
-        Some(raw) => profile_name(&raw)?,
-        None => "default".to_owned(),
+    let path = match effective_profile_raw() {
+        Some(raw) if is_absolute_dir(&raw) => std::path::absolute(raw.trim())?,
+        Some(raw) => {
+            let name = profile_name(&raw)?;
+            let home = home_dir()
+                .context("HOME/USERPROFILE env 未设置，无法定位默认 profile 目录")?;
+            std::path::absolute(home.join(".gsearch").join("profiles").join(name))?
+        }
+        None => {
+            let home = home_dir()
+                .context("HOME/USERPROFILE env 未设置，无法定位默认 profile 目录")?;
+            std::path::absolute(home.join(".gsearch").join("profiles").join("default"))?
+        }
     };
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .context("HOME/USERPROFILE env 未设置，无法定位默认 profile 目录")?;
-    let path = std::path::absolute(PathBuf::from(home).join(".gsearch").join("profiles").join(name))?;
     ensure_dir(&path)?;
     Ok(path)
+}
+
+/// 值是“存在的绝对路径目录”→ 当存放路径用（不是 profile 名）。
+fn is_absolute_dir(raw: &str) -> bool {
+    let p = Path::new(raw.trim());
+    p.is_absolute() && p.is_dir()
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
 }
 
 /// 生效的 profile 原始值（env 优先，其次配置文件；两者都空返回 None）。
@@ -209,10 +230,18 @@ fn effective_profile_raw() -> Option<String> {
     }
     crate::config::load().profile.clone()
 }
-/// M14-1B：取 meta 头部用的 profile 末段名（不创建目录、纯查询）。
+/// M14-1B：取 meta 头部用的 profile 名（不创建目录、纯查询）。
+/// 绝对路径模式返回末段名（meta 里仍展示可读名字）。
 /// ponytail: profile_dir() 会 create_dir_all 在没设 env 时副作用意外；这里只读。
 pub fn profile_name_only() -> String {
     match effective_profile_raw() {
+        Some(raw) if is_absolute_dir(&raw) => {
+            Path::new(raw.trim())
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("default")
+                .to_owned()
+        }
         Some(raw) => profile_name(&raw).unwrap_or_else(|_| "default".into()),
         None => "default".into(),
     }

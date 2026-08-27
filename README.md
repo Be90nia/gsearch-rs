@@ -89,10 +89,15 @@ EOF（Ctrl+D / Ctrl+Z+Enter）才真正退出；单条命令出错只打印 `err
 ```
 
 查找顺序：`--config <path>` 显式指定 → `./gsearch.json`（当前目录）→ `~/.gsearch/config.json`。
-只读已存在的文件，不主动创建——exe 和 gsearch.json 放同一目录即“绿色软件”，清理零残留。
+只读已存在的文件，不主动创建——exe 和 gsearch.json 放同一目录即"绿色软件"，清理零残留。
 
-优先级（各键独立）：环境变量 > 配置文件 > 默认值。`profile` 值语义同 `GSEARCH_PROFILE`
-（取末段名放进 `~/.gsearch/profiles/`，保留名/非法路径照拦）。
+优先级（各键独立）：环境变量 > 配置文件 > 默认值。
+
+`profile` 值两种语义：
+
+- **名字**（如 `"work"`）→ 数据存 `~/.gsearch/profiles/work/`
+- **已存在的绝对路径**（如 `"D:/gsearch-profiles/main"`）→ **直接用作存放目录**，
+  数据全在该路径下（换盘符存放用这个；目录需预先存在，不存在的路径按名字处理）
 
 ### `--browser <chrome|edge|auto>`（M11 多浏览器兑底）
 
