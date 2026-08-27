@@ -375,15 +375,19 @@ async fn cmd_dl(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     }
     let url = match n_token {
         Some(n_str) => {
-            let n: usize = n_str.parse().map_err(|_| anyhow!("dl N 非数字: {n_str:?}"))?;
-            if n == 0 || n > ctx.last_results.len() {
-                return Err(anyhow!("dl {n} 越界（结果数 {}）", ctx.last_results.len()));
+            // 数字 → 取第 N 条搜索结果；其他 → 视为 URL 直下
+            if let Ok(n) = n_str.parse::<usize>() {
+                if n == 0 || n > ctx.last_results.len() {
+                    return Err(anyhow!("dl {n} 越界（结果数 {}）", ctx.last_results.len()));
+                }
+                ctx.last_results[n - 1].url.clone()
+            } else {
+                n_str.to_string()
             }
-            ctx.last_results[n - 1].url.clone()
         }
         None => {
             if ctx.current_url.is_empty() {
-                return Err(anyhow!("dl 缺 N 且 current_url 未设置（先 browse 或 click）"));
+                return Err(anyhow!("dl 缺 N/URL 且 current_url 未设置（先 browse 或 click）"));
             }
             ctx.current_url.clone()
         }
