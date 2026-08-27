@@ -388,19 +388,21 @@ async fn cmd_doctor() -> Result<ExitCode> {
         }
     }
 
-    // 6) GSEARCH_PROFILE 路径检查
-    match std::env::var("GSEARCH_PROFILE") {
-        Ok(v) if !v.trim().is_empty() => {
-            let p = std::path::PathBuf::from(v.trim());
-            let exists = p.exists();
-            if exists {
-                println!("[ OK ] GSEARCH_PROFILE 已设置且存在: {}", p.display());
-            } else {
-                println!("[WARN] GSEARCH_PROFILE 已设置但路径不存在: {}（gsearch 会自动创建）", p.display());
-                warn += 1;
-            }
+    // 6) 生效 profile 来源检查（env > 配置文件 > default）
+    if let Ok(v) = std::env::var("GSEARCH_PROFILE")
+        && !v.trim().is_empty()
+    {
+        let p = std::path::PathBuf::from(v.trim());
+        if p.exists() {
+            println!("[ OK ] GSEARCH_PROFILE 已设置且存在: {}", p.display());
+        } else {
+            println!("[WARN] GSEARCH_PROFILE 已设置但路径不存在: {}（gsearch 会自动创建）", p.display());
+            warn += 1;
         }
-        _ => println!("[ OK ] GSEARCH_PROFILE 未设置（默认 ~/.gsearch/profiles/default/）"),
+    } else if let Some(p) = gsearch::config::load().profile.clone() {
+        println!("[ OK ] profile 来自配置文件: {p}");
+    } else {
+        println!("[ OK ] GSEARCH_PROFILE 未设置（默认 ~/.gsearch/profiles/default/）");
     }
 
     let elapsed_ms = started.elapsed().as_millis();
