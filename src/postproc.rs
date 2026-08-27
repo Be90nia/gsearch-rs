@@ -31,10 +31,15 @@ fn pick<'a>(results: &'a [SearchResult], n: usize, flag: &str) -> Result<&'a str
 /// `--open N`：默认浏览器开窗。
 pub fn open(results: &[SearchResult], n: usize) -> Result<()> {
     let url = pick(results, n, "open")?;
-    if let Err(e) = std::process::Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .spawn()
-    {
+    // 三平台原生开窗命令；cfg! 让三个分支都在全平台编译（无 cfg 死代码）。
+    let spawned = if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd").args(["/c", "start", "", url]).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(url).spawn()
+    };
+    if let Err(e) = spawned {
         tracing::warn!("打开默认浏览器失败（不影响输出）: {e}");
     }
     Ok(())
@@ -257,6 +262,8 @@ mod live_tests {
         std::fs::remove_file("download.bin").unwrap();
     }
 
+    /// 直接断言 `cmd /c start` 机制——Windows 专属；Linux/macOS 由 CI matrix 的编译覆盖。
+    #[cfg(windows)]
     #[test]
     fn open_mechanism() {
         let st = std::process::Command::new("cmd")

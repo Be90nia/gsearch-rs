@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 mod general;
 mod postproc;
 mod shell;
+mod shell_snap;
 mod stealth;
 
 // Windows 控制台 UTF-8：让 println! / eprintln! 正确输出中文标题与 SERP 摘要。

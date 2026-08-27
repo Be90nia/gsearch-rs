@@ -122,16 +122,25 @@ gsearch doctor
 任意 FAIL 退出码 1；WARN 整体可用；都 OK 退出 0。CI 或首次安装后跑一次可快速定位是浏览器路径、profile 权限、网络出口哪一类故障。
 ### 安装与构建
 
+三种方式任选：
+
 ```
-cargo build --release
-./target/release/gsearch.exe --help
+# 1. Release 页下载单二进制（Windows / Linux / macOS）
+#    打 tag v* 自动构建并附加到 GitHub Releases
+
+# 2. 源码安装（需 Rust 工具链）
+cargo install --path .
+
+# 3. 源码构建
+git clone <repo> && cd gsearch-rs && cargo build --release
+./target/release/gsearch --help
 ```
 
-单 exe + Chrome 即可运行。不装 Python/venv/Node。
+单 exe + Chrome 即可运行，不装 Python/venv/Node。Linux/macOS 同样只需本地有 Chrome 或 Edge。
 
 ## 设计
 
-项目根 PLAN.md 为权威设计文档。
+项目根 [`docs/PLAN.md`](docs/PLAN.md) 为权威设计文档。
 
 ## License
 
