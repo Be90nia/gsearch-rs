@@ -172,6 +172,18 @@ async fn cmd_search(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
         },
     )
     .await?;
+    // CAPTCHA 路径里 run_search 会 swap_to_headed 换 browser 实例——旧 page 句柄
+    // 随旧 browser 死掉（后续命令报 "receiver is gone"）。检测失效即重建。
+    if ctx.page.evaluate("1").await.is_err() {
+        ctx.page = ctx
+            .browser
+            .new_page("about:blank")
+            .await
+            .context("CAPTCHA 换 browser 后重建 page 失败")?;
+    }
+    if let Ok(Some(u)) = ctx.page.url().await {
+        ctx.current_url = u;
+    }
     print_text(&results);
     if results.is_empty() {
         println!("（搜索无结果）");
