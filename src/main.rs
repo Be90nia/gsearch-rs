@@ -229,6 +229,8 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         stealth::install_init_script(&page).await?;
         stealth::warmup(&page).await?;
     }
+    // ponytail: 顶层 search 没人在场 stdin 给 noop Arc（human_solved 永远是 false，不影响行为）
+    let human_solved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let outcome = gsearch::search::run_search_on_page(
         &mut browser,
         gsearch::search::SearchConfig {
@@ -237,9 +239,9 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         },
         page,
         &mut h_slot,
+        human_solved,
     )
     .await?;
-    // 解构 outcome：M15 透明等待协议按结局分支（不再统一 anyhow 退出）
     let (results, captcha_solved) = match outcome {
         gsearch::search::SearchOutcome::Results { results, captcha_solved } => (results, captcha_solved),
         gsearch::search::SearchOutcome::CaptchaTimeout => {

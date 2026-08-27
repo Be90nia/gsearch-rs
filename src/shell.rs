@@ -9,9 +9,12 @@
 use std::path::Path;
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+
 use chromiumoxide::Page;
 use chromiumoxide::browser::Browser;
 
@@ -52,6 +55,8 @@ pub struct ShellCtx {
     /// M16：swap_to_headed 会 abort 旧 handler task 再起新 task，避免 chromiumoxide 0.9.1
     /// "send failed because receiver is gone"（旧 handler 还跑着，新 Browser sender 没人接）
     pub handler_task: Option<tokio::task::JoinHandle<()>>,
+    /// M17：撞 CAPTCHA 时人工按 Enter 立即加速 poll loop 退出（不需等 1s tick 或超时）
+    pub human_solved: Arc<AtomicBool>,
 }
 /// 起一次 headless Chrome，进入 `gsearch> ` REPL；EOF / Ctrl+D 走 graceful 关闭。
 /// exit/quit 走二次确认（提示用户 EOF），状态机不增。
@@ -70,24 +75,24 @@ pub async fn run_shell() -> Result<ExitCode> {
         last_snap: Vec::new(),
         current_url: String::new(),
         handler_task: Some(browser::spawn_handler(handler)),
+        human_solved: Arc::new(AtomicBool::new(false)),
     };
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = io::stdout();
-
-    println!("进入 gsearch shell（输入 help 查命令，exit / quit / Ctrl+D 退出）");
     let mut buf = String::new();
     loop {
         buf.clear();
-        write!(stdout, "{PROMPT}")?;
+        print!("{PROMPT}");
         stdout.flush()?;
         let n = reader.read_line(&mut buf)?;
         if n == 0 {
             // EOF：Ctrl+D（Unix）或 Ctrl+Z 回车（Windows）
             println!();
-            println!("[EOF] 退出 shell");
             break;
         }
+        // 命令行输入也算"用户活跃"——重置 human_solved 让下条 search 命令不会被旧信号立即 break
+        ctx.human_solved.store(false, std::sync::atomic::Ordering::Relaxed);
         let line = buf.trim();
         if line.is_empty() {
             continue;
@@ -97,11 +102,10 @@ pub async fn run_shell() -> Result<ExitCode> {
             continue;
         };
         let args: Vec<&str> = parts.collect();
-        // 单条命令出错只打 error，不退出 shell
         if let Err(e) = dispatch(cmd, &args, &mut ctx).await {
             eprintln!("error: {e}");
             for cause in e.chain().skip(1) {
-                eprintln!("  原因: {cause}");
+                eprintln!(" 原因: {cause}");
             }
         }
     }
@@ -147,21 +151,18 @@ async fn dispatch(cmd: &str, args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
 fn print_help() {
     println!(
         "shell 命令集：\n\
-         search <query> [--limit N]   Google 搜索，结果存入 last_results\n\
-         click <N> / open <N>         跳到 last_results[N-1].url\n\
-         click @eN                    点击 snap 元素（a 跳 href，其余 JS click）\n\
-         snap / snapshot              列出当前页可交互元素（ref e1..eN，供 click @eN）\n\
-         read                         打印当前页（默认 AdaptiveRead 三段）\n\
-         dl [N] [-o DIR]              下载 last_results[N-1].url 到 DIR 或 CWD（N 缺省走 current_url）\n\
-         browse <url>                 goto <url> 并更新 current_url\n\
-         login <url>                  切有头窗人工登录；关窗后提示是否切回 headless\n\
-         back                         页面后退\n\
-         status                       打印 current_url / title / 结果数 / profile 路径\n\
-         help                         本帮助\n\
+         search <query> [--limit N]   Google 搜索\n\
+         browse <url>                 渲染 + 取正文\n\
+         snap                         列出可交互元素 (@eN)\n\
+         click N | @eN                跳到第 N 结果 / 第 N snap 元素\n\
+         read [N] [--full]            读第 N 结果正文\n\
+         dl N [--output DIR]          下载第 N 个结果\n\
+         login <url>                  有头窗登录\n\
+         back / status                后退 / / 当前 URL + 标题\n\
+         help                         帮助\n\
          exit / quit                  提示退出；EOF / Ctrl+D 真退出"
     );
 }
-
 async fn cmd_search(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     let (query, limit) = parse_search_args(args)?;
     let outcome = run_search(
@@ -171,6 +172,7 @@ async fn cmd_search(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
             limit,
         },
         &mut ctx.handler_task,
+        ctx.human_solved.clone(),
     )
     .await?;
     let results = match outcome {
@@ -624,8 +626,8 @@ mod tests {
         // --limit 非数字
         assert!(parse_search_args(&["q", "--limit", "abc"]).is_err());
         // --limit 缺值
-        assert!(parse_search_args(&["q", "--limit"]).is_err());
+    assert!(parse_search_args(&["q", "--limit"]).is_err());
+    }
 }
 
-}
 

@@ -5,8 +5,9 @@
 //! 行为真值逐条对照 Python 版（plsearch main.py:236-343 / config.py:18-19, 112-139）。
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-
 use anyhow::{Result, anyhow};
 use chromiumoxide::Page;
 use chromiumoxide::browser::Browser;
@@ -56,9 +57,14 @@ pub enum SearchOutcome {
 }
 
 /// 翻页搜索直到凑满 limit / 空页 / 打满 MAX_PAGES；中途首页撞 CAPTCHA 切有头轮询等人解。
-pub async fn run_search(browser: &mut Browser, cfg: SearchConfig, h_slot: &mut Option<tokio::task::JoinHandle<()>>) -> Result<SearchOutcome> {
+pub async fn run_search(
+    browser: &mut Browser,
+    cfg: SearchConfig,
+    h_slot: &mut Option<tokio::task::JoinHandle<()>>,
+    human_solved: Arc<AtomicBool>,
+) -> Result<SearchOutcome> {
     let page = browser.new_page("about:blank").await?;
-    run_search_on_page(browser, cfg, page, h_slot).await
+    run_search_on_page(browser, cfg, page, h_slot, human_solved).await
 }
 
 pub async fn run_search_on_page(
@@ -66,6 +72,7 @@ pub async fn run_search_on_page(
     cfg: SearchConfig,
     page: Page,
     h_slot: &mut Option<tokio::task::JoinHandle<()>>,
+    human_solved: Arc<AtomicBool>,
 ) -> Result<SearchOutcome> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut collected: Vec<SearchResult> = Vec::new();
@@ -95,7 +102,7 @@ pub async fn run_search_on_page(
             swap_to_headed(browser, h_slot).await?;
             let page2 = browser.new_page("about:blank").await?;
             page2.goto(&url).await.map_err(|e| anyhow!("goto {url} 失败: {e}"))?;
-            content = match poll_until_solved(&page2, CAPTCHA_TIMEOUT_SECS).await? {
+            content = match poll_until_solved(&page2, CAPTCHA_TIMEOUT_SECS, human_solved.clone()).await? {
                 Some(html) => {
                     captcha_solved = true;
                     html
@@ -149,7 +156,11 @@ async fn swap_to_headed(browser: &mut Browser, h_slot: &mut Option<tokio::task::
 /// 轮询 page content 直到非 captcha 或超时。等价 plsearch wait_until_captcha_solved（config.py:117-139）。
 /// 瞬态错误（页面 mid-navigation / 连接抖动）debug 跳过，deadline 到才返回 None。
 /// 返回 Some(html) 表示解完；None 表示超时；Err 表示浏览器已被手关（连接断开）。
-async fn poll_until_solved(page: &Page, timeout_secs: u64) -> Result<Option<String>> {
+async fn poll_until_solved(
+    page: &Page,
+    timeout_secs: u64,
+    human_solved: Arc<AtomicBool>,
+) -> Result<Option<String>> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut since_last_log = 0u64;
     loop {
@@ -160,6 +171,13 @@ async fn poll_until_solved(page: &Page, timeout_secs: u64) -> Result<Option<Stri
             && !u.contains("/sorry/")
         {
             tracing::info!("CAPTCHA 已解（页面已导航到结果页）");
+            if let Ok(html) = page.content().await {
+                return Ok(Some(html));
+            }
+        }
+        // human_solved=true = 人工按 Enter 确认已解完（poll 循环下一 tick 即可 break）
+        if human_solved.load(Ordering::Relaxed) {
+            tracing::info!("人工确认 CAPTCHA 已解（stdin Enter）");
             if let Ok(html) = page.content().await {
                 return Ok(Some(html));
             }
@@ -178,7 +196,7 @@ async fn poll_until_solved(page: &Page, timeout_secs: u64) -> Result<Option<Stri
         // 心跳：每 15s 报一次剩余时间（120s 默认下用户会看到 8 条进度）。
         if since_last_log == 0 || since_last_log.is_multiple_of(15) {
             let remaining = (deadline - Instant::now()).as_secs();
-            tracing::info!("CAPTCHA 轮询中（还剩约 {remaining}s/{timeout_secs}s，解完请关窗）");
+            tracing::info!("CAPTCHA 轮询中（还剩约 {remaining}s/{timeout_secs}s，解完请按 Enter 加速通过）");
         }
         since_last_log += CAPTCHA_POLL_SECS;
         tokio::time::sleep(Duration::from_secs(CAPTCHA_POLL_SECS)).await;
