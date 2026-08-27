@@ -321,18 +321,16 @@ pub async fn launch(headless: bool) -> Result<(Browser, Handler)> {
 /// CAPTCHA 双模式（M3）核心：cookie 落盘保留（Playwright 做不到热切换，同款方案）。
 /// 等价 plsearch AppContext.reveal_for_captcha（main.py:133-137）。
 pub async fn swap_to_headed(browser: &mut Browser) -> Result<()> {
-    browser.close().await.map_err(|e| anyhow!("close 当前 browser 失败: {e}"))?;
-    // 必须 wait：close 只发信号，chrome 子进程在后台跑——不 wait 就立刻 launch 会撞
-    // 上一实例尚未释放的 profile 锁（"残留锁被活 Chrome 持有"，见 cleanup_stale_locks 注释）。
-    let _ = browser.wait().await;
-    let (new_browser, handler) = launch(false).await?;
+    graceful_close(browser).await;
+    // M16：kill_residual_chrome_strict 兜底清掉 chromiumoxide 0.9.1 关闭后 chrome 子进程树残留
+    // （renderer/gpu/utility），避免新 launch 撞 profile 锁
+    #[cfg(windows)]
+    kill_residual_chrome_strict();
+    let (new_browser, _handler) = launch(false).await?;
     *browser = new_browser;
-    spawn_handler(handler);
     Ok(())
 }
 
-/// 启动浏览器并返回 (Browser, Handler)。`kind = None` 自动兑底；
-/// `kind = Some(_)` 时若指定浏览器不可用则兑底到第一个可用浏览器（不报错）。
 pub async fn launch_with_kind(headless: bool, kind: Option<BrowserKind>) -> Result<(Browser, Handler)> {
     let proxy = std::env::var("GSEARCH_PROXY").ok().filter(|s| !s.is_empty());
     launch_with_kind_proxy(headless, kind, proxy).await
@@ -524,11 +522,36 @@ pub fn spawn_handler(handler: Handler) -> tokio::task::JoinHandle<()> {
 /// 关 Chrome 并等进程死透。chromiumoxide 0.9 的 close 只 background kill，
 /// 不调 wait() 直接 Drop 会报 "was not closed manually" WARN，且 profile 锁残留。
 /// 顶层命令（search/browse/login/dl）+ shell 退出统一走这条，避免下一次 launch 撞 profile 锁。
+///
+/// M16 压测发现：chromiumoxide 0.9.1 在 Windows 上 close + wait 后 child 仍可能残留
+/// （handler 退出循环但未给 chrome 发 CDP Browser.close 命令，kill_on_drop 仅 Unix 生效）。
+/// 若 wait 拿到 None 或 child 仍存活，主动 `kill()` 强杀；这是 chromiumoxide 公开 API（browser/mod.rs:315）。
+#[cfg(windows)]
+pub fn kill_residual_chrome_strict() {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/IM", "chrome.exe", "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(windows))]
+pub fn kill_residual_chrome_strict() {}
+
 pub async fn graceful_close(browser: &mut Browser) {
     if let Err(e) = browser.close().await {
         tracing::warn!("close browser 失败: {e}");
     }
-    let _ = browser.wait().await;
+    match browser.wait().await {
+        Ok(Some(status)) if status.success() => {} // 正常退出
+        _ => {
+            // 残留：强制杀子进程（连同子子进程），再 wait 兜底
+            if let Some(Err(e)) = browser.kill().await {
+                tracing::warn!("kill browser 失败: {e}");
+            }
+            let _ = browser.wait().await;
+        }
+    }
 }
 
 #[cfg(test)]

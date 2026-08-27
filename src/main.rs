@@ -248,9 +248,8 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
                 eprintln!("error: CAPTCHA 亲解超时（{}s）；profile 已养熟，再次执行会跳过 CAPTCHA",
                     gsearch::search::CAPTCHA_TIMEOUT_SECS);
             }
-            if let Err(e) = browser.close().await { tracing::warn!("close browser 失败: {e}"); }
-            let _ = browser.wait().await;
-            return Ok(ExitCode::from(3)); // 3 = CAPTCHA 超时（区别于 1=错误 / 2=无结果）
+            gsearch::browser::graceful_close(&mut browser).await;
+            return Ok(ExitCode::from(3));
         }
     };
     if args.json {
@@ -303,10 +302,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     }
     .await;
 
-    if let Err(e) = browser.close().await {
-        tracing::warn!("close browser 失败: {e}");
-    }
-    let _ = browser.wait().await;
+    gsearch::browser::graceful_close(&mut browser).await;
     if let Err(e) = post {
         eprintln!("postproc 失败: {e}");
     }
