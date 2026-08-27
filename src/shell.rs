@@ -49,14 +49,14 @@ pub struct ShellCtx {
     pub last_results: Vec<SearchResult>,
     pub last_snap: Vec<SnapElem>,
     pub current_url: String,
+    /// M16：swap_to_headed 会 abort 旧 handler task 再起新 task，避免 chromiumoxide 0.9.1
+    /// "send failed because receiver is gone"（旧 handler 还跑着，新 Browser sender 没人接）
+    pub handler_task: Option<tokio::task::JoinHandle<()>>,
 }
-
 /// 起一次 headless Chrome，进入 `gsearch> ` REPL；EOF / Ctrl+D 走 graceful 关闭。
 /// exit/quit 走二次确认（提示用户 EOF），状态机不增。
-/// Ctrl+C 在 tokio runtime 默认是 process kill；本进程按 Ctrl+C = 退出 shell（同 Ctrl+D）。
 pub async fn run_shell() -> Result<ExitCode> {
     let (browser, handler) = browser::launch(true).await.context("启动 Chrome 失败")?;
-    let _h = browser::spawn_handler(handler);
 
     let page = browser
         .new_page("about:blank")
@@ -69,8 +69,8 @@ pub async fn run_shell() -> Result<ExitCode> {
         last_results: Vec::new(),
         last_snap: Vec::new(),
         current_url: String::new(),
+        handler_task: Some(browser::spawn_handler(handler)),
     };
-
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = io::stdout();
@@ -170,6 +170,7 @@ async fn cmd_search(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
             query: query.clone(),
             limit,
         },
+        &mut ctx.handler_task,
     )
     .await?;
     let results = match outcome {
@@ -462,7 +463,7 @@ async fn cmd_browse(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
 async fn cmd_login(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     let url = args.first().ok_or_else(|| anyhow!("login 缺 url"))?;
     // 先切有头（close + 同 profile 重起），保持 cookie 不丢
-    swap_to_headed(&mut ctx.browser).await?;
+    swap_to_headed(&mut ctx.browser, &mut ctx.handler_task).await?;
     // 有头模式下旧 page 已随旧 browser 关闭，新开一个
     ctx.page = ctx
         .browser
@@ -514,7 +515,7 @@ async fn cmd_login(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     let ans = ans.trim().to_lowercase();
     if ans.is_empty() || ans == "y" || ans == "yes" {
         // 同 profile 重起 headless，page 也得重建
-        swap_to_headed(&mut ctx.browser).await?;
+        swap_to_headed(&mut ctx.browser, &mut ctx.handler_task).await?;
         ctx.page = ctx
             .browser
             .new_page("about:blank")
@@ -529,8 +530,8 @@ async fn cmd_login(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
 }
 /// close 当前 browser 并同 profile 起重起有头实例。
 /// 等价 plsearch AppContext.reveal_for_captcha（main.py:133-137）。
-async fn swap_to_headed(browser: &mut Browser) -> Result<()> {
-    browser::swap_to_headed(browser).await
+async fn swap_to_headed(browser: &mut Browser, h_slot: &mut Option<tokio::task::JoinHandle<()>>) -> Result<()> {
+    browser::swap_to_headed(browser, h_slot).await
 }
 
 

@@ -222,7 +222,8 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     let (mut browser, handler) = gsearch::browser::launch_with_kind_proxy(true, browser_kind, proxy.clone())
         .await
         .context("启动 Chrome/Edge 失败：检查 GSEARCH_CHROME 是否指向 chrome.exe/msedge.exe，或 profile 被另一实例占用")?;
-    let _h = gsearch::browser::spawn_handler(handler);
+    // h_slot: swap_to_headed 时 abort 旧 handler task，再起新 task 接新 Browser 的 sender
+    let mut h_slot = Some(gsearch::browser::spawn_handler(handler));
     let page = browser.new_page("about:blank").await?;
     if args.humanize {
         stealth::install_init_script(&page).await?;
@@ -235,6 +236,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             limit: args.limit,
         },
         page,
+        &mut h_slot,
     )
     .await?;
     // 解构 outcome：M15 透明等待协议按结局分支（不再统一 anyhow 退出）

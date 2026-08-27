@@ -320,17 +320,22 @@ pub async fn launch(headless: bool) -> Result<(Browser, Handler)> {
 /// close 当前 browser 并同 profile 起重起**有头**实例。
 /// CAPTCHA 双模式（M3）核心：cookie 落盘保留（Playwright 做不到热切换，同款方案）。
 /// 等价 plsearch AppContext.reveal_for_captcha（main.py:133-137）。
-pub async fn swap_to_headed(browser: &mut Browser) -> Result<()> {
+pub async fn swap_to_headed(
+    browser: &mut Browser,
+    handler_slot: &mut Option<tokio::task::JoinHandle<()>>,
+) -> Result<()> {
     graceful_close(browser).await;
-    // M16：kill_residual_chrome_strict 兜底清掉 chromiumoxide 0.9.1 关闭后 chrome 子进程树残留
-    // （renderer/gpu/utility），避免新 launch 撞 profile 锁
-    #[cfg(windows)]
-    kill_residual_chrome_strict();
-    let (new_browser, _handler) = launch(false).await?;
+    let (new_browser, handler) = launch(false).await?;
+    // 关键：abort 旧 handler task 避免与新 Browser 的 sender 错配，否则 chromiumoxide 0.9.1
+    // handler 内部状态机在 sender drop 时报"Browser was not closed manually" warn，
+    // 后续新 Browser 的 CreatePage 发去已死 handler task → "send failed receiver is gone"。
+    if let Some(h) = handler_slot.take() {
+        h.abort();
+    }
+    *handler_slot = Some(spawn_handler(handler));
     *browser = new_browser;
     Ok(())
 }
-
 pub async fn launch_with_kind(headless: bool, kind: Option<BrowserKind>) -> Result<(Browser, Handler)> {
     let proxy = std::env::var("GSEARCH_PROXY").ok().filter(|s| !s.is_empty());
     launch_with_kind_proxy(headless, kind, proxy).await
@@ -538,6 +543,9 @@ pub fn kill_residual_chrome_strict() {
 #[cfg(not(windows))]
 pub fn kill_residual_chrome_strict() {}
 
+/// 关 Chrome 并等进程死透。chromiumoxide 0.9.1 的 close 只断 CDP 不保证杀子进程树；
+/// 调 kill() 兜底（公开 API，browser/mod.rs:315）。顶层命令（search/browse/login/dl）
+/// + shell 退出统一走这条，避免下一次 launch 撞 profile 锁。
 pub async fn graceful_close(browser: &mut Browser) {
     if let Err(e) = browser.close().await {
         tracing::warn!("close browser 失败: {e}");
@@ -545,7 +553,7 @@ pub async fn graceful_close(browser: &mut Browser) {
     match browser.wait().await {
         Ok(Some(status)) if status.success() => {} // 正常退出
         _ => {
-            // 残留：强制杀子进程（连同子子进程），再 wait 兜底
+            // 残留：杀子进程，再 wait 兜底
             if let Some(Err(e)) = browser.kill().await {
                 tracing::warn!("kill browser 失败: {e}");
             }

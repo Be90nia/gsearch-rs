@@ -56,15 +56,16 @@ pub enum SearchOutcome {
 }
 
 /// 翻页搜索直到凑满 limit / 空页 / 打满 MAX_PAGES；中途首页撞 CAPTCHA 切有头轮询等人解。
-pub async fn run_search(browser: &mut Browser, cfg: SearchConfig) -> Result<SearchOutcome> {
+pub async fn run_search(browser: &mut Browser, cfg: SearchConfig, h_slot: &mut Option<tokio::task::JoinHandle<()>>) -> Result<SearchOutcome> {
     let page = browser.new_page("about:blank").await?;
-    run_search_on_page(browser, cfg, page).await
+    run_search_on_page(browser, cfg, page, h_slot).await
 }
 
 pub async fn run_search_on_page(
     browser: &mut Browser,
     cfg: SearchConfig,
     page: Page,
+    h_slot: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<SearchOutcome> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut collected: Vec<SearchResult> = Vec::new();
@@ -91,8 +92,7 @@ pub async fn run_search_on_page(
                 break;
             }
             // 首页撞码：切有头轮询等人解（plsearch main.py:339-343 reveal_for_captcha + _search wait_for_captcha=True）
-            tracing::info!("检测到 CAPTCHA，起有头窗等人解（≤{}s）", CAPTCHA_TIMEOUT_SECS);
-            swap_to_headed(browser).await?;
+            swap_to_headed(browser, h_slot).await?;
             let page2 = browser.new_page("about:blank").await?;
             page2.goto(&url).await.map_err(|e| anyhow!("goto {url} 失败: {e}"))?;
             content = match poll_until_solved(&page2, CAPTCHA_TIMEOUT_SECS).await? {
@@ -142,8 +142,8 @@ pub async fn run_search_on_page(
 
 /// close 当前 browser 并同 profile 起重起有头实例。
 /// 等价 plsearch AppContext.reveal_for_captcha（main.py:133-137）。
-async fn swap_to_headed(browser: &mut Browser) -> Result<()> {
-    browser::swap_to_headed(browser).await
+async fn swap_to_headed(browser: &mut Browser, h_slot: &mut Option<tokio::task::JoinHandle<()>>) -> Result<()> {
+    browser::swap_to_headed(browser, h_slot).await
 }
 
 /// 轮询 page content 直到非 captcha 或超时。等价 plsearch wait_until_captcha_solved（config.py:117-139）。
