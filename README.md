@@ -75,8 +75,24 @@ EOF（Ctrl+D / Ctrl+Z+Enter）才真正退出；单条命令出错只打印 `err
 ### 环境变量
 
 - `GSEARCH_PROFILE`：profile 名或任意输入路径（统一取末段名）
-- `GSEARCH_CHROME`：覆盖默认 Chrome 路径
 - `RUST_LOG=debug`：查详细信息
+
+### 配置文件（gsearch.json，可选）
+
+不想用环境变量时，写 JSON 配置文件：
+
+```json
+{
+  "profile": "work",
+  "chrome": "D:/Sdk/Chrome/chrome.exe"
+}
+```
+
+查找顺序：`--config <path>` 显式指定 → `./gsearch.json`（当前目录）→ `~/.gsearch/config.json`。
+只读已存在的文件，不主动创建——exe 和 gsearch.json 放同一目录即“绿色软件”，清理零残留。
+
+优先级（各键独立）：环境变量 > 配置文件 > 默认值。`profile` 值语义同 `GSEARCH_PROFILE`
+（取末段名放进 `~/.gsearch/profiles/`，保留名/非法路径照拦）。
 
 ### `--browser <chrome|edge|auto>`（M11 多浏览器兑底）
 

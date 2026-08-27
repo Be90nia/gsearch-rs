@@ -38,12 +38,14 @@ fn enable_utf8_console() {}
     about = "Google 搜索 + 通用浏览器代理 CLI（真 Chrome + 持久 profile）"
 )]
 struct Cli {
-    /// RUST_LOG-style 详细日志：debug / info / warn（默认 info）
     #[arg(long, global = true, default_value = "info")]
     verbose: String,
     /// 浏览器代理，例：http://127.0.0.1:7890 / socks5://127.0.0.1:1080；走环境 GSEARCH_PROXY 同效。
     #[arg(long, global = true)]
     proxy: Option<String>,
+    /// 配置文件路径（gsearch.json；不指定则依次找 ./gsearch.json、~/.gsearch/config.json）
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Command,
 }
@@ -161,6 +163,12 @@ async fn main() -> ExitCode {
     enable_utf8_console();
     let cli = Cli::parse();
     init_tracing(&cli.verbose);
+    if let Some(p) = &cli.config
+        && let Err(e) = gsearch::config::set_explicit_and_load(p.clone())
+    {
+        eprintln!("error: {e:#}");
+        return ExitCode::from(2);
+    }
     // GSEARCH_PROXY env 作为默认值（CLI --proxy 覆盖）
     let proxy = cli.proxy.clone().or_else(|| std::env::var("GSEARCH_PROXY").ok().filter(|s| !s.is_empty()));
     let result: Result<ExitCode> = match cli.cmd {

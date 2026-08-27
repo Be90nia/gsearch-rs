@@ -105,7 +105,10 @@ const DEFAULT_EDGE_64: &str = r"C:\Program Files\Microsoft\Edge\Application\msed
 /// `where chrome.exe` / `where msedge.exe`。Edge 是 Chromium 内核，参数与 Chrome 兼容。
 /// 返回的 `(path, kind)` 供 `launch()` 决定是否需要任何浏览器特定逻辑。
 pub fn find_browser() -> Result<(PathBuf, BrowserKind)> {
-    if let Ok(p) = std::env::var("GSEARCH_CHROME") {
+    let env_or_cfg = std::env::var("GSEARCH_CHROME")
+        .ok()
+        .or_else(|| crate::config::load().chrome.clone());
+    if let Some(p) = env_or_cfg {
         let path = PathBuf::from(p);
         if path.is_file() {
             let kind = if path.to_string_lossy().to_ascii_lowercase().contains("msedge") {
@@ -143,10 +146,9 @@ pub fn find_browser() -> Result<(PathBuf, BrowserKind)> {
     }
 
     Err(anyhow!(
-        "找不到 Chrome 或 Edge；请装 Chrome 到 {DEFAULT_CHROME}，或 Edge 到 {DEFAULT_EDGE}，或设 GSEARCH_CHROME env"
+        "找不到 Chrome 或 Edge；请装 Chrome 到 {DEFAULT_CHROME}，或 Edge 到 {DEFAULT_EDGE}，或设 GSEARCH_CHROME env / 配置文件 chrome 键"
     ))
 }
-
 /// 给定 BrowserKind 查找对应路径；找不到返回 None（让 launch() 兑底到 find_browser）。
 pub fn find_specific(kind: BrowserKind) -> Option<(PathBuf, BrowserKind)> {
     let exe_name = match kind {
@@ -183,11 +185,12 @@ pub fn find_chrome() -> Result<PathBuf> {
     Ok(p)
 }
 
-/// Profile 目录：env `GSEARCH_PROFILE` 取末段名放进 `~/.gsearch/profiles/`，未设时用 `default`。
+/// Profile 目录：env `GSEARCH_PROFILE` > 配置文件 profile 键 > default，
+/// 取末段名放进 `~/.gsearch/profiles/`。
 pub fn profile_dir() -> Result<PathBuf> {
-    let name = match std::env::var("GSEARCH_PROFILE") {
-        Ok(raw) if !raw.trim().is_empty() => profile_name(&raw)?,
-        _ => "default".to_owned(),
+    let name = match effective_profile_raw() {
+        Some(raw) => profile_name(&raw)?,
+        None => "default".to_owned(),
     };
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -196,14 +199,33 @@ pub fn profile_dir() -> Result<PathBuf> {
     ensure_dir(&path)?;
     Ok(path)
 }
+
+/// 生效的 profile 原始值（env 优先，其次配置文件；两者都空返回 None）。
+fn effective_profile_raw() -> Option<String> {
+    if let Ok(raw) = std::env::var("GSEARCH_PROFILE")
+        && !raw.trim().is_empty()
+    {
+        return Some(raw);
+    }
+    crate::config::load().profile.clone()
+}
+/// M14-1B：取 meta 头部用的 profile 末段名（不创建目录、纯查询）。
+/// ponytail: profile_dir() 会 create_dir_all 在没设 env 时副作用意外；这里只读。
+pub fn profile_name_only() -> String {
+    match effective_profile_raw() {
+        Some(raw) => profile_name(&raw).unwrap_or_else(|_| "default".into()),
+        None => "default".into(),
+    }
+}
+
 fn profile_name(raw: &str) -> Result<String> {
     let path = Path::new(raw.trim()).to_path_buf();
     let name = path.file_name().and_then(|part| part.to_str()).unwrap_or_default();
     if name.is_empty() || name == ".." || name == "." || name == "/" {
-        return Err(anyhow!("GSEARCH_PROFILE 路径末段非法: {raw:?}"));
+        return Err(anyhow!("profile 路径末段非法: {raw:?}"));
     }
     if is_windows_reserved(name) {
-        return Err(anyhow!("GSEARCH_PROFILE 是 Windows 保留设备名: {raw:?}"));
+        return Err(anyhow!("profile 是 Windows 保留设备名: {raw:?}"));
     }
     Ok(name.to_owned())
 }
@@ -215,15 +237,6 @@ fn is_windows_reserved(name: &str) -> bool {
     match stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT")) {
         Some(d) => d.len() == 1 && (b'1'..=b'9').contains(&d.as_bytes()[0]),
         None => matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL"),
-    }
-}
-
-/// M14-1B：取 meta 头部用的 profile 末段名（不创建目录、纯查询）。
-/// ponytail: profile_dir() 会 create_dir_all 在没设 env 时副作用意外；这里只读。
-pub fn profile_name_only() -> String {
-    match std::env::var("GSEARCH_PROFILE") {
-        Ok(raw) if !raw.trim().is_empty() => profile_name(&raw).unwrap_or_else(|_| "default".into()),
-        _ => "default".into(),
     }
 }
 
