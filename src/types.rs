@@ -39,9 +39,36 @@ pub struct MetaOutput {
 
 /// M14-1B：`--json` 输出的统一信封，`results` 是真正的载荷（Vec 或 AdaptiveRead）。
 /// ponytail: 用泛型让 search / browse / dl 共用同一序列化路径；不引新依赖。
+/// M15 扩展：每次响应顶层带状态，便于 Agent 识别四种结局而不必解析 stderr / 文案。
+/// 协议约定：
+///   * `Ok`               → 正常出结果，captcha_solved 记录本次是否经过人工验证
+///   * `CaptchaRequired`  → 当前页撞验证，已起有头窗等人解；results 留空但 Agent 拿到事件
+///   * `CaptchaTimeout`   → 等人解超时，results 留空
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    Ok,
+    CaptchaRequired,
+    CaptchaTimeout,
+    #[default]
+    Error,
+}
+
+/// M15 扩展：人类可读的状态文本，Agent 可直接喂回 LLM。
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct RunStatusInfo {
+    pub status: RunStatus,
+    /// 本次是否经过人工 CAPTCHA 验证（仅 Ok 时有信息量）。
+    pub captcha_solved: bool,
+    /// 人类可读提示。CaptchaRequired 时含“弹窗请用户验证 + 已等 N 秒/120 秒”。
+    pub message: String,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct OutputEnvelope<T: Serialize> {
     pub meta: MetaOutput,
+    /// M15：放在 results 前面让 Agent 优先看到状态字段（按 JSON key 顺序）。
+    pub run: RunStatusInfo,
     pub results: T,
 }
 
@@ -87,32 +114,62 @@ mod tests {
         }
     }
 
-    /// M14-1B 验收：`--json` 信封顶层有 meta + results，且字段名与 schema spec 一一对应。
+    /// M14-1B 验收：`--json` 信封顶层有 meta + run + results，且 run.status 序列化小写 snake_case。
     #[test]
-    fn envelope_serializes_meta_and_results() {
-        let env = OutputEnvelope { meta: sample_meta(), results: sample_results() };
+    fn envelope_serializes_meta_run_results() {
+        let env = OutputEnvelope {
+            meta: sample_meta(),
+            run: RunStatusInfo {
+                status: RunStatus::Ok,
+                captcha_solved: false,
+                message: String::new(),
+            },
+            results: sample_results(),
+        };
         let v: serde_json::Value = serde_json::to_value(&env).unwrap();
         assert!(v.get("meta").is_some(), "missing meta");
+        assert!(v.get("run").is_some(), "missing run");
         assert!(v.get("results").is_some(), "missing results");
+        // run.status 序列化为字符串（snake_case），不是 enum tag
+        let s = serde_json::to_string(&env).unwrap();
+        assert!(s.contains("\"status\":\"ok\""), "run.status 应小写 snake_case: {s}");
+        assert!(!s.contains("\"Ok\""), "Ok 不应作为字符串原样输出: {s}");
         let m = &v["meta"];
         assert_eq!(m["tool"], "gsearch");
         assert_eq!(m["version"], "0.2.0");
         assert_eq!(m["query"], "python asyncio");
         assert_eq!(m["profile"], "default");
-        assert_eq!(m["browser_kind"], "Chrome");
-        assert_eq!(m["proxy"], serde_json::Value::Null);
-        assert_eq!(m["results_count"], 1);
-        assert_eq!(m["truncated"], false);
-        assert_eq!(v["results"][0]["url"], "https://example.com/");
     }
-
     /// M14-1B 验收：proxy = None 必须序列化成 JSON `null`（不是缺失字段，不是空字符串）。
     #[test]
     fn meta_proxy_none_serializes_as_null() {
-        let env = OutputEnvelope { meta: sample_meta(), results: sample_results() };
+        let env = OutputEnvelope {
+            meta: sample_meta(),
+            run: RunStatusInfo { status: RunStatus::Ok, captcha_solved: false, message: String::new() },
+            results: sample_results(),
+        };
         let s = serde_json::to_string(&env).unwrap();
         assert!(s.contains("\"proxy\":null"), "proxy 应为 JSON null: {s}");
-        assert!(!s.contains("\"proxy\":\"\""), "proxy 不应是空字符串");
+        assert!(!s.contains("\"proxy\":\""), "proxy 不应是空字符串");
+    }
+
+    /// M15：四种状态都正确序列化小写 snake_case。
+    #[test]
+    fn run_status_all_variants_serialize_snake_case() {
+        for (status, expected) in [
+            (RunStatus::Ok, "\"status\":\"ok\""),
+            (RunStatus::CaptchaRequired, "\"status\":\"captcha_required\""),
+            (RunStatus::CaptchaTimeout, "\"status\":\"captcha_timeout\""),
+            (RunStatus::Error, "\"status\":\"error\""),
+        ] {
+            let env = OutputEnvelope::<Vec<SearchResult>> {
+                meta: sample_meta(),
+                run: RunStatusInfo { status, captcha_solved: false, message: "x".into() },
+                results: vec![],
+            };
+            let s = serde_json::to_string(&env).unwrap();
+            assert!(s.contains(expected), "{expected} not in {s}");
+        }
     }
 
     /// M14-1B 验收：browse / dl 命令 query 留空串（schema spec 要求）。

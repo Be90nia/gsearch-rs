@@ -228,7 +228,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         stealth::install_init_script(&page).await?;
         stealth::warmup(&page).await?;
     }
-    let results = gsearch::search::run_search_on_page(
+    let outcome = gsearch::search::run_search_on_page(
         &mut browser,
         gsearch::search::SearchConfig {
             query: args.query.clone(),
@@ -237,9 +237,23 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         page,
     )
     .await?;
+    // 解构 outcome：M15 透明等待协议按结局分支（不再统一 anyhow 退出）
+    let (results, captcha_solved) = match outcome {
+        gsearch::search::SearchOutcome::Results { results, captcha_solved } => (results, captcha_solved),
+        gsearch::search::SearchOutcome::CaptchaTimeout => {
+            // 输出 captcha_timeout JSON（Agent 看到 status 字段就知道等人解超时）
+            if args.json {
+                emit_captcha_timeout_json(&args, &browser_path, &resolved_kind, proxy.clone(), started.elapsed().as_millis());
+            } else {
+                eprintln!("error: CAPTCHA 亲解超时（{}s）；profile 已养熟，再次执行会跳过 CAPTCHA",
+                    gsearch::search::CAPTCHA_TIMEOUT_SECS);
+            }
+            if let Err(e) = browser.close().await { tracing::warn!("close browser 失败: {e}"); }
+            let _ = browser.wait().await;
+            return Ok(ExitCode::from(3)); // 3 = CAPTCHA 超时（区别于 1=错误 / 2=无结果）
+        }
+    };
     if args.json {
-        // M14-1B：--json 输出 self-describing 信封 `{meta, results}`。query 填查询串；
-        // browse / dl 留空（schema 唯一对应 search 的 [{title,url,snippet}...] 形状）。
         let meta = gsearch::types::MetaOutput {
             tool: "gsearch",
             version: env!("CARGO_PKG_VERSION"),
@@ -254,7 +268,12 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             results_count: results.len(),
             truncated: results.len() >= args.limit,
         };
-        let envelope = gsearch::types::OutputEnvelope { meta, results: &results };
+        let run = gsearch::types::RunStatusInfo {
+            status: gsearch::types::RunStatus::Ok,
+            captcha_solved,
+            message: if captcha_solved { "本次搜索经过了人工 CAPTCHA 验证".into() } else { String::new() },
+        };
+        let envelope = gsearch::types::OutputEnvelope { meta, run, results: &results };
         gsearch::output::print_envelope_json(&envelope)?;
     } else {
         gsearch::output::print_text(&results);
@@ -297,6 +316,39 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+/// M15：CAPTCHA 超时时输出 status=captcha_timeout 的 JSON 信封。
+fn emit_captcha_timeout_json(
+    args: &SearchArgs,
+    browser_path: &std::path::Path,
+    resolved_kind: &gsearch::browser::BrowserKind,
+    proxy: Option<String>,
+    elapsed_ms: u128,
+) {
+    let meta = gsearch::types::MetaOutput {
+        tool: "gsearch",
+        version: env!("CARGO_PKG_VERSION"),
+        query: args.query.clone(),
+        profile: gsearch::browser::profile_name_only(),
+        browser_kind: format!("{resolved_kind:?}"),
+        browser_path: browser_path.to_string_lossy().into_owned(),
+        proxy,
+        humanize: args.humanize,
+        limit: args.limit,
+        elapsed_ms,
+        results_count: 0,
+        truncated: false,
+    };
+    let run = gsearch::types::RunStatusInfo {
+        status: gsearch::types::RunStatus::CaptchaTimeout,
+        captcha_solved: false,
+        message: format!("CAPTCHA 亲解超时（{}s）；profile 已养熟，下次执行会自动跳过 CAPTCHA",
+            gsearch::search::CAPTCHA_TIMEOUT_SECS),
+    };
+    let envelope: gsearch::types::OutputEnvelope<Vec<()>> =
+        gsearch::types::OutputEnvelope { meta, run, results: vec![] };
+    let _ = gsearch::output::print_envelope_json(&envelope);
 }
 
 fn browser_arg_to_kind(arg: BrowserArg) -> Option<gsearch::browser::BrowserKind> {

@@ -43,8 +43,20 @@ pub fn unusual_traffic(html: &str) -> bool {
         || lower.contains("/sorry/index")
 }
 
+/// M15：搜索结果 + 是否撞码过验证，Agent 拿一次 JSON 就能知道全部状态。
+#[derive(Debug)]
+pub enum SearchOutcome {
+    /// 正常出结果，可能包含“本轮经过人工 CAPTCHA 验证”的标记。
+    Results {
+        results: Vec<SearchResult>,
+        captcha_solved: bool,
+    },
+    /// 等人解超时，无结果。
+    CaptchaTimeout,
+}
+
 /// 翻页搜索直到凑满 limit / 空页 / 打满 MAX_PAGES；中途首页撞 CAPTCHA 切有头轮询等人解。
-pub async fn run_search(browser: &mut Browser, cfg: SearchConfig) -> Result<Vec<SearchResult>> {
+pub async fn run_search(browser: &mut Browser, cfg: SearchConfig) -> Result<SearchOutcome> {
     let page = browser.new_page("about:blank").await?;
     run_search_on_page(browser, cfg, page).await
 }
@@ -53,10 +65,10 @@ pub async fn run_search_on_page(
     browser: &mut Browser,
     cfg: SearchConfig,
     page: Page,
-) -> Result<Vec<SearchResult>> {
+) -> Result<SearchOutcome> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut collected: Vec<SearchResult> = Vec::new();
-    tracing::info!("搜索 {:?}（limit={}）", cfg.query, cfg.limit);
+    let mut captcha_solved = false;
     'pages: for page_idx in 0..MAX_PAGES {
         if collected.len() >= cfg.limit {
             break;
@@ -84,16 +96,16 @@ pub async fn run_search_on_page(
             let page2 = browser.new_page("about:blank").await?;
             page2.goto(&url).await.map_err(|e| anyhow!("goto {url} 失败: {e}"))?;
             content = match poll_until_solved(&page2, CAPTCHA_TIMEOUT_SECS).await? {
-                Some(html) => html,
+                Some(html) => {
+                    captcha_solved = true;
+                    html
+                }
                 None => {
-                    return Err(anyhow!(
-                        "CAPTCHA 亲解超时（{}s）",
-                        CAPTCHA_TIMEOUT_SECS
-                    ));
+                    // M15：超时不是错误而是 SearchOutcome，让调用方按 mode 决定
+                    // JSON 输出 captcha_timeout 而非 anyhow 退出。
+                    return Ok(SearchOutcome::CaptchaTimeout);
                 }
             };
-            // ponytail: 解完后不切回 headless。CLI 一次性 search 无后续轮询，
-            // 切回意味着再 close + launch 一次同 profile，多一次 profile 锁竞态风险 + 丢 page 状态。
             // 若以后接多轮 search，复用 plsearch main.py 的 hide_after_captcha() 模式即可。
             // 后续页沿用同一 page（不切回也不重 open）→ continue 翻页
             let results = parse_serp(&content);
@@ -121,8 +133,11 @@ pub async fn run_search_on_page(
             }
         }
     }
-    collected.truncate(cfg.limit); // 不要 [..limit] 裸切片：len < limit 时会 panic
-    Ok(collected)
+     collected.truncate(cfg.limit);
+    Ok(SearchOutcome::Results {
+        results: collected,
+        captcha_solved,
+    })
 }
 
 /// close 当前 browser 并同 profile 起重起有头实例。

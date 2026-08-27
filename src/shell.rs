@@ -17,7 +17,7 @@ use chromiumoxide::browser::Browser;
 
 use gsearch::browser;
 use gsearch::output::print_text;
-use gsearch::search::{SearchConfig, is_captcha, run_search};
+use gsearch::search::{SearchConfig, SearchOutcome, is_captcha, run_search};
 use gsearch::skeleton::{extract_adaptive, format_adaptive, format_headings_only, format_json};
 use gsearch::types::SearchResult;
 use gsearch::util::{b64_decode, filename_from_url};
@@ -164,7 +164,7 @@ fn print_help() {
 
 async fn cmd_search(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     let (query, limit) = parse_search_args(args)?;
-    let results = run_search(
+    let outcome = run_search(
         &mut ctx.browser,
         SearchConfig {
             query: query.clone(),
@@ -172,6 +172,14 @@ async fn cmd_search(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
         },
     )
     .await?;
+    let results = match outcome {
+        SearchOutcome::Results { results, .. } => results,
+        SearchOutcome::CaptchaTimeout => {
+            println!("CAPTCHA 亲解超时（{}s）—— profile 已养熟，下次 search 会自动跳过",
+                gsearch::search::CAPTCHA_TIMEOUT_SECS);
+            return Ok(());
+        }
+    };
     // CAPTCHA 路径里 run_search 会 swap_to_headed 换 browser 实例——旧 page 句柄
     // 随旧 browser 死掉（后续命令报 "receiver is gone"）。检测失效即重建。
     if ctx.page.evaluate("1").await.is_err() {
