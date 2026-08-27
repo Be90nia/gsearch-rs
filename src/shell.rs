@@ -396,6 +396,14 @@ async fn cmd_dl(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
 /// credentials:'include' 带同源 cookie；`async function ()` 而非箭头（chromiumoxide 函数探测）。
 async fn dl_in_page(page: &Page, url: &str, output: Option<&Path>) -> Result<()> {
     let _ = tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url)).await;
+    // goto 已跟完重定向；fetch 当前页真实 URL（相对当前页同源，绕开 /goto?url= 类
+    // 重定向链的 CORS 限制——真机踩坑：dl 1 对搜索结果的 google.com/goto 链直接 Failed to fetch）。
+    let final_url = page
+        .url()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| url.to_string());
     let js = format!(
         "async function () {{
             const r = await fetch({}, {{credentials: 'include'}});
@@ -406,7 +414,7 @@ async fn dl_in_page(page: &Page, url: &str, output: Option<&Path>) -> Result<()>
             for (const x of u8) s += String.fromCharCode(x);
             return btoa(s);
         }}",
-        serde_json::to_string(url)?
+        serde_json::to_string(&final_url)?
     );
     let b64 = page
         .evaluate(js)
@@ -419,8 +427,7 @@ async fn dl_in_page(page: &Page, url: &str, output: Option<&Path>) -> Result<()>
         return Err(anyhow!("下载内容为空（{url}）"));
     }
     let dir = std::path::absolute(output.unwrap_or_else(|| Path::new(".")))?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
-    let path = dir.join(filename_from_url(url));
+    let path = dir.join(filename_from_url(&final_url));
     std::fs::write(&path, &bytes).with_context(|| format!("写文件失败: {}", path.display()))?;
     println!("已下载: {} ({} bytes)", path.display(), bytes.len());
     Ok(())
