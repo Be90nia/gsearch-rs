@@ -234,6 +234,9 @@ mod live_tests {
     }
 
     /// 单一 async 测试独占 profile 锁，避免并行启两个 Chrome 抢锁。
+    /// #[ignore]：真启 Chrome + 访问外网，属手工验证测试（cargo test --ignored 跑）。
+    /// 之前混进默认 cargo test：真 Chrome 不 close 造成进程残留。
+    #[ignore]
     #[tokio::test]
     async fn postproc_live() {
         let (browser, handler) = gsearch::browser::launch(true).await.unwrap();
@@ -263,6 +266,9 @@ mod live_tests {
     }
 
     /// 直接断言 `cmd /c start` 机制——Windows 专属；Linux/macOS 由 CI matrix 的编译覆盖。
+    /// #[ignore]：真开默认浏览器窗口（每次 cargo test 弹 example.com 就是它），
+    /// 属手工验证测试（cargo test --ignored 跑）。
+    #[ignore]
     #[cfg(windows)]
     #[test]
     fn open_mechanism() {
