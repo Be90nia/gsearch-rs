@@ -125,10 +125,10 @@ struct SearchArgs {
     dl: Option<usize>,
     #[arg(long, group = "post")]
     open: Option<usize>,
-    /// 启用 fingerprint 补丁 + Google 搜索前 warmup（opt-in；新 profile/裸搜可能撞码时建议 off）。
-    #[arg(long, default_value_t = false)]
+    /// 跳过搜索前的 warmup（Wikipedia/GitHub/HN 随机访问 + 滚动）+ 指纹补丁。
+    /// Agent 反复调时建议加；人用保留默认 warmup。
+    #[arg(long = "no-humanize", default_value_t = true, action = clap::ArgAction::SetFalse)]
     humanize: bool,
-    /// `--read N` 输出兜底纯 innerText（5000 字截断），覆盖默认 AdaptiveRead
     #[arg(long, default_value_t = false)]
     full: bool,
     /// `--read N` 输出 AdaptiveRead 结构化 JSON
@@ -150,7 +150,11 @@ struct SearchArgs {
 
 fn init_tracing(level: &str) {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
+    // chromiumoxide 0.9 与新版 Chrome 之间常打出无害的 "WS Invalid message" 噪音
+    // （Chrome 加新 ws message 变体，依赖没跟上，serde 不能匹配的 fallback）。
+    // 默认把它压到 error 级：需要 chromiumoxide 细节时再加 RUST_LOG=chromiumoxide=warn。
+    let composed = format!("{},chromiumoxide=error", level);
+    let filter = EnvFilter::try_new(composed).unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -546,11 +550,16 @@ mod tests {
     use super::{Cli, Command};
     use clap::Parser;
 
+
+    /// M18：humanize 默认 true（人用保留 warmup），加 --no-humanize 跳过。
     #[test]
-    fn humanize_defaults_to_false() {
+    fn humanize_defaults_to_true_unless_opted_out() {
         let cli = Cli::try_parse_from(["gsearch", "search", "test"]).unwrap();
         let Command::Search(args) = cli.cmd else { panic!("expected search") };
-        assert!(!args.humanize);
+        assert!(args.humanize);
+        let cli2 = Cli::try_parse_from(["gsearch", "search", "test", "--no-humanize"]).unwrap();
+        let Command::Search(args2) = cli2.cmd else { panic!("expected search") };
+        assert!(!args2.humanize);
     }
 
     #[test]

@@ -30,10 +30,10 @@ pub struct SearchConfig {
 }
 
 pub fn is_captcha(html: &str) -> bool {
-    // 注意：裸 "recaptcha" 子串在正常结果页脚本里也出现（审计挂账的误报源），
-    // 只认验证页形态：captcha-form 容器 / g-recaptcha 部件 / 三条文案。
+    // 只认验证页形态：captcha-form 容器 + 三条文案。
+    // "g-recaptcha" 子串在普通 SERP 脚本预加载里也出现，不能独立作判定
+    // （否则每次搜索都被误判成撞码，弹有头窗；审计挂账的 is_captcha false positives）。
     html.contains("captcha-form")
-        || html.contains("g-recaptcha")
         || unusual_traffic(html)
 }
 
@@ -236,6 +236,13 @@ mod tests {
     #[test]
     fn serp_with_recaptcha_script_is_not_captcha() {
         let serp = r#"<html><body><script src="https://www.gstatic.com/recaptcha/releases/x.js"></script><a href="https://example.com"><h3>Title</h3></a></body></html>"#;
+        assert!(!is_captcha(serp));
+    }
+
+    /// M18 回归测试
+    #[test]
+    fn serp_with_grecaptcha_script_is_not_captcha() {
+        let serp = r#"<html><body><script src="https://www.google.com/recaptcha/api.js"></script><div class="g-recaptcha"></div><h3>Real result</h3></html>"#;
         assert!(!is_captcha(serp));
     }
 
