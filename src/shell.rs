@@ -62,6 +62,7 @@ pub struct ShellCtx {
 /// exit/quit 走二次确认（提示用户 EOF），状态机不增。
 pub async fn run_shell() -> Result<ExitCode> {
     let (browser, handler) = browser::launch(true).await.context("启动 Chrome 失败")?;
+    let handler_task = Some(browser::spawn_handler(handler));
 
     let page = browser
         .new_page("about:blank")
@@ -74,11 +75,12 @@ pub async fn run_shell() -> Result<ExitCode> {
         last_results: Vec::new(),
         last_snap: Vec::new(),
         current_url: String::new(),
-        handler_task: Some(browser::spawn_handler(handler)),
+        handler_task,
         human_solved: Arc::new(AtomicBool::new(false)),
     };
     let stdin = io::stdin();
     let mut reader = stdin.lock();
+    println!("进入 gsearch shell（输入 help 查命令，exit / quit / Ctrl+D 退出）");
     let mut stdout = io::stdout();
     let mut buf = String::new();
     loop {
