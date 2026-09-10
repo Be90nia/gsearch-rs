@@ -75,7 +75,7 @@ EOF（Ctrl+D / Ctrl+Z+Enter）才真正退出；单条命令出错只打印 `err
 ### 环境变量
 
 - `GSEARCH_PROFILE`：profile 名或任意输入路径（统一取末段名）
-- `RUST_LOG=debug`：查详细信息
+- `GSEARCH_SEARXNG_URL`：SearXNG 实例地址（如 `http://192.168.89.249:8888`）；配置后 search 走 SearXNG 纯 HTTP 搜索（不走代理），失败自动回退 Google 直爬，`--json` 的 `meta.provider` 标注来源
 
 ### 配置文件（gsearch.json，可选）
 
@@ -84,8 +84,8 @@ EOF（Ctrl+D / Ctrl+Z+Enter）才真正退出；单条命令出错只打印 `err
 ```json
 {
   "profile": "work",
-  "chrome": "D:/Sdk/Chrome/chrome.exe"
-}
+  "chrome": "D:/Sdk/Chrome/chrome.exe",
+  "searxng_url": "http://192.168.89.249:8888"
 ```
 
 查找顺序：`--config <path>` 显式指定 → `./gsearch.json`（当前目录）→ `~/.gsearch/config.json`。
