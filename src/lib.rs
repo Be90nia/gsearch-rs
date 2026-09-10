@@ -4,6 +4,7 @@ pub mod skeleton;
 pub mod output;
 pub mod parse;
 pub mod search;
+pub mod searxng;
 pub mod types;
 pub mod util;
 pub mod verify;

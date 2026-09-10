@@ -51,6 +51,8 @@ pub enum SearchOutcome {
     Results {
         results: Vec<SearchResult>,
         captcha_solved: bool,
+        /// M16：结果来源（"searxng" / "google"），供 MetaOutput.provider 按实际来源填值。
+        provider: &'static str,
     },
     /// 等人解超时，无结果。
     CaptchaTimeout,
@@ -74,6 +76,10 @@ pub async fn run_search_on_page(
     h_slot: &mut Option<tokio::task::JoinHandle<()>>,
     human_solved: Arc<AtomicBool>,
 ) -> Result<SearchOutcome> {
+    // M16：配置了 SearXNG 就先走纯 HTTP 源；失败/空结果 eprintln warn 后落回 Google 直爬（原路径原样执行）。
+    if let Some(outcome) = try_searxng(&cfg).await {
+        return Ok(outcome);
+    }
     let mut seen: HashSet<String> = HashSet::new();
     let mut collected: Vec<SearchResult> = Vec::new();
     let mut captcha_solved = false;
@@ -140,11 +146,70 @@ pub async fn run_search_on_page(
             }
         }
     }
-     collected.truncate(cfg.limit);
+    collected.truncate(cfg.limit);
     Ok(SearchOutcome::Results {
         results: collected,
         captcha_solved,
+        provider: "google",
     })
+}
+
+/// M16：SearXNG 分流。未配置 searxng_url → None（直接走 Google）。
+/// 翻页：pageno 从 1 递增，凑满 limit / 空页 / 打满 MAX_PAGES 收口。
+///   * 成功凑到结果 → Some(Results, provider="searxng")
+///   * 任一页 Err，或零结果就遇空页 → eprintln 一行 warn 后 None（回退 Google 直爬）；
+///     已有部分结果时遇空页视为自然终止，不算失败。
+async fn try_searxng(cfg: &SearchConfig) -> Option<SearchOutcome> {
+    let Some(base) = crate::config::load().searxng_url.clone() else {
+        return None;
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut collected: Vec<SearchResult> = Vec::new();
+    for page_no in 1..=MAX_PAGES as u32 {
+        match crate::searxng::search(&base, &cfg.query, page_no).await {
+            Ok(results) if results.is_empty() => {
+                if collected.is_empty() {
+                    warn_searxng_fallback(&base, "查询无结果");
+                    return None;
+                }
+                break; // 后页无更多结果：有多少用多少
+            }
+            Ok(results) => {
+                for r in results {
+                    // 与 Google 路径同一去重语义（不同页可能重复）
+                    if seen.insert(r.url.clone()) {
+                        collected.push(r);
+                    }
+                }
+                if collected.len() >= cfg.limit {
+                    break;
+                }
+            }
+            Err(e) => {
+                // 任务语义：任何 Err 都整体回退，行为可预测
+                warn_searxng_fallback(&base, &format!("{e:#}"));
+                return None;
+            }
+        }
+    }
+    if collected.is_empty() {
+        return None;
+    }
+    collected.truncate(cfg.limit);
+    Some(SearchOutcome::Results {
+        results: collected,
+        captcha_solved: false,
+        provider: "searxng",
+    })
+}
+
+/// SearXNG 失败回退的一行 warn（stderr）。错误链含 403 时追加 format=json 提示。
+fn warn_searxng_fallback(base: &str, err: &str) {
+    let mut msg = format!("SearXNG {base} 查询失败（{err}），已回退 Google 直爬");
+    if err.contains("403") {
+        msg.push_str("；提示：检查 SearXNG 实例已启用 JSON format（settings.yml 的 search.formats 加 json）");
+    }
+    eprintln!("{msg}");
 }
 
 /// close 当前 browser 并同 profile 起重起有头实例。
@@ -215,7 +280,8 @@ async fn load(page: &Page, url: &str) -> Result<String> {
 }
 
 /// ponytail: 查询串就几十字节，手写 10 行不引 percent_encoding crate。
-fn urlencode(s: &str) -> String {
+/// M16：searxng.rs 复用同一 URL 编码（q 参数语义相同），故 pub(crate)。
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {

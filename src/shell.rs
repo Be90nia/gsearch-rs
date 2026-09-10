@@ -177,8 +177,8 @@ async fn cmd_search(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
         ctx.human_solved.clone(),
     )
     .await?;
-    let results = match outcome {
-        SearchOutcome::Results { results, .. } => results,
+    let (results, provider) = match outcome {
+        SearchOutcome::Results { results, provider, .. } => (results, provider),
         SearchOutcome::CaptchaTimeout => {
             println!("CAPTCHA 亲解超时（{}s）—— profile 已养熟，下次 search 会自动跳过",
                 gsearch::search::CAPTCHA_TIMEOUT_SECS);
@@ -201,7 +201,7 @@ async fn cmd_search(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     if results.is_empty() {
         println!("（搜索无结果）");
     } else {
-        println!("共 {} 条结果（输入 click N / read / dl N 继续）", results.len());
+        println!("共 {} 条结果（来源: {provider}；输入 click N / read / dl N 继续）", results.len());
     }
     ctx.last_results = results;
     Ok(())

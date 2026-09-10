@@ -35,6 +35,8 @@ pub struct MetaOutput {
     pub results_count: usize,
     /// 是否被 `--limit` 截断。search 命令：达到 limit 且最后一页满则 true。
     pub truncated: bool,
+    /// M16：本次搜索来源："searxng"（配了 SearXNG 且成功）或 "google"（直爬 / 回退 / browse / dl）。
+    pub provider: String,
 }
 
 /// M14-1B：`--json` 输出的统一信封，`results` 是真正的载荷（Vec 或 AdaptiveRead）。
@@ -111,6 +113,7 @@ mod tests {
             elapsed_ms: 1234,
             results_count: 1,
             truncated: false,
+            provider: "google".into(),
         }
     }
 

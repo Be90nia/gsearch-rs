@@ -62,26 +62,9 @@ pub async fn read(
     opts: &ReadOpts,
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
-    let page = browser.new_page("about:blank").await?;
-    tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
-        .await
-        .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
-        .map_err(|e| anyhow!("goto {url} 失败（浏览器被手关？）: {e}"))?;
-
-    if is_captcha(&page.content().await.unwrap_or_default()) {
-        return Err(anyhow!("{url} 遇 CAPTCHA，M4 后处理不支持人解，请重试或手动浏览器打开"));
-    }
-
-    if opts.full {
-        return read_full_inner(&page, url).await;
-    }
-
-    let title = page
-        .evaluate("document.title")
-        .await?
-        .into_value::<String>()
-        .unwrap_or_default();
-    let html = page.content().await.unwrap_or_default();
+    let page = open_page(browser, url).await?;
+    let title = eval_string_retry(&page, "document.title").await;
+    let html = content_retry(&page).await;
     let mut read = extract_adaptive(&html);
     read.url = url.to_string();
     read.title = title;
@@ -100,29 +83,73 @@ pub async fn read(
 /// `--read N --full` 兜底：纯 innerText 5000 字。
 pub async fn read_full(browser: &Browser, results: &[SearchResult], n: usize) -> Result<String> {
     let url = pick(results, n, "read")?;
-    let page = browser.new_page("about:blank").await?;
-    tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
-        .await
-        .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
-        .map_err(|e| anyhow!("goto {url} 失败（浏览器被手关？）: {e}"))?;
-
-    if is_captcha(&page.content().await.unwrap_or_default()) {
-        return Err(anyhow!("{url} 遇 CAPTCHA，M4 后处理不支持人解，请重试或手动浏览器打开"));
-    }
-
+    let page = open_page(browser, url).await?;
     read_full_inner(&page, url).await
 }
 
 /// 共享 innerText 5000 字截断 + 打印。
 async fn read_full_inner(page: &chromiumoxide::Page, url: &str) -> Result<String> {
-    let txt = page
-        .evaluate("document.body.innerText")
-        .await?
-        .into_value::<String>()
-        .unwrap_or_default();
+    let txt = eval_string_retry(page, "document.body.innerText").await;
     let txt: String = txt.chars().take(READ_FULL_MAX_CHARS).collect();
     println!("=== {url} ===\n{txt}");
     Ok(txt)
+}
+
+/// M4 健壮性修复：打开结果页并等 DOM 稳定——read / read_full 共用的 goto 前置。
+/// 知乎等站 goto resolve 后仍会内部跳转（登录墙/风控重定向），旧 JS context 被销毁，
+/// 紧跟的 content()/evaluate 会撞 CDP -32000 "Cannot find context"（此前被 unwrap_or_default
+/// 吞成空串 → 正文为空）。修法对照 shell.rs settle_after_click 先例：goto 后轮询
+/// document.readyState 到 complete（约 10s 上限），evaluate 类错误（含 -32000）吞掉继续轮询。
+async fn open_page(browser: &Browser, url: &str) -> Result<chromiumoxide::Page> {
+    let page = browser.new_page("about:blank").await?;
+    tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
+        .await
+        .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
+        .map_err(|e| anyhow!("goto {url} 失败（浏览器被手关？）: {e}"))?;
+    wait_dom_complete(&page, 50).await; // 50×200ms ≈ 10s
+    if is_captcha(&content_retry(&page).await) {
+        return Err(anyhow!("{url} 遇 CAPTCHA，M4 后处理不支持人解，请重试或手动浏览器打开"));
+    }
+    Ok(page)
+}
+
+/// 轮询 document.readyState 到 complete；evaluate 报错（context 重建中的 -32000 等）视为未就绪。
+/// 对照 shell.rs settle_after_click（click 后 4s 版）；此处窗口放宽到 rounds×200ms。
+async fn wait_dom_complete(page: &chromiumoxide::Page, rounds: usize) {
+    for _ in 0..rounds {
+        let ok = page
+            .evaluate("document.readyState")
+            .await
+            .ok()
+            .and_then(|v| v.into_value::<String>().ok())
+            .is_some_and(|s| s == "complete");
+        if ok {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// page.content() 带 -32000 容错：context 重建中等 DOM 稳定后重取，至多 3 次。
+async fn content_retry(page: &chromiumoxide::Page) -> String {
+    for _ in 0..3 {
+        match page.content().await {
+            Ok(c) => return c,
+            Err(_) => wait_dom_complete(page, 25).await, // ≈5s 内等 context 重建
+        }
+    }
+    String::new()
+}
+
+/// page.evaluate(js) → String，带 -32000 容错：等 DOM 稳定后重试，至多 3 次。
+async fn eval_string_retry(page: &chromiumoxide::Page, js: &str) -> String {
+    for _ in 0..3 {
+        match page.evaluate(js).await {
+            Ok(v) => return v.into_value::<String>().unwrap_or_default(),
+            Err(_) => wait_dom_complete(page, 25).await,
+        }
+    }
+    String::new()
 }
 /// `--dl N [-o DIR]`：走浏览器 cookie 的简化下载（M13 加 `-o`）。
 /// `-o DIR` 把文件落到 DIR 下（按 URL 末段命名）；缺省落 CWD（M4 历史行为）。

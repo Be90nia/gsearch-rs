@@ -20,4 +20,6 @@ serde_json = "1"
 scraper = "0.20"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# M16 SearXNG：chromiumoxide 已拖 reqwest 0.13 进依赖树，这里只开 json（局域网 http 直连，无需 TLS）。
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 futures = "0.3"

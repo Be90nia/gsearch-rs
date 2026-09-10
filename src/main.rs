@@ -246,8 +246,8 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         human_solved,
     )
     .await?;
-    let (results, captcha_solved) = match outcome {
-        gsearch::search::SearchOutcome::Results { results, captcha_solved } => (results, captcha_solved),
+    let (results, captcha_solved, provider) = match outcome {
+        gsearch::search::SearchOutcome::Results { results, captcha_solved, provider } => (results, captcha_solved, provider),
         gsearch::search::SearchOutcome::CaptchaTimeout => {
             // 输出 captcha_timeout JSON（Agent 看到 status 字段就知道等人解超时）
             if args.json {
@@ -274,6 +274,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             elapsed_ms: started.elapsed().as_millis(),
             results_count: results.len(),
             truncated: results.len() >= args.limit,
+            provider: provider.into(),
         };
         let run = gsearch::types::RunStatusInfo {
             status: gsearch::types::RunStatus::Ok,
@@ -343,6 +344,8 @@ fn emit_captcha_timeout_json(
         elapsed_ms,
         results_count: 0,
         truncated: false,
+        // CAPTCHA 超时只发生在 Google 直爬路径（searxng 不撞码）
+        provider: "google".into(),
     };
     let run = gsearch::types::RunStatusInfo {
         status: gsearch::types::RunStatus::CaptchaTimeout,

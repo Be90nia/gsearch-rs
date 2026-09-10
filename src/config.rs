@@ -18,6 +18,8 @@ pub struct GsearchConfig {
     pub profile: Option<String>,
     /// Chrome/Edge 可执行文件路径（语义同 GSEARCH_CHROME）
     pub chrome: Option<String>,
+    /// M16 SearXNG 实例 base URL（语义同 GSEARCH_SEARXNG_URL）；None = 走 Google 直爬。
+    pub searxng_url: Option<String>,
 }
 
 static CONFIG: OnceLock<GsearchConfig> = OnceLock::new();
@@ -35,6 +37,13 @@ pub fn set_explicit_and_load(path: PathBuf) -> Result<()> {
 pub fn load() -> &'static GsearchConfig {
     CONFIG.get_or_init(|| load_from_disk().unwrap_or_default())
 }
+/// M16：searxng_url 的 env 覆盖（GSEARCH_SEARXNG_URL > 配置文件 > None）。
+/// 对齐 GSEARCH_PROXY 语义：设了但空白 = 未设。抽纯函数便于单测（env::set_var 在测试里是 unsafe + 全局污染）。
+fn merge_searxng_env(cfg: &mut GsearchConfig, env_val: Option<String>) {
+    if let Some(v) = env_val.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        cfg.searxng_url = Some(v);
+    }
+}
 
 fn load_from_disk() -> Result<GsearchConfig> {
     let candidates: Vec<(PathBuf, bool)> = match EXPLICIT.get() {
@@ -47,6 +56,7 @@ fn load_from_disk() -> Result<GsearchConfig> {
             v
         }
     };
+    let mut cfg = GsearchConfig::default();
     for (path, explicit) in candidates {
         if !path.is_file() {
             if explicit {
@@ -56,12 +66,14 @@ fn load_from_disk() -> Result<GsearchConfig> {
         }
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("读取配置失败: {}", path.display()))?;
-        let cfg: GsearchConfig = serde_json::from_str(&raw)
-            .with_context(|| format!("配置格式错误（应为 JSON 对象，键 profile/chrome）: {}", path.display()))?;
+        cfg = serde_json::from_str(&raw)
+            .with_context(|| format!("配置格式错误（应为 JSON 对象，键 profile/chrome/searxng_url）: {}", path.display()))?;
         tracing::debug!("已加载配置: {}", path.display());
-        return Ok(cfg);
+        break;
     }
-    Ok(GsearchConfig::default())
+    // M16：searxng_url 的 env 覆盖在磁盘配置之后统一做（env > 文件 > None）
+    merge_searxng_env(&mut cfg, std::env::var("GSEARCH_SEARXNG_URL").ok());
+    Ok(cfg)
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -115,5 +127,39 @@ mod tests {
         // 复刻 load_from_disk 的读+解析两步，验证缺失路径报错（EXPLICIT 是全局静态，测试里不能直接喂）
         let p = std::path::Path::new("Z:/definitely/not/here/gsearch.json");
         assert!(std::fs::read_to_string(p).is_err());
+    }
+
+    #[test]
+    fn parses_searxng_url_key() {
+        let cfg: GsearchConfig =
+            serde_json::from_str(r#"{"searxng_url": "http://192.168.89.249:8888"}"#).unwrap();
+        assert_eq!(cfg.searxng_url.as_deref(), Some("http://192.168.89.249:8888"));
+        // 缺省 = None（走 Google 直爬）
+        let cfg: GsearchConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.searxng_url.is_none());
+    }
+
+    #[test]
+    fn merge_searxng_env_priority() {
+        // env > 文件：覆盖已有值
+        let mut cfg = GsearchConfig {
+            searxng_url: Some("http://from-file:8888".into()),
+            ..Default::default()
+        };
+        merge_searxng_env(&mut cfg, Some("http://from-env:9999".into()));
+        assert_eq!(cfg.searxng_url.as_deref(), Some("http://from-env:9999"));
+        // env 未设：保留文件值
+        let mut cfg = GsearchConfig {
+            searxng_url: Some("http://from-file:8888".into()),
+            ..Default::default()
+        };
+        merge_searxng_env(&mut cfg, None);
+        assert_eq!(cfg.searxng_url.as_deref(), Some("http://from-file:8888"));
+        // env 设了但空白 = 未设（对齐 GSEARCH_PROXY 语义）
+        merge_searxng_env(&mut cfg, Some("   ".into()));
+        assert_eq!(cfg.searxng_url.as_deref(), Some("http://from-file:8888"));
+        // env 空白值 trim 后生效
+        merge_searxng_env(&mut cfg, Some("  http://trim:1  ".into()));
+        assert_eq!(cfg.searxng_url.as_deref(), Some("http://trim:1"));
     }
 }
