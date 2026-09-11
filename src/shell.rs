@@ -23,7 +23,7 @@ use gsearch::output::print_text;
 use gsearch::search::{SearchConfig, SearchOutcome, is_captcha, run_search};
 use gsearch::skeleton::{extract_adaptive, format_adaptive, format_headings_only, format_json};
 use gsearch::types::SearchResult;
-use gsearch::util::{b64_decode, filename_from_url};
+use gsearch::util::filename_from_url;
 
 const TEXT_MAX_CHARS: usize = 5000;
 const PAGE_TIMEOUT_SECS: u64 = 30;
@@ -412,11 +412,11 @@ async fn cmd_dl(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     dl_in_page(&ctx.page, &url, output).await
 }
 
-/// 页内 fetch → 字节落盘（同 M4 dl 思路，去掉 postproc.rs 私有耦合）。
+/// 页内 fetch → 字节落盘（I4/I5：goto 预算与 fetch 实现共用 postproc，本函数只管 URL 解析与落盘）。
 /// `output` 缺省落 CWD；提供时 create_dir_all(DIR) + DIR.join(filename)，与 postproc::dl / general::cmd_dl 三处行为一致。
-/// credentials:'include' 带同源 cookie；`async function ()` 而非箭头（chromiumoxide 函数探测）。
 async fn dl_in_page(page: &Page, url: &str, output: Option<&Path>) -> Result<()> {
-    let _ = tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url)).await;
+    use crate::postproc;
+    let _ = postproc::goto_for_download(page.goto(url), url).await;
     // goto 已跟完重定向；fetch 当前页真实 URL（相对当前页同源，绕开 /goto?url= 类
     // 重定向链的 CORS 限制——真机踩坑：dl 1 对搜索结果的 google.com/goto 链直接 Failed to fetch）。
     let final_url = page
@@ -425,25 +425,7 @@ async fn dl_in_page(page: &Page, url: &str, output: Option<&Path>) -> Result<()>
         .ok()
         .flatten()
         .unwrap_or_else(|| url.to_string());
-    let js = format!(
-        "async function () {{
-            const r = await fetch({}, {{credentials: 'include'}});
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            const b = await r.arrayBuffer();
-            const u8 = new Uint8Array(b);
-            let s = '';
-            for (const x of u8) s += String.fromCharCode(x);
-            return btoa(s);
-        }}",
-        serde_json::to_string(&final_url)?
-    );
-    let b64 = page
-        .evaluate(js)
-        .await
-        .map_err(|e| anyhow!("下载失败（{url}）：同源 fetch 受 CORS 限制: {e}"))?
-        .into_value::<String>()
-        .map_err(|e| anyhow!("fetch 返回值非字符串（{url}）: {e}"))?;
-    let bytes = b64_decode(&b64)?;
+    let bytes = postproc::fetch_in_page(page, &final_url).await?;
     if bytes.is_empty() {
         return Err(anyhow!("下载内容为空（{url}）"));
     }
@@ -599,6 +581,7 @@ async fn goto(page: &Page, url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gsearch::util::b64_decode;
 
     #[test]
     fn b64_decode_known_vectors() {

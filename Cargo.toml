@@ -24,6 +24,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 futures = "0.3"
 
+[dev-dependencies]
+# start_paused（tokio 虚拟时钟）仅测试启用；release 构建不含 dev-deps，二进制不受影响。
+tokio = { version = "1", features = ["test-util"] }
+
 # M18 CI：Release profile 优化（Linux x86_64 release 二进制 16.4MB 撞 15MB 阈值）。
 # LTO=fat 比 thin 多压 1-2MB（chromiumoxide_cdp 全 CDP 类型最大受益），build 慢 ~30s 可接受。
 # strip=true 移除调试符号。codegen-units=1 让 LTO 跨单元。

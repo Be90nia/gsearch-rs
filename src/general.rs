@@ -186,8 +186,8 @@ pub(crate) async fn browser_alive(browser: &chromiumoxide::Browser) -> bool {
 
 /// `dl <url> [-o PATH]`：CDP `Browser.setDownloadBehavior` 走 Chrome 原生下载（带 profile 登录态）。
 /// 渲染型 URL（普通网页，Chrome 不触发下载）回退页内 fetch 落盘（PLAN §3.5 raw-file 路径，同源 cookie）。
-/// H2+M2：launch 后所有 ? 早返回由外层 graceful_close 收尾；fetch_in_page 走 base64（M4）。
 pub async fn cmd_dl(url: &str, output: Option<&Path>, browser: Option<BrowserKind>, proxy: Option<String>) -> Result<ExitCode> {
+    use crate::postproc;
     let dir: PathBuf = std::path::absolute(output.unwrap_or(Path::new(".")))?;
     std::fs::create_dir_all(&dir).with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
     let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
@@ -209,7 +209,8 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>, browser: Option<BrowserKin
 
         let before = list_dir(&dir)?;
         let page = browser_inst.new_page("about:blank").await?;
-        let _ = tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url)).await;
+        // I4：goto 失败/超时 warn 留痕后继续——下载靠原生下载嗅探或页内 fetch 兜底。
+        let _ = postproc::goto_for_download(page.goto(url), url).await;
 
         match wait_new_file(&dir, &before).await? {
             Some(name) => {
@@ -217,16 +218,13 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>, browser: Option<BrowserKin
                 println!("已下载: {} ({size} bytes)", dir.join(&name).display());
             }
             None => {
-                let bytes = fetch_in_page(&page, url).await?;
+                let bytes = postproc::fetch_in_page(&page, url).await?;
                 if bytes.is_empty() {
                     return Err(anyhow!("下载内容为空（{url}"));
                 }
                 let name = filename_from_url(url);
                 let path = dir.join(&name);
                 std::fs::write(&path, &bytes).with_context(|| format!("写文件失败: {}", path.display()))?;
-                if bytes.len() > 50_000_000 {
-                    tracing::warn!("下载文件 >50MB（{} bytes）：{}，页内 fetch 大文件慎用", bytes.len(), path.display());
-                }
                 println!("已下载: {} ({})", path.display(), bytes.len());
             }
         }
@@ -238,30 +236,6 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>, browser: Option<BrowserKin
     }
     result?;
     Ok(ExitCode::SUCCESS)
-}
-
-/// M4：页内 fetch → base64 字符串回传（避免 JSON number 数组在 chromiumoxide 上 evaluation 失败）。
-/// 对齐 shell.rs dl_in_page 的实现。>50MB 时调用方打 warn。
-async fn fetch_in_page(page: &chromiumoxide::Page, url: &str) -> Result<Vec<u8>> {
-    let js = format!(
-        "async function () {{
-            const r = await fetch({}, {{credentials: 'include'}});
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            const u8 = new Uint8Array(await r.arrayBuffer());
-            let s = '';
-            for (const x of u8) s += String.fromCharCode(x);
-            return btoa(s);
-        }}",
-        serde_json::to_string(url)?
-    );
-    let b64 = page
-        .evaluate(js)
-        .await
-        .map_err(|e| anyhow!("页内 fetch 失败（{url}）: {e}"))?
-        .into_value::<String>()
-        .map_err(|e| anyhow!("fetch 返回值非字符串（{url}）: {e}"))?;
-    gsearch::util::b64_decode(&b64)
-        .with_context(|| format!("页内 fetch base64 解码失败（{url}）"))
 }
 
 

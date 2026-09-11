@@ -132,4 +132,33 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"new");
         cleanup(&dir);
     }
+
+    /// I5 回归：1MB 伪随机字节经 base64 encode→b64_decode roundtrip 无损。
+    /// 覆盖 u32 累积器在大输入下的溢出/截断；编码器与 JS `btoa()` 同字母表（标准 + '=' padding）。
+    #[test]
+    fn b64_decode_roundtrip_1mb() {
+        // xorshift64 确定性伪随机，不引 rand 依赖
+        let mut seed: u64 = 0x243F_6A88_85A3_08D3;
+        let raw: Vec<u8> = (0..1_000_000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut enc = String::with_capacity(raw.len().div_ceil(3) * 4);
+        for chunk in raw.chunks(3) {
+            let n = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            enc.push(TBL[(n >> 18) as usize] as char);
+            enc.push(TBL[(n >> 12 & 0x3f) as usize] as char);
+            enc.push(if chunk.len() > 1 { TBL[(n >> 6 & 0x3f) as usize] as char } else { '=' });
+            enc.push(if chunk.len() > 2 { TBL[(n & 0x3f) as usize] as char } else { '=' });
+        }
+        assert_eq!(b64_decode(&enc).unwrap(), raw);
+    }
+
 }

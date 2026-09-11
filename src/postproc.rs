@@ -15,11 +15,10 @@ use crate::general::{LOGIN_POLL_SECS, browser_alive, login_poll_decision};
 use gsearch::search::is_captcha;
 use gsearch::skeleton::{extract_adaptive, format_adaptive, format_headings_only, format_json};
 use gsearch::types::SearchResult;
-use gsearch::util::{b64_decode, filename_from_url};
+use gsearch::util::filename_from_url;
 
 const READ_FULL_MAX_CHARS: usize = 5000;
 const PAGE_TIMEOUT_SECS: u64 = 30;
-const DL_LARGE_BYTES: usize = 50_000_000;
 /// M17 登录墙:等人工登录的总超时(顶层命令无人守窗,不能像 `login` 命令那样不限时)
 const LOGIN_WALL_TIMEOUT_SECS: u64 = 180;
 /// 登录墙 title 判定要求的「正文极短」阈值(innerText 字符数;登录页只有表单文案)
@@ -292,12 +291,62 @@ pub async fn dl(
 ) -> Result<()> {
     let url = pick(results, n, "dl")?;
     let page = browser.new_page("about:blank").await?;
-    let _ = tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url)).await;
+    // I4：goto 失败/超时 warn 留痕后继续——下载靠后续 fetch 直链兜底（goto 慢的站 fetch 可能可达）。
+    let _ = goto_for_download(page.goto(url), url).await;
+    let bytes = fetch_in_page(&page, url).await?;
+    if bytes.is_empty() {
+        return Err(anyhow!("下载内容为空（{url}）"));
+    }
+
+    let dir = std::path::absolute(output.unwrap_or_else(|| Path::new(".")))?;
+    std::fs::create_dir_all(&dir).map_err(|e| anyhow!("创建下载目录 {} 失败: {e}", dir.display()))?;
+    let path = dir.join(filename_from_url(url));
+    std::fs::write(&path, &bytes).map_err(|e| anyhow!("写文件 {} 失败: {e}", path.display()))?;
+    println!("已下载: {} ({} bytes)", path.display(), bytes.len());
+    Ok(())
+}
+
+/// 页内 goto 预算封装（I4，deep-audit §1.2）：dl 链路 goto 失败/超时不再静默——
+/// warn 留痕（URL + 耗时）后返回 Err。调用方保持兜底语义：goto 未完成仍尝试页内 fetch 直链。
+/// 泛型 future 以便单测注入 pending() 打超时分支，无需真浏览器。
+pub(crate) async fn goto_for_download<F, T, E>(fut: F, url: &str) -> Result<()>
+where
+    F: Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), fut).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "dl 导航失败（{url}，{}ms）: {e} —— 继续尝试页内 fetch 直链",
+                started.elapsed().as_millis()
+            );
+            Err(anyhow!("dl 导航失败（{url}）: {e}"))
+        }
+        Err(_) => {
+            tracing::warn!(
+                "dl 导航超时（{url}，{:.1}s > {PAGE_TIMEOUT_SECS}s 预算）—— 继续尝试页内 fetch 直链",
+                started.elapsed().as_secs_f64()
+            );
+            Err(anyhow!("dl 导航超时（{url}）: 超过 {PAGE_TIMEOUT_SECS}s"))
+        }
+    }
+}
+
+/// 页内 fetch 直链 → base64 回传 → Rust 解码。三条 dl 路径共用同一实现
+/// （general::cmd_dl 兜底 / postproc::dl / shell::dl_in_page，I5）。
+/// I5 通道选择：保留 base64（1.33x 文本膨胀）而非 JSON 字节数组——数组对二进制是
+/// ~3.9x 文本（"255," 4 字符/字节）+ V8 number 数组 8B/元素，50MB 文件反而放大峰值；
+/// 改为 JS 侧 32MB 拒绝阈值封顶内存（超限先拒，不白编码再传），报错引导走原生下载路径。
+pub(crate) async fn fetch_in_page(page: &chromiumoxide::Page, url: &str) -> Result<Vec<u8>> {
     let js = format!(
         "async function () {{
             const r = await fetch({}, {{credentials: 'include'}});
-            const b = await r.arrayBuffer();
-            const u8 = new Uint8Array(b);
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const buf = await r.arrayBuffer();
+            if (buf.byteLength > {FETCH_IN_PAGE_MAX_BYTES}) throw new Error('文件超过页内 fetch 上限 {FETCH_IN_PAGE_MAX_BYTES} bytes（实际 ' + buf.byteLength + '），改用可触发原生下载的直链');
+            const u8 = new Uint8Array(buf);
             let s = '';
             for (const x of u8) s += String.fromCharCode(x);
             return btoa(s);
@@ -307,29 +356,14 @@ pub async fn dl(
     let b64 = page
         .evaluate(js)
         .await
-        .map_err(|e| anyhow!(
-            "下载失败（{url}）：M4 同源 fetch 受 CORS 限制，未放行的站会在此报错，待 M6 升级为 Page download flow。原因: {e}"
-        ))?
+        .map_err(|e| anyhow!("页内 fetch 失败（{url}）: {e}（同源 fetch 受 CORS 限制，未放行的站会在此报错）"))?
         .into_value::<String>()
         .map_err(|e| anyhow!("fetch 返回值非字符串（{url}）: {e}"))?;
-    let bytes = b64_decode(&b64)?;
-    if bytes.is_empty() {
-        return Err(anyhow!("下载内容为空（{url}）"));
-    }
-
-    let dir = std::path::absolute(output.unwrap_or_else(|| Path::new(".")))?;
-    std::fs::create_dir_all(&dir).map_err(|e| anyhow!("创建下载目录 {} 失败: {e}", dir.display()))?;
-    let path = dir.join(filename_from_url(url));
-    std::fs::write(&path, &bytes).map_err(|e| anyhow!("写文件 {} 失败: {e}", path.display()))?;
-    if bytes.len() > DL_LARGE_BYTES {
-        tracing::warn!(
-            "下载文件 {} MB，fetch→base64 路径吃内存，考虑 M6 Page download flow",
-            bytes.len() / 1_000_000
-        );
-    }
-    println!("已下载: {} ({} bytes)", path.display(), bytes.len());
-    Ok(())
+    gsearch::util::b64_decode(&b64).map_err(|e| anyhow!("页内 fetch base64 解码失败（{url}）: {e}"))
 }
+
+/// 页内 fetch 单文件上限（I5）：32MB × ~3x 通道峰值 ≈ 100MB 内存封顶。
+const FETCH_IN_PAGE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -413,6 +447,19 @@ mod tests {
             assert!(is_http_url(ok), "应放行: {ok}");
         }
     }
+
+    /// I4 回归：goto_for_download 超时分支返回 Err 且文本带 URL（start_paused 下时间自动推进，
+    /// pending future 永不完成 → 必超时，无需真浏览器）。
+    #[tokio::test(start_paused = true)]
+    async fn goto_for_download_timeout_carries_url() {
+        let err = goto_for_download(std::future::pending::<std::result::Result<(), std::convert::Infallible>>(), "https://example.com/slow")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("https://example.com/slow"), "Err 缺 URL: {msg}");
+        assert!(msg.contains("超时"), "Err 未标超时: {msg}");
+    }
+
 }
 
 #[cfg(test)]

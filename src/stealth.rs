@@ -6,8 +6,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use chromiumoxide::element::Element;
-use chromiumoxide::layout::Point;
 use chromiumoxide::Page;
 
 const WARMUP_URLS: &[&str] = &[
@@ -46,42 +44,6 @@ pub async fn warmup(page: &Page) -> Result<()> {
     Ok(())
 }
 
-/// Type one character at a time with a small randomized key delay.
-#[allow(dead_code)]
-pub async fn human_type(page: &Page, selector: &str, text: &str) -> Result<()> {
-    let element = page.find_element(selector).await?;
-    element.focus().await?;
-    let mut random = Jitter::new();
-    for character in text.chars() {
-        element.type_str(character.to_string()).await?;
-        tokio::time::sleep(Duration::from_millis(random.range(25, 125))).await;
-    }
-    Ok(())
-}
-
-/// Move through a cubic Bezier path and click at the element's center.
-#[allow(dead_code)]
-pub async fn human_click(page: &Page, selector: &str) -> Result<()> {
-    let element: Element = page.find_element(selector).await?;
-    let target = element.scroll_into_view().await?.clickable_point().await?;
-    let mut random = Jitter::new();
-    let steps = 12 + random.range(0, 9) as u32;
-    let (cx1, cy1) = (random.range(0, 500) as f64, random.range(80, 500) as f64);
-    let (cx2, cy2) = (random.range(0, 500) as f64, random.range(80, 500) as f64);
-
-    for step in 0..steps {
-        let t = step as f64 / steps as f64;
-        let inverse = 1.0 - t;
-        let x = inverse.powi(3) * 0.0 + 3.0 * inverse.powi(2) * t * cx1
-            + 3.0 * inverse * t * t * cx2 + t.powi(3) * target.x;
-        let y = inverse.powi(3) * 0.0 + 3.0 * inverse.powi(2) * t * cy1
-            + 3.0 * inverse * t * t * cy2 + t.powi(3) * target.y;
-        page.move_mouse(Point::new(x, y)).await?;
-        tokio::time::sleep(Duration::from_millis(random.range(12, 36))).await;
-    }
-    page.click(target).await?;
-    Ok(())
-}
 
 struct Jitter(u64);
 
