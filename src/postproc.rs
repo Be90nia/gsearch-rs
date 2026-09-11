@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use chromiumoxide::browser::Browser;
 
+use crate::general::{LOGIN_POLL_SECS, browser_alive, login_poll_decision};
 use gsearch::search::is_captcha;
 use gsearch::skeleton::{extract_adaptive, format_adaptive, format_headings_only, format_json};
 use gsearch::types::SearchResult;
@@ -19,6 +20,10 @@ use gsearch::util::{b64_decode, filename_from_url};
 const READ_FULL_MAX_CHARS: usize = 5000;
 const PAGE_TIMEOUT_SECS: u64 = 30;
 const DL_LARGE_BYTES: usize = 50_000_000;
+/// M17 登录墙:等人工登录的总超时(顶层命令无人守窗,不能像 `login` 命令那样不限时)
+const LOGIN_WALL_TIMEOUT_SECS: u64 = 180;
+/// 登录墙 title 判定要求的「正文极短」阈值(innerText 字符数;登录页只有表单文案)
+const LOGIN_WALL_SHORT_BODY: usize = 400;
 
 /// `--{flag} N` 下标校验：1-based；0 或超出结果数报错（含结果数为 0 的情况）
 fn pick<'a>(results: &'a [SearchResult], n: usize, flag: &str) -> Result<&'a str> {
@@ -56,13 +61,14 @@ pub struct ReadOpts {
 
 /// `--read N`：M9 默认走 AdaptiveRead（按文章结构自适应）。opts 见 ReadOpts。
 pub async fn read(
-    browser: &Browser,
+    browser: &mut Browser,
+    h_slot: &mut Option<tokio::task::JoinHandle<()>>,
     results: &[SearchResult],
     n: usize,
     opts: &ReadOpts,
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
-    let page = open_page(browser, url).await?;
+    let page = open_page(browser, h_slot, url).await?;
     let title = eval_string_retry(&page, "document.title").await;
     let html = content_retry(&page).await;
     let mut read = extract_adaptive(&html);
@@ -81,9 +87,14 @@ pub async fn read(
 }
 
 /// `--read N --full` 兜底：纯 innerText 5000 字。
-pub async fn read_full(browser: &Browser, results: &[SearchResult], n: usize) -> Result<String> {
+pub async fn read_full(
+    browser: &mut Browser,
+    h_slot: &mut Option<tokio::task::JoinHandle<()>>,
+    results: &[SearchResult],
+    n: usize,
+) -> Result<String> {
     let url = pick(results, n, "read")?;
-    let page = open_page(browser, url).await?;
+    let page = open_page(browser, h_slot, url).await?;
     read_full_inner(&page, url).await
 }
 
@@ -100,17 +111,116 @@ async fn read_full_inner(page: &chromiumoxide::Page, url: &str) -> Result<String
 /// 紧跟的 content()/evaluate 会撞 CDP -32000 "Cannot find context"（此前被 unwrap_or_default
 /// 吞成空串 → 正文为空）。修法对照 shell.rs settle_after_click 先例：goto 后轮询
 /// document.readyState 到 complete（约 10s 上限），evaluate 类错误（含 -32000）吞掉继续轮询。
-async fn open_page(browser: &Browser, url: &str) -> Result<chromiumoxide::Page> {
+///
+/// M17 登录墙（Part 2）：检测到登录墙 → eprintln 提示 → swap_to_headed 弹有头窗
+/// 等人工登录（复用 general::login_poll_decision 决策，180s 超时）→ 登录成功重抓正文。
+/// cookie 随 profile 落盘，下次无感。人关窗 = browser 已死 → 重起 headless 再试一次；
+/// 重抓仍撞墙/CAPTCHA 报错退出（限一次登录机会，防循环弹窗）。
+async fn open_page(
+    browser: &mut Browser,
+    h_slot: &mut Option<tokio::task::JoinHandle<()>>,
+    url: &str,
+) -> Result<chromiumoxide::Page> {
+    let page = goto_page(browser, url).await?;
+    if is_captcha(&content_retry(&page).await) {
+        return Err(anyhow!("{url} 遇 CAPTCHA，M4 后处理不支持人解，请重试或手动浏览器打开"));
+    }
+    if !login_wall_hit_page(&page).await {
+        return Ok(page);
+    }
+
+    eprintln!(
+        "检测到登录墙（{url}），弹出有头窗口请登录，登录后自动继续（最长 {LOGIN_WALL_TIMEOUT_SECS}s；cookie 落 profile，下次无感）"
+    );
+    gsearch::browser::swap_to_headed(browser, h_slot).await?;
+    wait_login(browser, url).await?;
+    // 登录完成（URL 变化）或用户关窗。关窗路径 browser 已死：重起 headless 重抓。
+    if !browser_alive(browser).await {
+        let (b, handler) = gsearch::browser::launch(true).await?;
+        *h_slot = Some(gsearch::browser::spawn_handler(handler));
+        *browser = b;
+    }
+    let page = goto_page(browser, url).await?;
+    if is_captcha(&content_retry(&page).await) {
+        return Err(anyhow!("{url} 遇 CAPTCHA，请重试或手动浏览器打开"));
+    }
+    if login_wall_hit_page(&page).await {
+        return Err(anyhow!("登录后重抓 {url} 仍遇登录墙（登录未生效？）；可先 `gsearch login <url>` 手动完成登录"));
+    }
+    Ok(page)
+}
+
+/// new_page + goto + 等 DOM 稳定（原 open_page 前半，登录墙重抓路径复用）。
+async fn goto_page(browser: &Browser, url: &str) -> Result<chromiumoxide::Page> {
     let page = browser.new_page("about:blank").await?;
     tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
         .await
         .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
         .map_err(|e| anyhow!("goto {url} 失败（浏览器被手关？）: {e}"))?;
     wait_dom_complete(&page, 50).await; // 50×200ms ≈ 10s
-    if is_captcha(&content_retry(&page).await) {
-        return Err(anyhow!("{url} 遇 CAPTCHA，M4 后处理不支持人解，请重试或手动浏览器打开"));
-    }
     Ok(page)
+}
+
+/// 登录墙页内判定：URL 跳转特征 + title/正文特征（见 login_wall_hit）。
+async fn login_wall_hit_page(page: &chromiumoxide::Page) -> bool {
+    let url = page.url().await.ok().flatten().unwrap_or_default();
+    let title = eval_string_retry(page, "document.title").await;
+    let body = eval_string_retry(page, "document.body ? document.body.innerText : ''").await;
+    login_wall_hit(&url, &title, &body, body.chars().count())
+}
+
+/// M17 登录墙判定（契约特征，纯函数可单测）：
+/// 1. 最终 URL 路径段精确命中 signin/signup/login 等登录跳转（知乎 /signin、GitHub /login）；
+/// 2. 或 title/DOM 命中「登录/sign in/log in」且正文极短——SPA 型墙 URL 不变的兜底，
+///    也覆盖知乎 IP 风控页（正文是含「登录后…反馈」的短 JSON 错误体；带登录态访问即解，
+///    所以弹窗登录是正确动作而非误伤）。
+/// ponytail: 路径段精确匹配而非全文 contains——防「文章标题/路径含 login」误伤正文页；
+/// 正文长度门槛 <400 字挡住「正文提到登录」的正常文章。不做站点特征库（Non-goal）。
+fn login_wall_hit(url: &str, title: &str, body: &str, body_chars: usize) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    let path_hit = path
+        .split('/')
+        .any(|seg| matches!(seg, "login" | "signin" | "signup" | "log-in" | "sign-in" | "accounts"));
+    if path_hit {
+        return true;
+    }
+    let t = title.to_lowercase();
+    let b = body.to_lowercase();
+    let text_hit = ["登录", "sign in", "log in"].iter().any(|p| t.contains(p) || b.contains(p));
+    text_hit && body_chars < LOGIN_WALL_SHORT_BODY
+}
+
+/// 决策函数与 general::cmd_login 同源（URL 变化 = 登录完成跳转；evaluate 死 + page 消失 =
+/// 用户关窗 = 完成），语义对齐其 login_poll_decision_* 单测。差异仅两点：
+/// 180s deadline（顶层命令无人守窗）+ 完成后不退出进程而是返回重抓。
+async fn wait_login(browser: &Browser, url: &str) -> Result<()> {
+    let page = goto_page(browser, url).await?;
+    let initial_url = page
+        .url()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| url.to_string());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(LOGIN_WALL_TIMEOUT_SECS);
+    loop {
+        tokio::time::sleep(Duration::from_secs(LOGIN_POLL_SECS)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "登录等待超时（{LOGIN_WALL_TIMEOUT_SECS}s）: {url}；可先 `gsearch login <url>` 完成登录后重试"
+            ));
+        }
+        let evaluate_ok = page.evaluate("1").await.is_ok();
+        let current_url = page.url().await.ok().flatten().unwrap_or_default();
+        let attached = browser_alive(browser).await
+            && browser
+                .pages()
+                .await
+                .map(|ps| ps.iter().any(|p| p.target_id() == page.target_id()))
+                .unwrap_or(false);
+        if login_poll_decision(evaluate_ok, &initial_url, &current_url, attached) {
+            return Ok(());
+        }
+    }
 }
 
 /// 轮询 document.readyState 到 complete；evaluate 报错（context 重建中的 -32000 等）视为未就绪。
@@ -242,6 +352,29 @@ mod tests {
         assert_eq!(r.paragraph_index.len(), 3);
         assert!(r.paragraph_index[0].char_count > 0);
     }
+
+    /// M17 登录墙判定:URL 路径段特征 / title 或 DOM+短正文特征 / 正文页不误伤。
+    #[test]
+    fn login_wall_hit_cases() {
+        // URL 路径段:知乎 /signin、GitHub /login、注册墙
+        assert!(login_wall_hit("https://www.zhihu.com/signin?next=%2Fp%2F1", "登录 - 知乎", "", 300));
+        assert!(login_wall_hit("https://github.com/login", "Sign in to GitHub", "", 500));
+        assert!(login_wall_hit("https://example.com/signup", "注册", "", 100));
+        // title 特征 + 正文极短(SPA 型墙,URL 不变)
+        assert!(login_wall_hit("https://example.com/article", "请登录后继续", "", 50));
+        assert!(login_wall_hit("https://example.com/x", "Sign in required", "", 399));
+        // DOM 特征 + 正文极短:知乎 IP 风控页(title 空,body 是含「登录」的短 JSON 错误体)
+        assert!(login_wall_hit(
+            "https://zhuanlan.zhihu.com/p/405555378",
+            "",
+            r#"{"error":{"message":"您当前请求存在异常，暂时限制本次访问。……登录后私信知乎小管家反馈。","code":40362}}"#,
+            100
+        ));
+        // 正文页不误伤:title/DOM 撞词但正文长;URL 含 login 但非登录段
+        assert!(!login_wall_hit("https://example.com/article", "如何登录的完全指南", "登录教程正文……", 3000));
+        assert!(!login_wall_hit("https://blog.example.com/how-to-login", "How to login (guide)", "long body", 5000));
+        assert!(!login_wall_hit("https://example.com/", "Example Domain", "This domain is for use in illustrative examples", 100));
+    }
 }
 
 #[cfg(test)]
@@ -266,19 +399,19 @@ mod live_tests {
     #[ignore]
     #[tokio::test]
     async fn postproc_live() {
-        let (browser, handler) = gsearch::browser::launch(true).await.unwrap();
-        let _h = gsearch::browser::spawn_handler(handler);
+        let (mut browser, handler) = gsearch::browser::launch(true).await.unwrap();
+        let mut h_slot = Some(gsearch::browser::spawn_handler(handler));
         let results = fixture();
 
-        let err = read(&browser, &[], 1, &ReadOpts::default()).await.unwrap_err();
+        let err = read(&mut browser, &mut h_slot, &[], 1, &ReadOpts::default()).await.unwrap_err();
         assert!(err.to_string().contains("越界"), "got: {err}");
 
-        let txt = read(&browser, &results, 1, &ReadOpts::default()).await.unwrap();
+        let txt = read(&mut browser, &mut h_slot, &results, 1, &ReadOpts::default()).await.unwrap();
         assert!(txt.contains("[目录]"), "default read missing [目录]: {txt:?}");
         assert!(txt.contains("[摘要"), "default read missing [摘要]: {txt:?}");
         assert!(txt.contains("Example Domain"), "default read got: {txt:?}");
 
-        let txt = read_full(&browser, &results, 1).await.unwrap();
+        let txt = read_full(&mut browser, &mut h_slot, &results, 1).await.unwrap();
         assert!(txt.contains("Example Domain"), "read_full got: {txt:?}");
 
         dl(&browser, &results, 1, None).await.unwrap();

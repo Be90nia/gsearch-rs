@@ -223,41 +223,46 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             (std::path::PathBuf::new(), gsearch::browser::BrowserKind::Chrome)
         }),
     };
-    let (mut browser, handler) = gsearch::browser::launch_with_kind_proxy(true, browser_kind, proxy.clone())
-        .await
-        .context("启动 Chrome/Edge 失败：检查 GSEARCH_CHROME 是否指向 chrome.exe/msedge.exe，或 profile 被另一实例占用")?;
-    // h_slot: swap_to_headed 时 abort 旧 handler task，再起新 task 接新 Browser 的 sender
-    let mut h_slot = Some(gsearch::browser::spawn_handler(handler));
-    let page = browser.new_page("about:blank").await?;
-    if args.humanize {
-        stealth::install_init_script(&page).await?;
-        stealth::warmup(&page).await?;
-    }
-    // ponytail: 顶层 search 没人在场 stdin 给 noop Arc（human_solved 永远是 false，不影响行为）
-    let human_solved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let outcome = gsearch::search::run_search_on_page(
-        &mut browser,
-        gsearch::search::SearchConfig {
-            query: args.query.clone(),
-            limit: args.limit,
-        },
-        page,
-        &mut h_slot,
-        human_solved,
-    )
-    .await?;
-    let (results, captcha_solved, provider) = match outcome {
-        gsearch::search::SearchOutcome::Results { results, captcha_solved, provider } => (results, captcha_solved, provider),
-        gsearch::search::SearchOutcome::CaptchaTimeout => {
-            // 输出 captcha_timeout JSON（Agent 看到 status 字段就知道等人解超时）
-            if args.json {
-                emit_captcha_timeout_json(&args, &browser_path, &resolved_kind, proxy.clone(), started.elapsed().as_millis());
-            } else {
-                eprintln!("error: CAPTCHA 亲解超时（{}s）；profile 已养熟，再次执行会跳过 CAPTCHA",
-                    gsearch::search::CAPTCHA_TIMEOUT_SECS);
+    // M17 惰性启动（Part 1）：先跑 SearXNG 纯 HTTP 源——命中则全程零浏览器；
+    // 未配置/失败（try_searxng = None，回退 warn 已打）才 launch 走 Google 直爬。
+    let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
+    let mut h_slot: Option<tokio::task::JoinHandle<()>> = None;
+    let cfg = gsearch::search::SearchConfig { query: args.query.clone(), limit: args.limit };
+    let (results, captcha_solved, provider) = if let Some(
+        gsearch::search::SearchOutcome::Results { results, captcha_solved, provider },
+    ) = gsearch::search::try_searxng(&cfg).await
+    {
+        (results, captcha_solved, provider)
+    } else {
+        let (mut browser, handler) = gsearch::browser::launch_with_kind_proxy(true, browser_kind, proxy.clone())
+            .await
+            .context("启动 Chrome/Edge 失败：检查 GSEARCH_CHROME 是否指向 chrome.exe/msedge.exe，或 profile 被另一实例占用")?;
+        // h_slot: swap_to_headed 时 abort 旧 handler task，再起新 task 接新 Browser 的 sender
+        h_slot = Some(gsearch::browser::spawn_handler(handler));
+        let page = browser.new_page("about:blank").await?;
+        if args.humanize {
+            stealth::install_init_script(&page).await?;
+            stealth::warmup(&page).await?;
+        }
+        // ponytail: 顶层 search 没人在场 stdin 给 noop Arc（human_solved 永远是 false，不影响行为）
+        let human_solved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        match gsearch::search::run_search_on_page(&mut browser, cfg, page, &mut h_slot, human_solved).await? {
+            gsearch::search::SearchOutcome::Results { results, captcha_solved, provider } => {
+                // browser 存进 slot 供 postproc（--read/--dl）与收尾 close 复用
+                browser_opt = Some(browser);
+                (results, captcha_solved, provider)
             }
-            gsearch::browser::graceful_close(&mut browser).await;
-            return Ok(ExitCode::from(3));
+            gsearch::search::SearchOutcome::CaptchaTimeout => {
+                // 输出 captcha_timeout JSON（Agent 看到 status 字段就知道等人解超时）
+                if args.json {
+                    emit_captcha_timeout_json(&args, &browser_path, &resolved_kind, proxy.clone(), started.elapsed().as_millis());
+                } else {
+                    eprintln!("error: CAPTCHA 亲解超时（{}s）；profile 已养熟，再次执行会跳过 CAPTCHA",
+                        gsearch::search::CAPTCHA_TIMEOUT_SECS);
+                }
+                gsearch::browser::graceful_close(&mut browser).await;
+                return Ok(ExitCode::from(3));
+            }
         }
     };
     if args.json {
@@ -292,6 +297,8 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             postproc::open(&results, n)?;
         }
         if let Some(n) = args.read {
+            // M17 惰性：SearXNG 命中时浏览器尚未启动，--read/--dl 首次用到才 launch(headless)
+            let browser = ensure_search_browser(&mut browser_opt, &mut h_slot, browser_kind, proxy.clone()).await?;
             let opts = postproc::ReadOpts {
                 full: args.full,
                 json: args.json,
@@ -299,19 +306,22 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
                 from: args.from.unwrap_or(0),
             };
             if opts.full {
-                postproc::read_full(&browser, &results, n).await?;
+                postproc::read_full(browser, &mut h_slot, &results, n).await?;
             } else {
-                postproc::read(&browser, &results, n, &opts).await?;
+                postproc::read(browser, &mut h_slot, &results, n, &opts).await?;
             }
         }
         if let Some(n) = args.dl {
-            postproc::dl(&browser, &results, n, args.output.as_deref()).await?;
+            let browser = ensure_search_browser(&mut browser_opt, &mut h_slot, browser_kind, proxy.clone()).await?;
+            postproc::dl(browser, &results, n, args.output.as_deref()).await?;
         }
         anyhow::Ok(())
     }
     .await;
-
-    gsearch::browser::graceful_close(&mut browser).await;
+    // 仅 Google 路径（或 --read/--dl 惰性启动过）才有 browser 需要收尾
+    if let Some(browser) = browser_opt.as_mut() {
+        gsearch::browser::graceful_close(browser).await;
+    }
     if let Err(e) = post {
         eprintln!("postproc 失败: {e}");
     }
@@ -320,6 +330,27 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         Ok(ExitCode::from(2))
     } else {
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// M17 惰性启动：--read/--dl 首次用到浏览器时才 launch(headless)。
+/// SearXNG 命中路径全程零浏览器；Google 路径已 launch 则直接复用（slot 已 Some）。
+/// ponytail: Option::insert 返回 &mut——省掉「先判空再取出」的双 borrow 样板。
+async fn ensure_search_browser<'a>(
+    slot: &'a mut Option<chromiumoxide::browser::Browser>,
+    h_slot: &mut Option<tokio::task::JoinHandle<()>>,
+    kind: Option<gsearch::browser::BrowserKind>,
+    proxy: Option<String>,
+) -> Result<&'a mut chromiumoxide::browser::Browser> {
+    match slot {
+        Some(b) => Ok(b),
+        None => {
+            let (browser, handler) = gsearch::browser::launch_with_kind_proxy(true, kind, proxy)
+                .await
+                .context("启动 Chrome/Edge 失败：检查 GSEARCH_CHROME 是否指向 chrome.exe/msedge.exe，或 profile 被另一实例占用")?;
+            *h_slot = Some(gsearch::browser::spawn_handler(handler));
+            Ok(slot.insert(browser))
+        }
     }
 }
 

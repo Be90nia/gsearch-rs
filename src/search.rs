@@ -65,6 +65,12 @@ pub async fn run_search(
     h_slot: &mut Option<tokio::task::JoinHandle<()>>,
     human_solved: Arc<AtomicBool>,
 ) -> Result<SearchOutcome> {
+    // M16/M17：SearXNG 纯 HTTP 源在此分流（shell 会话入口）。顶层 search 命令已在
+    // cmd_search 惰性启动时先跑过 try_searxng 并直接调 run_search_on_page——此处不再
+    // 重复查询（否则 SearXNG 双失败会打两遍回退 warn、白跑两轮 HTTP）。
+    if let Some(outcome) = try_searxng(&cfg).await {
+        return Ok(outcome);
+    }
     let page = browser.new_page("about:blank").await?;
     run_search_on_page(browser, cfg, page, h_slot, human_solved).await
 }
@@ -72,14 +78,10 @@ pub async fn run_search(
 pub async fn run_search_on_page(
     browser: &mut Browser,
     cfg: SearchConfig,
-    page: Page,
+    mut page: Page,
     h_slot: &mut Option<tokio::task::JoinHandle<()>>,
     human_solved: Arc<AtomicBool>,
 ) -> Result<SearchOutcome> {
-    // M16：配置了 SearXNG 就先走纯 HTTP 源；失败/空结果 eprintln warn 后落回 Google 直爬（原路径原样执行）。
-    if let Some(outcome) = try_searxng(&cfg).await {
-        return Ok(outcome);
-    }
     let mut seen: HashSet<String> = HashSet::new();
     let mut collected: Vec<SearchResult> = Vec::new();
     let mut captcha_solved = false;
@@ -119,8 +121,9 @@ pub async fn run_search_on_page(
                     return Ok(SearchOutcome::CaptchaTimeout);
                 }
             };
-            // 若以后接多轮 search，复用 plsearch main.py 的 hide_after_captcha() 模式即可。
-            // 后续页沿用同一 page（不切回也不重 open）→ continue 翻页
+            // swap_to_headed 换了 Browser 实例——旧 page 句柄已死（receiver is gone），
+            // 把新实例的 page2 顶回循环变量，后续翻页才不会打已死句柄。
+            page = page2;
             let results = parse_serp(&content);
             if results.is_empty() {
                 tracing::info!("第 {} 页（解码后）无结果，终止翻页", page_idx + 1);
@@ -161,7 +164,7 @@ pub async fn run_search_on_page(
 ///   * 成功凑到结果 → Some(Results, provider="searxng")
 ///   * json+html 双失败/双空：已有部分结果自然终止，否则 warn 一行后 None
 ///     （回退 Google 直爬）。
-async fn try_searxng(cfg: &SearchConfig) -> Option<SearchOutcome> {
+pub async fn try_searxng(cfg: &SearchConfig) -> Option<SearchOutcome> {
     let Some(base) = crate::config::load().searxng_url.clone() else {
         return None;
     };

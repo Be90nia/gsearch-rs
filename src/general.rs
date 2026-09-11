@@ -20,8 +20,8 @@ use gsearch::util::filename_from_url;
 
 const TEXT_MAX_CHARS: usize = 5000;
 const PAGE_TIMEOUT_SECS: u64 = 30;
-/// login 轮询间隔
-const LOGIN_POLL_SECS: u64 = 2;
+/// login 轮询间隔(postproc 登录墙等待复用同一节奏)
+pub(crate) const LOGIN_POLL_SECS: u64 = 2;
 /// dl 下载完成总超时
 const DL_TOTAL_TIMEOUT_SECS: u64 = 60;
 /// 下载嗅探窗口：窗口内目录无任何新文件（连 .crdownload 都没有）→ 判定渲染型 URL，走页内 fetch 落盘
@@ -172,7 +172,7 @@ pub(crate) fn login_poll_decision(
     true
 }
 
-async fn browser_alive(browser: &chromiumoxide::Browser) -> bool {
+pub(crate) async fn browser_alive(browser: &chromiumoxide::Browser) -> bool {
     browser.version().await.is_ok()
 }
 
