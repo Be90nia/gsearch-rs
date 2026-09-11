@@ -43,6 +43,30 @@ pub const STEALTH_INIT_SCRIPT: &str = r#"
   defineGetter(Navigator.prototype, 'plugins', () => pdf);
   defineGetter(Navigator.prototype, 'mimeTypes', () => ({ length: 0 }));
 
+  // Permissions API:headless 下 query({name:'notifications'}) 返回 'prompt' 而
+  // Notification.permission 是 'denied',二者不一致是 sannysoft/bot-detector 经典检测点。
+  // 同款 chromiumoxide 0.9.1 page.rs hide_permissions:query 恒返回 Notification.permission
+  // (denied→denied;headed 默认 default/granted 也原样,保证恒一致),非 notifications 透传原生。
+  if (window.navigator.permissions && window.navigator.permissions.query) {
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.__proto__.query = (parameters) => {
+      if (parameters && parameters.name === 'notifications') {
+        return Promise.resolve({ state: Notification.permission });
+      }
+      return originalQuery.call(window.navigator.permissions, parameters);
+    };
+  }
+
+  // headless=new 的 screen 对象是独立虚拟屏(默认 800x600),不随 --window-size 走——
+  // 与真实窗口 1920x1080 不一致会被 screen/window 关联检测抓出。对齐窗口尺寸
+  // (availHeight 预留 Windows 任务栏 ~40px,典型 Win11 形态)。
+  if (screen.width !== 1920 || screen.height !== 1080) {
+    define(screen, 'width', 1920);
+    define(screen, 'height', 1080);
+    define(screen, 'availWidth', 1920);
+    define(screen, 'availHeight', 1040);
+  }
+
   if (!window.chrome) window.chrome = {};
   defineGetter(window.chrome, 'runtime', () => ({
     connect: function () { return { onMessage: { addListener: function () {} } }; },
@@ -397,23 +421,36 @@ pub async fn launch_with_kind_proxy(
     let mut builder = BrowserConfig::builder()
         .chrome_executable(&browser_exe)
         .user_data_dir(&profile)
-        .arg("--disable-blink-features=AutomationControlled")
-        .arg(format!("--user-agent={UA}"))
+        // ⚠ chromiumoxide 0.9.1 ArgsBuilder 会给 key 统一加 "--" 前缀（argument.rs:35,37），
+        // 手写 "--xxx" 会变成 "----xxx" 被 Chrome 静默忽略（实测 UA/proxy 一直没生效）。
+        // 这里全部去掉前缀，由 ArgsBuilder 补 "--"。
+        .arg("disable-blink-features=AutomationControlled")
+        .arg(format!("user-agent={UA}"))
         .disable_default_args();
     if let Some(proxy) = &proxy {
         // ponytail: Chrome 只识别 --proxy-server=protocol://host:port；不引 chromiumoxide proxy builder（M12 调试期足以）。
         tracing::info!("代理: {}", redact_proxy(proxy));
-        builder = builder.arg(format!("--proxy-server={proxy}"));
+        builder = builder.arg(format!("proxy-server={proxy}"));
     }
     let safe_args: &[&str] = if headless {
-        ["--headless=new", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"].as_slice()
+        // disable-gpu 已去：Chrome 132+ 统一 headless 支持 GPU，留着反而让 WebGL/性能
+        // 特征假；window-size=1920,1080 补 headless 默认 800x600 的窗口尺寸指纹。
+        ["headless=new", "no-sandbox", "disable-dev-shm-usage", "window-size=1920,1080"].as_slice()
     } else {
-        ["--no-sandbox", "--disable-dev-shm-usage"].as_slice()
+        ["no-sandbox", "disable-dev-shm-usage"].as_slice()
     };
     builder = builder.args(safe_args.iter().copied());
-    // HeadlessMode 枚举在 chromiumoxide 0.9 未对外 re-export；用 builder 自身的便捷方法切模式
     builder = if headless {
-        builder.new_headless_mode()
+        // chromiumoxide 默认 viewport=800x600,每页 CDP Emulation.setDeviceMetricsOverride
+        // 会把它强加给页面(screen.width/innerWidth 全变 800x600 指纹)。
+        // 显式设 1920x1080 与 --window-size 对齐:emulation 让 screen 与窗口全链一致。
+        builder
+            .viewport(chromiumoxide::handler::viewport::Viewport {
+                width: 1920,
+                height: 1080,
+                ..Default::default()
+            })
+            .new_headless_mode()
     } else {
         builder.with_head()
     };
