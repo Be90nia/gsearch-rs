@@ -117,8 +117,6 @@ pub async fn run_shell() -> Result<ExitCode> {
 
 /// M2 迁移：以前 shell 自带一个本地 graceful_close；现在统一走 gsearch::browser::graceful_close
 /// （带超时 + kill 兜底，与顶层命令收尾路径完全一致）。
-
-
 /// 分派单条 shell 命令
 async fn dispatch(cmd: &str, args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     match cmd {
@@ -521,9 +519,9 @@ async fn cmd_login(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     print!("切回 headless 模式？[Y/n]: ");
     io::stdout().flush().ok();
     let mut ans = String::new();
-    if ans.is_empty() || ans == "y" || ans == "yes" {
-        // I4：切回 headless（swap_to_headless），不是 swap_to_headed（注释/命名误导前的原 bug）。
-        // 同 profile 重起 headless，page 也得重建
+    io::stdin().read_line(&mut ans)?;
+    let cut = ans.trim();
+    if cut.is_empty() || cut.eq_ignore_ascii_case("y") || cut.eq_ignore_ascii_case("yes") {
         browser::swap_to_headless(&mut ctx.browser, &mut ctx.handler_task).await?;
         ctx.page = ctx
             .browser

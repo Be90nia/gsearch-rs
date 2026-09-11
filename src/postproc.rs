@@ -187,8 +187,8 @@ async fn login_wall_hit_page(page: &chromiumoxide::Page) -> bool {
 /// 2. 或 title/DOM 命中「登录/sign in/log in」且正文极短——SPA 型墙 URL 不变的兜底，
 ///    也覆盖知乎 IP 风控页（正文是含「登录后…反馈」的短 JSON 错误体；带登录态访问即解，
 ///    所以弹窗登录是正确动作而非误伤）。
-/// ponytail: 路径段精确匹配而非全文 contains——防「文章标题/路径含 login」误伤正文页；
-/// 正文长度门槛 <400 字挡住「正文提到登录」的正常文章。不做站点特征库（Non-goal）。
+///   * ponytail: 路径段精确匹配而非全文 contains——防「文章标题/路径含 login」误伤正文页；
+///   * 正文长度门槛 <400 字挡住「正文提到登录」的正常文章。不做站点特征库（Non-goal）。
 fn login_wall_hit(url: &str, title: &str, body: &str, body_chars: usize) -> bool {
     let path = url.split(['?', '#']).next().unwrap_or("");
     let path_hit = path

@@ -262,9 +262,12 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             Ok(o) => o,
             Err(e) => {
                 // Err 路径：浏览器可能起好但未移交，graceful_close 兜底关。
-                if let Some(b) = slot.borrow_mut().as_mut() {
-                    gsearch::browser::graceful_close(b).await;
+                // 取走 Option 后释放 RefCell 借用，再 await 关浏览器。
+                let mut b = slot.borrow_mut().take();
+                if let Some(b_ref) = b.as_mut() {
+                    gsearch::browser::graceful_close(b_ref).await;
                 }
+                drop(b);
                 return Err(e);
             }
         };

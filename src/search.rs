@@ -210,8 +210,9 @@ pub async fn run_search_on_page(
 ///   * json+html 双失败/双空：已有部分结果自然终止，否则 warn 一行后 None
 ///     （回退 Google 直爬）。
 pub async fn try_searxng(cfg: &SearchConfig) -> Option<SearchOutcome> {
-    let Some(base) = crate::config::load().searxng_url.clone() else {
-        return None;
+    let base = match crate::config::load().searxng_url.clone() {
+        Some(b) => b,
+        None => return None,
     };
     let mut seen: HashSet<String> = HashSet::new();
     let mut collected: Vec<SearchResult> = Vec::new();

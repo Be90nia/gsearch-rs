@@ -591,7 +591,6 @@ pub fn spawn_handler(handler: Handler) -> tokio::task::JoinHandle<()> {
 /// Low②：曾有 `kill_residual_chrome_strict()` 跑 `taskkill /IM chrome.exe /T /F`——会误杀
 /// 用户主 Chrome（不是本 profile 的实例），已被审计删除。Chrome 残留收口一律走
 /// `graceful_close`（per-进程 close + wait + kill 兜底，不动用户主实例）。
-
 /// 关 Chrome 并等进程死透。chromiumoxide 0.9.1 的 close 只断 CDP 不保证杀子进程树；
 /// 调 kill() 兜底（公开 API，browser/mod.rs:315）。顶层命令（search/browse/login/dl）
 /// + shell 退出统一走这条，避免下一次 launch 撞 profile 锁。
