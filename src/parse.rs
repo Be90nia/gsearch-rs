@@ -32,7 +32,7 @@ pub fn parse_serp(html: &str) -> Vec<SearchResult> {
             };
             results.push(SearchResult {
                 title: text_of(&title_el),
-                url: absolutize(el.value().attr("href").unwrap_or_default().trim()),
+                url: absolutize(el.value().attr("href").unwrap_or_default().trim(), "https://www.google.com"),
                 snippet: String::new(),
             });
             pending.push(results.len() - 1);
@@ -56,18 +56,18 @@ pub fn parse_serp(html: &str) -> Vec<SearchResult> {
 }
 
 /// 元素全文本：收集 + nbsp→空格 + 去首尾空白（等价 get_text(strip=True) + replace \xa0）
-fn text_of(el: &ElementRef) -> String {
+pub(crate) fn text_of(el: &ElementRef) -> String {
     el.text().collect::<String>().replace('\u{a0}', " ").trim().to_string()
 }
 
-/// Google SERP 的结果 href 常为相对路径（/goto?url=... / /url?q=...）；无 scheme 时
-/// 补 https://www.google.com 前缀，否则 goto 直接失败（真机踩坑：click 1 报
-/// "goto /goto?url=... 失败"）。绝对 URL 原样返回。
-fn absolutize(href: &str) -> String {
+/// 结果 href 为相对路径时补 origin 前缀：Google SERP 传 "https://www.google.com"
+/// （真机踩坑：click 1 报 "goto /goto?url=... 失败"），SearXNG HTML 传实例地址。
+/// 绝对 URL 原样返回。
+pub(crate) fn absolutize(href: &str, origin: &str) -> String {
     if href.starts_with("http://") || href.starts_with("https://") {
         href.to_string()
     } else if let Some(rest) = href.strip_prefix('/') {
-        format!("https://www.google.com/{rest}")
+        format!("{}/{rest}", origin.trim_end_matches('/'))
     } else {
         href.to_string()
     }
