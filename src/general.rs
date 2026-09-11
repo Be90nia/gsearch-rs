@@ -42,114 +42,122 @@ pub struct BrowseOpts {
 
 /// `browse <url>`：headless 渲染 → 默认 AdaptiveRead（M9），`--full` 拿纯 innerText 5000 字。
 /// CAPTCHA 路径：撞码报错退出，提示用 login 手工验证。
+/// H2+M2：launch 后所有 ? 早返回路径（new_page / goto / evaluate / content / parse）由外层
+/// graceful_close 收尾；不再裸 close+wait。
+/// M6：goto 后复用 postproc::wait_dom_complete 等 DOM 稳定；正文取自 postproc::content_retry
+/// （避免 CDP -32000 空抓）。
 pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
-    let (mut browser, handler) = launch_with_kind_proxy(true, opts.browser, opts.proxy.clone()).await?;
-    let _h = spawn_handler(handler);
-    let page = browser.new_page("about:blank").await?;
-    tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
-        .await
-        .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
-        .map_err(|e| anyhow!("goto {url} 失败: {e}"))?;
+    use crate::postproc;
+    let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
+    let result: Result<()> = async {
+        let (browser, handler) =
+            launch_with_kind_proxy(true, opts.browser, opts.proxy.clone()).await?;
+        let _h = spawn_handler(handler);
+        let page = browser.new_page("about:blank").await?;
+        tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
+            .await
+            .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
+            .map_err(|e| anyhow!("goto {url} 失败: {e}"))?;
+        // M6：等 DOM 稳定，避免 -32000。postproc::wait_dom_complete 50 轮×200ms ≈10s。
+        postproc::wait_dom_complete(&page, 50).await;
 
-    if is_captcha(&page.content().await.unwrap_or_default()) {
-        return Err(anyhow!(
-            "{url} 遇 CAPTCHA：用 `gsearch login {url}` 开有头窗手工验证后重试"
-        ));
-    }
-
-    // --full：纯 innerText 5000 字
-    if opts.full {
-        let text = page
-            .evaluate("document.body.innerText")
-            .await?
-            .into_value::<String>()
-            .unwrap_or_default();
-        let text: String = text.chars().take(TEXT_MAX_CHARS).collect();
-        println!("=== {url} ===\n{text}");
-        if let Err(e) = browser.close().await {
-            tracing::warn!("close browser 失败: {e}");
+        if is_captcha(&postproc::content_retry(&page).await) {
+            return Err(anyhow!(
+                "{url} 遇 CAPTCHA：用 `gsearch login {url}` 开有头窗手工验证后重试"
+            ));
         }
-        let _ = browser.wait().await;
-        return Ok(ExitCode::SUCCESS);
+
+        // --full：纯 innerText 5000 字
+        if opts.full {
+            let text = postproc::eval_string_retry(&page, "document.body.innerText").await;
+            let text: String = text.chars().take(TEXT_MAX_CHARS).collect();
+            println!("=== {url} ===\n{text}");
+            browser_opt = Some(browser);
+            return Ok(());
+        }
+
+        let title = postproc::eval_string_retry(&page, "document.title").await;
+        let html = postproc::content_retry(&page).await;
+        let mut read = extract_adaptive(&html);
+        read.url = url.to_string();
+        read.title = title;
+
+        let out = if opts.json {
+            format_json(&read)
+        } else if opts.headings_only {
+            format_headings_only(&read)
+        } else {
+            format_adaptive(&read, opts.from)
+        };
+        println!("{out}");
+        browser_opt = Some(browser);
+        Ok(())
     }
-
-    let title = page
-        .evaluate("document.title")
-        .await?
-        .into_value::<String>()
-        .unwrap_or_default();
-    let html = page.content().await.unwrap_or_default();
-    let mut read = extract_adaptive(&html);
-    read.url = url.to_string();
-    read.title = title;
-
-    let out = if opts.json {
-        format_json(&read)
-    } else if opts.headings_only {
-        format_headings_only(&read)
-    } else {
-        format_adaptive(&read, opts.from)
-    };
-    println!("{out}");
-
-    if let Err(e) = browser.close().await {
-        tracing::warn!("close browser 失败: {e}");
+    .await;
+    if let Some(b) = browser_opt.as_mut() {
+        gsearch::browser::graceful_close(b).await;
     }
-    let _ = browser.wait().await;
+    result?;
     Ok(ExitCode::SUCCESS)
 }
 
 /// `login <url>`：有头窗人工登录，轮询不限时；人关窗（或关页签）= 完成，cookie 随 profile 落盘。
 /// 不判 CAPTCHA（登录页是真人登录页，PLAN §3.5）。
+/// H2+M2：launch 后所有 ? 早返回由外层 graceful_close 收尾。
 pub async fn cmd_login(url: &str, browser: Option<BrowserKind>, proxy: Option<String>) -> Result<ExitCode> {
-    let (browser_inst, handler) = launch_with_kind_proxy(false, browser, proxy).await?;
-    let _h = spawn_handler(handler);
+    let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
+    let result: Result<bool> = async {
+        let (browser_inst, handler) = launch_with_kind_proxy(false, browser, proxy).await?;
+        let _h = spawn_handler(handler);
+        browser_opt = Some(browser_inst);
 
-    let page = browser_inst.new_page("about:blank").await?;
-    tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
-        .await
-        .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
-        .map_err(|e| anyhow!("goto {url} 失败: {e}"))?;
-    // 记录登录页 URL；用户登录成功跳到 dashboard = URL 变化 = 登录完成（bug fix）。
-    // ponytail: 旧版只用 page.evaluate("1").await.is_ok() 判定「页面是否仍在」——
-    // 登录后跳到 dashboard，evaluate 继续成功 → 死循环，只能 Ctrl+C。
-    let initial_url = page
-        .url()
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| url.to_string());
-    tracing::info!("已打开登录窗口: {url}，完成登录后直接关窗（或本页签）即算完成，不限时等待");
-
-    loop {
-        tokio::time::sleep(Duration::from_secs(LOGIN_POLL_SECS)).await;
-        let evaluate_ok = page.evaluate("1").await.is_ok();
-        let current_url = page
+        let page = browser_opt.as_ref().unwrap().new_page("about:blank").await?;
+        tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
+            .await
+            .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
+            .map_err(|e| anyhow!("goto {url} 失败: {e}"))?;
+        // 记录登录页 URL；用户登录成功跳到 dashboard = URL 变化 = 登录完成（bug fix）。
+        // ponytail: 旧版只用 page.evaluate("1").await.is_ok() 判定「页面是否仍在」——
+        // 登录后跳到 dashboard，evaluate 继续成功 → 死循环，只能 Ctrl+C。
+        let initial_url = page
             .url()
             .await
             .ok()
             .flatten()
-            .unwrap_or_default();
-        let page_still_attached = browser_alive(&browser_inst).await
-            && browser_inst
-                .pages()
+            .unwrap_or_else(|| url.to_string());
+        tracing::info!("已打开登录窗口: {url}，完成登录后直接关窗（或本页签）即算完成，不限时等待");
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(LOGIN_POLL_SECS)).await;
+            let browser_inst = browser_opt.as_ref().unwrap();
+            let evaluate_ok = page.evaluate("1").await.is_ok();
+            let current_url = page
+                .url()
                 .await
-                .map(|ps| ps.iter().any(|p| p.target_id() == page.target_id()))
-                .unwrap_or(false);
-        if login_poll_decision(evaluate_ok, &initial_url, &current_url, page_still_attached) {
-            tracing::info!("检测到登录完成（URL 变化或窗口关闭），cookie 已落 profile");
-            return Ok(ExitCode::SUCCESS);
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let page_still_attached = browser_alive(browser_inst).await
+                && browser_inst
+                    .pages()
+                    .await
+                    .map(|ps| ps.iter().any(|p| p.target_id() == page.target_id()))
+                    .unwrap_or(false);
+            if login_poll_decision(evaluate_ok, &initial_url, &current_url, page_still_attached) {
+                tracing::info!("检测到登录完成（URL 变化或窗口关闭），cookie 已落 profile");
+                return Ok(true);
+            }
         }
     }
+    .await;
+    if let Some(b) = browser_opt.as_mut() {
+        gsearch::browser::graceful_close(b).await;
+    }
+    result?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `cmd_login` 单轮决策。返回 true = 本轮退出（登录完成）。
-///
-/// ponytail: 抽成纯函数好让 URL 变化退出分支可单测，不起 CDP。新增「URL 变化」作为
-/// 主退出条件；`evaluate_ok`（页面仍在）+ `page_still_attached`（page 在列表里）
-/// 兜底用户「关窗完成」路径。三条退出路径：URL 变 / evaluate 死 + page 死。
-/// ponytail ceiling: 假定「登录成功 = URL 变化」（单页 SPA 也跳 hash）。SPA 改 in-place
-/// 不动 URL 的场景需要 pushState 钩子，超出范围按需补。
 pub(crate) fn login_poll_decision(
     evaluate_ok: bool,
     initial_url: &str,
@@ -178,66 +186,84 @@ pub(crate) async fn browser_alive(browser: &chromiumoxide::Browser) -> bool {
 
 /// `dl <url> [-o PATH]`：CDP `Browser.setDownloadBehavior` 走 Chrome 原生下载（带 profile 登录态）。
 /// 渲染型 URL（普通网页，Chrome 不触发下载）回退页内 fetch 落盘（PLAN §3.5 raw-file 路径，同源 cookie）。
+/// H2+M2：launch 后所有 ? 早返回由外层 graceful_close 收尾；fetch_in_page 走 base64（M4）。
 pub async fn cmd_dl(url: &str, output: Option<&Path>, browser: Option<BrowserKind>, proxy: Option<String>) -> Result<ExitCode> {
     let dir: PathBuf = std::path::absolute(output.unwrap_or(Path::new(".")))?;
     std::fs::create_dir_all(&dir).with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
-    let (mut browser_inst, handler) = launch_with_kind_proxy(true, browser, proxy).await?;
-    let _h = spawn_handler(handler);
+    let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
+    let result: Result<()> = async {
+        let (browser_inst, handler) = launch_with_kind_proxy(true, browser, proxy).await?;
+        let _h = spawn_handler(handler);
+        browser_opt = Some(browser_inst);
 
-    let params = SetDownloadBehaviorParams::builder()
-        .behavior(SetDownloadBehaviorBehavior::Allow)
-        .download_path(dir.to_string_lossy().into_owned())
-        .build()
-        .map_err(|e| anyhow!("构造 setDownloadBehavior 参数失败: {e}"))?;
-    browser_inst
-        .execute(params)
-        .await
-        .context("设置下载行为失败（Browser.setDownloadBehavior）")?;
+        let browser_inst = browser_opt.as_mut().unwrap();
+        let params = SetDownloadBehaviorParams::builder()
+            .behavior(SetDownloadBehaviorBehavior::Allow)
+            .download_path(dir.to_string_lossy().into_owned())
+            .build()
+            .map_err(|e| anyhow!("构造 setDownloadBehavior 参数失败: {e}"))?;
+        browser_inst
+            .execute(params)
+            .await
+            .context("设置下载行为失败（Browser.setDownloadBehavior）")?;
 
-    let before = list_dir(&dir)?;
-    let page = browser_inst.new_page("about:blank").await?;
-    let _ = tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url)).await;
+        let before = list_dir(&dir)?;
+        let page = browser_inst.new_page("about:blank").await?;
+        let _ = tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url)).await;
 
-    match wait_new_file(&dir, &before).await? {
-        Some(name) => {
-            let size = std::fs::metadata(dir.join(&name)).map(|m| m.len()).unwrap_or(0);
-            println!("已下载: {} ({size} bytes)", dir.join(&name).display());
-        }
-        None => {
-            let bytes = fetch_in_page(&page, url).await?;
-            if bytes.is_empty() {
-                return Err(anyhow!("下载内容为空（{url}"));
+        match wait_new_file(&dir, &before).await? {
+            Some(name) => {
+                let size = std::fs::metadata(dir.join(&name)).map(|m| m.len()).unwrap_or(0);
+                println!("已下载: {} ({size} bytes)", dir.join(&name).display());
             }
-            let name = filename_from_url(url);
-            let path = dir.join(&name);
-            std::fs::write(&path, &bytes).with_context(|| format!("写文件失败: {}", path.display()))?;
-            println!("已下载: {} ({})", path.display(), bytes.len());
+            None => {
+                let bytes = fetch_in_page(&page, url).await?;
+                if bytes.is_empty() {
+                    return Err(anyhow!("下载内容为空（{url}"));
+                }
+                let name = filename_from_url(url);
+                let path = dir.join(&name);
+                std::fs::write(&path, &bytes).with_context(|| format!("写文件失败: {}", path.display()))?;
+                if bytes.len() > 50_000_000 {
+                    tracing::warn!("下载文件 >50MB（{} bytes）：{}，页内 fetch 大文件慎用", bytes.len(), path.display());
+                }
+                println!("已下载: {} ({})", path.display(), bytes.len());
+            }
         }
+        Ok(())
     }
-
-    if let Err(e) = browser_inst.close().await {
-        tracing::warn!("close browser 失败: {e}");
+    .await;
+    if let Some(b) = browser_opt.as_mut() {
+        gsearch::browser::graceful_close(b).await;
     }
-    let _ = browser_inst.wait().await;
+    result?;
     Ok(ExitCode::SUCCESS)
 }
 
-/// 页内 fetch → JSON 字节数组回传（serde 反序列化 Vec<u8>，不走 base64）。
+/// M4：页内 fetch → base64 字符串回传（避免 JSON number 数组在 chromiumoxide 上 evaluation 失败）。
+/// 对齐 shell.rs dl_in_page 的实现。>50MB 时调用方打 warn。
 async fn fetch_in_page(page: &chromiumoxide::Page, url: &str) -> Result<Vec<u8>> {
     let js = format!(
         "async function () {{
             const r = await fetch({}, {{credentials: 'include'}});
             if (!r.ok) throw new Error('HTTP ' + r.status);
-            return Array.from(new Uint8Array(await r.arrayBuffer()));
+            const u8 = new Uint8Array(await r.arrayBuffer());
+            let s = '';
+            for (const x of u8) s += String.fromCharCode(x);
+            return btoa(s);
         }}",
         serde_json::to_string(url)?
     );
-    page.evaluate(js)
+    let b64 = page
+        .evaluate(js)
         .await
         .map_err(|e| anyhow!("页内 fetch 失败（{url}）: {e}"))?
-        .into_value::<Vec<u8>>()
-        .map_err(|e| anyhow!("fetch 返回值非字节数组（{url}）: {e}"))
+        .into_value::<String>()
+        .map_err(|e| anyhow!("fetch 返回值非字符串（{url}）: {e}"))?;
+    gsearch::util::b64_decode(&b64)
+        .with_context(|| format!("页内 fetch base64 解码失败（{url}）"))
 }
+
 
 /// 轮询 dir 等 before 之外的新文件。
 async fn wait_new_file(dir: &Path, before: &HashSet<String>) -> Result<Option<String>> {

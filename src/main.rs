@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 
 mod general;
@@ -234,19 +234,45 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     {
         (results, captcha_solved, provider)
     } else {
-        let (mut browser, handler) = gsearch::browser::launch_with_kind_proxy(true, browser_kind, proxy.clone())
-            .await
-            .context("启动 Chrome/Edge 失败：检查 GSEARCH_CHROME 是否指向 chrome.exe/msedge.exe，或 profile 被另一实例占用")?;
-        // h_slot: swap_to_headed 时 abort 旧 handler task，再起新 task 接新 Browser 的 sender
-        h_slot = Some(gsearch::browser::spawn_handler(handler));
-        let page = browser.new_page("about:blank").await?;
-        if args.humanize {
-            stealth::install_init_script(&page).await?;
-            stealth::warmup(&page).await?;
+        // H2 包成 async 块统一收尾：launch 成功后所有 ? 早返回路径（new_page / install_init_script /
+        // browser 用 Cell 模式（Option<Browser>）保留到外层，Err 路径也走 graceful_close 再上抛
+        // （防 Browser::drop 在 Windows 上不杀子进程的漏）。
+        let slot: std::cell::RefCell<Option<chromiumoxide::browser::Browser>> = std::cell::RefCell::new(None);
+        let outcome: anyhow::Result<gsearch::search::SearchOutcome> = async {
+            let (b, handler) = gsearch::browser::launch_with_kind_proxy(true, browser_kind, proxy.clone())
+                .await
+                .context("启动 Chrome/Edge 失败：检查 GSEARCH_CHROME 是否指向 chrome.exe/msedge.exe，或 profile 被另一实例占用")?;
+            // h_slot: swap_to_headed 时 abort 旧 handler task，再起新 task 接新 Browser 的 sender
+            h_slot = Some(gsearch::browser::spawn_handler(handler));
+            let mut browser = b;
+            let page = browser.new_page("about:blank").await?;
+            if args.humanize {
+                stealth::install_init_script(&page).await?;
+                stealth::warmup(&page).await?;
+            }
+            // ponytail: 顶层 search 没人在场 stdin 给 noop Arc（human_solved 永远是 false，不影响行为）
+            let human_solved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cfg = gsearch::search::SearchConfig { query: args.query.clone(), limit: args.limit };
+            let r = gsearch::search::run_search_on_page(&mut browser, cfg, page, &mut h_slot, human_solved).await?;
+            *slot.borrow_mut() = Some(browser);
+            Ok::<_, anyhow::Error>(r)
         }
-        // ponytail: 顶层 search 没人在场 stdin 给 noop Arc（human_solved 永远是 false，不影响行为）
-        let human_solved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        match gsearch::search::run_search_on_page(&mut browser, cfg, page, &mut h_slot, human_solved).await? {
+        .await;
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                // Err 路径：浏览器可能起好但未移交，graceful_close 兜底关。
+                if let Some(b) = slot.borrow_mut().as_mut() {
+                    gsearch::browser::graceful_close(b).await;
+                }
+                return Err(e);
+            }
+        };
+        let mut browser = match slot.borrow_mut().take() {
+            Some(b) => b,
+            None => return Err(anyhow!("google_path Ok 后 slot 应含 browser，逻辑漏洞")),
+        };
+        match outcome {
             gsearch::search::SearchOutcome::Results { results, captcha_solved, provider } => {
                 // browser 存进 slot 供 postproc（--read/--dl）与收尾 close 复用
                 browser_opt = Some(browser);

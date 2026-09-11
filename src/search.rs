@@ -94,7 +94,15 @@ pub async fn run_search_on_page(
             urlencode(&cfg.query),
             page_idx * RESULTS_PER_PAGE
         );
-        let mut content = load(&page, &url).await?;
+        // H1：每个 ? 早返回前先 close page（句柄已死的 swap 后旧 page close 吞错），
+        // 防 load / new_page / poll_until_solved 任一失败时 page 在 headless/headed 浏览器上残留。
+        let mut content = match load(&page, &url).await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = page.close().await;
+                return Err(e);
+            }
+        };
 
         if is_captcha(&content) {
             if !collected.is_empty() {
@@ -108,25 +116,59 @@ pub async fn run_search_on_page(
             }
             // 首页撞码：切有头轮询等人解（plsearch main.py:339-343 reveal_for_captcha + _search wait_for_captcha=True）
             eprintln!("Google 对无头浏览器有独立风控（豁免 cookie 约 3 小时且对无头无效），弹出窗口验证后本会话将切回无头继续；高频场景建议用 gsearch shell");
-            swap_to_headed(browser, h_slot).await?;
-            let page2 = browser.new_page("about:blank").await?;
-            page2.goto(&url).await.map_err(|e| anyhow!("goto {url} 失败: {e}"))?;
-            content = match poll_until_solved(&page2, CAPTCHA_TIMEOUT_SECS, human_solved.clone()).await? {
-                Some(html) => {
+            if let Err(e) = swap_to_headed(browser, h_slot).await {
+                let _ = page.close().await;
+                return Err(anyhow!("swap_to_headed 失败: {e}"));
+            }
+            let page2 = match browser.new_page("about:blank").await {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = page.close().await;
+                    return Err(anyhow!("new_page 失败: {e}"));
+                }
+            };
+
+            if let Err(e) = page2.goto(&url).await {
+                let _ = page.close().await;
+                let _ = page2.close().await;
+                return Err(anyhow!("goto {url} 失败: {e}"));
+            }
+            content = match poll_until_solved(&page2, CAPTCHA_TIMEOUT_SECS, human_solved.clone()).await {
+                Ok(Some(html)) => {
                     captcha_solved = true;
                     html
                 }
-                None => {
+                Ok(None) => {
                     // M15：超时不是错误而是 SearchOutcome，让调用方按 mode 决定
                     // JSON 输出 captcha_timeout 而非 anyhow 退出。
+                    // I3：超时后保留 headed 浏览器给调用方回收（main / shell 都按 CaptchaTimeout 走
+                    // graceful_close 整段关）；这里关掉原始 page 句柄（swap_to_headed 后已死，close 吞错）。
+                    let _ = page.close().await;
+                    let _ = page2.close().await;
                     return Ok(SearchOutcome::CaptchaTimeout);
+                }
+                Err(e) => {
+                    let _ = page.close().await;
+                    let _ = page2.close().await;
+                    return Err(e);
                 }
             };
             // 解码完成即切回无头：GAEX 豁免 cookie 对 headed 有效（headed 直接过验证），
             // 切回后本次命令/会话内后续页不再弹窗。swap 换了 Browser 实例，page2 与旧
             // 句柄一起失效——重新 new_page 顶回循环变量再继续翻页。
-            browser::swap_to_headless(browser, h_slot).await?;
-            page = browser.new_page("about:blank").await?;
+            if let Err(e) = browser::swap_to_headless(browser, h_slot).await {
+                let _ = page.close().await;
+                let _ = page2.close().await;
+                return Err(e);
+            }
+            page = match browser.new_page("about:blank").await {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = page2.close().await;
+                    return Err(anyhow!("解码后 new_page 失败: {e}"));
+                }
+            };
+            let _ = page2.close().await;
             let results = parse_serp(&content);
             if results.is_empty() {
                 tracing::info!("第 {} 页（解码后）无结果，终止翻页", page_idx + 1);

@@ -6,6 +6,7 @@
 //! SearXNG 是局域网直连实例，**不走 GSEARCH_PROXY / 系统代理**。
 
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -15,7 +16,17 @@ use serde::Deserialize;
 use crate::parse::{absolutize, text_of};
 use crate::types::SearchResult;
 
-/// SearXNG 对缺失字段会输出 `null` 而非省略键；`null` → Default（serde default 不兜 null）。
+/// Low①：复用 reqwest::Client（连接池/tcp keepalive/handshake 重用）。原来每次请求
+/// 都 builder().build() 一遍——每次新建连接池、多页搜索（10 页）= 10 次握手。
+/// LazyLock 进程内单例；clear() 不会因为共享 client 被毒化（panic 也不影响其他调用方）。
+static SHARED_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        // 局域网直连：禁掉环境代理（HTTP_PROXY 等），配了 GSEARCH_PROXY 也绝不经代理
+        .no_proxy()
+        .build()
+        .expect("构建 SearXNG 共享 HTTP 客户端失败")
+});
 fn null_as_default<'de, D, T>(de: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -49,13 +60,7 @@ pub async fn search(base_url: &str, query: &str, page: u32) -> Result<Vec<Search
         crate::search::urlencode(query),
         page,
     );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        // 局域网直连：禁掉环境代理（HTTP_PROXY 等），配了 GSEARCH_PROXY 也绝不经代理
-        .no_proxy()
-        .build()
-        .context("构建 HTTP 客户端失败")?;
-    let resp = client
+    let resp = SHARED_CLIENT
         .get(&url)
         .send()
         .await
@@ -80,7 +85,6 @@ fn parse(text: &str) -> Result<Vec<SearchResult>> {
         })
         .collect())
 }
-
 /// 降级路径：抓 SearXNG HTML 结果页（format=json 不可用如 403 时）。
 /// `GET {base}/search?q=<encoded>&pageno=<page>`（不带 format=json），
 /// 5s 超时、明确禁代理，与 json 同款请求参数。
@@ -91,13 +95,7 @@ pub async fn search_html(base_url: &str, query: &str, page: u32) -> Result<Vec<S
         crate::search::urlencode(query),
         page,
     );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        // 局域网直连：禁掉环境代理（同 json 路径）
-        .no_proxy()
-        .build()
-        .context("构建 HTTP 客户端失败")?;
-    let resp = client
+    let resp = SHARED_CLIENT
         .get(&url)
         .send()
         .await
@@ -107,7 +105,6 @@ pub async fn search_html(base_url: &str, query: &str, page: u32) -> Result<Vec<S
     let text = resp.text().await.context("读取 SearXNG HTML 响应失败")?;
     Ok(parse_html(&text, base_url))
 }
-
 /// 解析 SearXNG HTML 结果页 → SearchResult 列表（纯函数，单测直接喂 HTML 片段）。
 /// 首选 `article.result` 容器；容器缺失（主题差异/改版）时放宽为 h3>a 与
 /// p.content 的文档序流式配对（同 parse.rs SEL_WALK 手法）。

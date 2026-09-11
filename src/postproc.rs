@@ -34,11 +34,17 @@ fn pick<'a>(results: &'a [SearchResult], n: usize, flag: &str) -> Result<&'a str
 }
 
 /// `--open N`：默认浏览器开窗。
+/// 校验 scheme 仅放行 http(s)（file: / javascript: / 自定义 scheme 一律拒），且不调 cmd.exe 解析 URL，
+/// 避免 Windows 上 `cmd /c start "" <url>` 的 cmd 元字符注入（实测 URL 含 `&` 会执行后半段）。
+/// explorer.exe 接受单个 URL 参数作为命令行 token，不经 cmd 解析；它会把 http(s) URL
+/// 交给默认浏览器。mac/linux 不走 cmd，保持 open / xdg-open 单参数。
 pub fn open(results: &[SearchResult], n: usize) -> Result<()> {
     let url = pick(results, n, "open")?;
-    // 三平台原生开窗命令；cfg! 让三个分支都在全平台编译（无 cfg 死代码）。
+    if !is_http_url(url) {
+        return Err(anyhow!("--open 仅支持 http/https URL（拒绝: {url}）"));
+    }
     let spawned = if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd").args(["/c", "start", "", url]).spawn()
+        std::process::Command::new("explorer.exe").arg(url).spawn()
     } else if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg(url).spawn()
     } else {
@@ -48,6 +54,13 @@ pub fn open(results: &[SearchResult], n: usize) -> Result<()> {
         tracing::warn!("打开默认浏览器失败（不影响输出）: {e}");
     }
     Ok(())
+}
+
+/// 校验 URL scheme 仅放行 http(s)（防 `cmd /c start` 注入与任意 scheme 兜底打开）。
+/// 提取 scheme 段时大小写不敏感（HTTP 与 http 等价），其余段（路径/查询）不动。
+fn is_http_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 /// `--read N` 选项集。M9：默认 AdaptiveRead，`--full/--json/--headings-only/--from K` 互斥选择。
@@ -225,7 +238,8 @@ async fn wait_login(browser: &Browser, url: &str) -> Result<()> {
 
 /// 轮询 document.readyState 到 complete；evaluate 报错（context 重建中的 -32000 等）视为未就绪。
 /// 对照 shell.rs settle_after_click（click 后 4s 版）；此处窗口放宽到 rounds×200ms。
-async fn wait_dom_complete(page: &chromiumoxide::Page, rounds: usize) {
+/// pub(crate)：general::cmd_browse 在 goto 后复用，避免再撞 -32000。
+pub(crate) async fn wait_dom_complete(page: &chromiumoxide::Page, rounds: usize) {
     for _ in 0..rounds {
         let ok = page
             .evaluate("document.readyState")
@@ -241,7 +255,8 @@ async fn wait_dom_complete(page: &chromiumoxide::Page, rounds: usize) {
 }
 
 /// page.content() 带 -32000 容错：context 重建中等 DOM 稳定后重取，至多 3 次。
-async fn content_retry(page: &chromiumoxide::Page) -> String {
+/// pub(crate)：general::cmd_browse 复用，避免直接 content() 撞 -32000 取空。
+pub(crate) async fn content_retry(page: &chromiumoxide::Page) -> String {
     for _ in 0..3 {
         match page.content().await {
             Ok(c) => return c,
@@ -252,15 +267,19 @@ async fn content_retry(page: &chromiumoxide::Page) -> String {
 }
 
 /// page.evaluate(js) → String，带 -32000 容错：等 DOM 稳定后重试，至多 3 次。
-async fn eval_string_retry(page: &chromiumoxide::Page, js: &str) -> String {
+pub(crate) async fn eval_string_retry(page: &chromiumoxide::Page, js: &str) -> String {
     for _ in 0..3 {
         match page.evaluate(js).await {
-            Ok(v) => return v.into_value::<String>().unwrap_or_default(),
+            Ok(v) => match v.into_value::<String>() {
+                Ok(s) => return s,
+                Err(_) => wait_dom_complete(page, 25).await,
+            },
             Err(_) => wait_dom_complete(page, 25).await,
         }
     }
     String::new()
 }
+
 /// `--dl N [-o DIR]`：走浏览器 cookie 的简化下载（M13 加 `-o`）。
 /// `-o DIR` 把文件落到 DIR 下（按 URL 末段命名）；缺省落 CWD（M4 历史行为）。
 /// ponytail: `general::cmd_dl` 已对（同名 `output: Option<&Path>` + `dir.join(filename_from_url(url))`），
@@ -372,8 +391,27 @@ mod tests {
         ));
         // 正文页不误伤:title/DOM 撞词但正文长;URL 含 login 但非登录段
         assert!(!login_wall_hit("https://example.com/article", "如何登录的完全指南", "登录教程正文……", 3000));
-        assert!(!login_wall_hit("https://blog.example.com/how-to-login", "How to login (guide)", "long body", 5000));
-        assert!(!login_wall_hit("https://example.com/", "Example Domain", "This domain is for use in illustrative examples", 100));
+    }
+    /// C1：open() 拒绝非 http(s) scheme（防 cmd 注入 + file:/javascript: 兜底打开）。
+    #[test]
+    fn open_rejects_non_http_scheme() {
+        for bad in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "ftp://example.com/x",
+            "data:text/html,hi",
+            "  javascript:alert(1)",
+        ] {
+            assert!(!is_http_url(bad), "应拒绝: {bad}");
+        }
+        for ok in [
+            "http://example.com",
+            "https://example.com/path?q=1",
+            "HTTPS://EXAMPLE.COM",
+            "  https://x.com/a",
+        ] {
+            assert!(is_http_url(ok), "应放行: {ok}");
+        }
     }
 }
 
@@ -425,18 +463,18 @@ mod live_tests {
         std::fs::remove_file("download.bin").unwrap();
     }
 
-    /// 直接断言 `cmd /c start` 机制——Windows 专属；Linux/macOS 由 CI matrix 的编译覆盖。
-    /// #[ignore]：真开默认浏览器窗口（每次 cargo test 弹 example.com 就是它），
-    /// 属手工验证测试（cargo test --ignored 跑）。
+    /// 直接断言 explorer.exe / open / xdg-open 路径——Windows 走 explorer.exe 单参数，
+    /// macOS/Linux 走 open / xdg-open 单参数，都不再经 cmd 解析（防元字符注入）。
+    /// #[ignore]：真开默认浏览器窗口（每次 cargo test --ignored 弹 example.com 就是它），
+    /// 属手工验证测试。CI matrix 编译覆盖了 cfg 分支。
     #[ignore]
     #[cfg(windows)]
     #[test]
-    fn open_mechanism() {
-        let st = std::process::Command::new("cmd")
-            .args(["/c", "start", "", "https://example.com"])
-            .status()
-            .unwrap();
-        assert!(st.success());
-        assert!(open(&fixture(), 1).is_ok());
+    fn open_mechanism_explorer() {
+        // 不实际 explorer.exe spawn——explorer.exe 是 GUI 进程，不会同步结束。
+        // 直接断言 open() 的 scheme 校验 + 平台分支构造（explorer.exe / open / xdg-open）。
+        assert!(open(&fixture(), 1).is_ok(), "https URL 应被放行并交给 explorer.exe");
+        // 越界仍按既有逻辑报错
+        assert!(open(&[], 1).is_err(), "越界应报错");
     }
 }

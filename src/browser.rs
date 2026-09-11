@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use chromiumoxide::browser::{Browser, BrowserConfig};
@@ -564,15 +565,18 @@ async fn apply_stealth_patches(page: &chromiumoxide::Page) {
         }
     }
 }
-
 /// 在独立 task 里持续 poll handler（chromiumoxide 要求，否则 CDP 通道会卡住）
+/// Low③：首个 error event 改 continue（仅致命 close 事件 break）——chromiumoxide 0.9.1
+/// Stream<Item = Result<()>> 偶尔会冒出瞬态 WS Invalid message 等非致命错误，旧版 break
+/// 让 handler 永久挂掉，所有后续 CDP 命令变成 -32000（接收端 gone）。改成 continue 后
+/// 让 handler 持续 poll；handler 自然在 closing 时返回 None 走完循环。
 pub fn spawn_handler(handler: Handler) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut h = handler;
         while let Some(event) = h.next().await {
             if event.is_err() {
-                tracing::warn!("CDP handler 出错: {:?}", event);
-                break;
+                tracing::warn!("CDP handler 出错（继续 poll）: {:?}", event);
+                continue;
             }
         }
     })
@@ -584,30 +588,26 @@ pub fn spawn_handler(handler: Handler) -> tokio::task::JoinHandle<()> {
 ///
 /// M16 压测发现：chromiumoxide 0.9.1 在 Windows 上 close + wait 后 child 仍可能残留
 /// （handler 退出循环但未给 chrome 发 CDP Browser.close 命令，kill_on_drop 仅 Unix 生效）。
-/// 若 wait 拿到 None 或 child 仍存活，主动 `kill()` 强杀；这是 chromiumoxide 公开 API（browser/mod.rs:315）。
-#[cfg(windows)]
-pub fn kill_residual_chrome_strict() {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/IM", "chrome.exe", "/T", "/F"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-}
-
-#[cfg(not(windows))]
-pub fn kill_residual_chrome_strict() {}
+/// Low②：曾有 `kill_residual_chrome_strict()` 跑 `taskkill /IM chrome.exe /T /F`——会误杀
+/// 用户主 Chrome（不是本 profile 的实例），已被审计删除。Chrome 残留收口一律走
+/// `graceful_close`（per-进程 close + wait + kill 兜底，不动用户主实例）。
 
 /// 关 Chrome 并等进程死透。chromiumoxide 0.9.1 的 close 只断 CDP 不保证杀子进程树；
 /// 调 kill() 兜底（公开 API，browser/mod.rs:315）。顶层命令（search/browse/login/dl）
 /// + shell 退出统一走这条，避免下一次 launch 撞 profile 锁。
+///
+/// M1：wait 加 5s tokio 超时——chromiumoxide 的 wait 在 Windows 上挂死历史踩坑
+/// （kill_on_drop 仅 Unix 生效；close 后子进程未必立刻退）；超时后强制走 kill 分支，
+/// 避免 graceful_close 自身成 hang 源。
 pub async fn graceful_close(browser: &mut Browser) {
     if let Err(e) = browser.close().await {
         tracing::warn!("close browser 失败: {e}");
     }
-    match browser.wait().await {
-        Ok(Some(status)) if status.success() => {} // 正常退出
+    let wait_res = tokio::time::timeout(Duration::from_secs(5), browser.wait()).await;
+    match wait_res {
+        Ok(Ok(Some(status))) if status.success() => {} // 正常退出
         _ => {
-            // 残留：杀子进程，再 wait 兜底
+            // 残留/超时：杀子进程，再 wait 兜底（这次不超时——kill 是同步信号）
             if let Some(Err(e)) = browser.kill().await {
                 tracing::warn!("kill browser 失败: {e}");
             }

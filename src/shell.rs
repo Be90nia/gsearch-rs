@@ -111,17 +111,12 @@ pub async fn run_shell() -> Result<ExitCode> {
             }
         }
     }
-    graceful_close(&mut ctx.browser).await;
+    gsearch::browser::graceful_close(&mut ctx.browser).await;
     Ok(ExitCode::SUCCESS)
 }
 
-/// 关 Chrome 并等进程死透；与 general.rs 同模式，避免 Drop 报 "was not closed manually" WARN。
-async fn graceful_close(browser: &mut Browser) {
-    if let Err(e) = browser.close().await {
-        tracing::warn!("close browser 失败: {e}");
-    }
-    let _ = browser.wait().await;
-}
+/// M2 迁移：以前 shell 自带一个本地 graceful_close；现在统一走 gsearch::browser::graceful_close
+/// （带超时 + kill 兜底，与顶层命令收尾路径完全一致）。
 
 
 /// 分派单条 shell 命令
@@ -182,10 +177,21 @@ async fn cmd_search(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
         SearchOutcome::CaptchaTimeout => {
             println!("CAPTCHA 亲解超时（{}s）—— profile 已养熟，下次 search 会自动跳过",
                 gsearch::search::CAPTCHA_TIMEOUT_SECS);
+            // I3：超时后浏览器还在 headed（CAPTCHA 路径 swap_to_headed 起 headed）；
+            // 切回 headless 并重建 page，让下条命令（read / dl / browse）能用。
+            if let Err(e) = browser::swap_to_headless(&mut ctx.browser, &mut ctx.handler_task).await {
+                eprintln!("切回 headless 失败: {e}");
+                return Err(e);
+            }
+            ctx.page = ctx
+                .browser
+                .new_page("about:blank")
+                .await
+                .context("切回 headless 后创建 page 失败")?;
+            ctx.current_url.clear();
             return Ok(());
         }
     };
-    // CAPTCHA 路径里 run_search 会 swap_to_headed 换 browser 实例——旧 page 句柄
     // 随旧 browser 死掉（后续命令报 "receiver is gone"）。检测失效即重建。
     if ctx.page.evaluate("1").await.is_err() {
         ctx.page = ctx
@@ -515,11 +521,10 @@ async fn cmd_login(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     print!("切回 headless 模式？[Y/n]: ");
     io::stdout().flush().ok();
     let mut ans = String::new();
-    io::stdin().lock().read_line(&mut ans).ok();
-    let ans = ans.trim().to_lowercase();
     if ans.is_empty() || ans == "y" || ans == "yes" {
+        // I4：切回 headless（swap_to_headless），不是 swap_to_headed（注释/命名误导前的原 bug）。
         // 同 profile 重起 headless，page 也得重建
-        swap_to_headed(&mut ctx.browser, &mut ctx.handler_task).await?;
+        browser::swap_to_headless(&mut ctx.browser, &mut ctx.handler_task).await?;
         ctx.page = ctx
             .browser
             .new_page("about:blank")
