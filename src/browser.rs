@@ -336,6 +336,23 @@ pub async fn swap_to_headed(
     *browser = new_browser;
     Ok(())
 }
+
+/// close 当前 browser 并同 profile 重启**无头**实例——解码完成后切回，对称 swap_to_headed。
+/// 动机（PM 实测）：GAEX 豁免 cookie 对 headed 有效、对 --headless=new 无效（Google 对无头
+/// 浏览器有独立指纹风控），headed 直接过验证后切回无头，本次命令/会话内后续搜索不再弹窗。
+pub async fn swap_to_headless(
+    browser: &mut Browser,
+    handler_slot: &mut Option<tokio::task::JoinHandle<()>>,
+) -> Result<()> {
+    graceful_close(browser).await;
+    let (new_browser, handler) = launch(true).await?;
+    if let Some(h) = handler_slot.take() {
+        h.abort();
+    }
+    *handler_slot = Some(spawn_handler(handler));
+    *browser = new_browser;
+    Ok(())
+}
 pub async fn launch_with_kind(headless: bool, kind: Option<BrowserKind>) -> Result<(Browser, Handler)> {
     let proxy = std::env::var("GSEARCH_PROXY").ok().filter(|s| !s.is_empty());
     launch_with_kind_proxy(headless, kind, proxy).await

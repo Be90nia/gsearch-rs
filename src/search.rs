@@ -107,6 +107,7 @@ pub async fn run_search_on_page(
                 break;
             }
             // 首页撞码：切有头轮询等人解（plsearch main.py:339-343 reveal_for_captcha + _search wait_for_captcha=True）
+            eprintln!("Google 对无头浏览器有独立风控（豁免 cookie 约 3 小时且对无头无效），弹出窗口验证后本会话将切回无头继续；高频场景建议用 gsearch shell");
             swap_to_headed(browser, h_slot).await?;
             let page2 = browser.new_page("about:blank").await?;
             page2.goto(&url).await.map_err(|e| anyhow!("goto {url} 失败: {e}"))?;
@@ -121,9 +122,11 @@ pub async fn run_search_on_page(
                     return Ok(SearchOutcome::CaptchaTimeout);
                 }
             };
-            // swap_to_headed 换了 Browser 实例——旧 page 句柄已死（receiver is gone），
-            // 把新实例的 page2 顶回循环变量，后续翻页才不会打已死句柄。
-            page = page2;
+            // 解码完成即切回无头：GAEX 豁免 cookie 对 headed 有效（headed 直接过验证），
+            // 切回后本次命令/会话内后续页不再弹窗。swap 换了 Browser 实例，page2 与旧
+            // 句柄一起失效——重新 new_page 顶回循环变量再继续翻页。
+            browser::swap_to_headless(browser, h_slot).await?;
+            page = browser.new_page("about:blank").await?;
             let results = parse_serp(&content);
             if results.is_empty() {
                 tracing::info!("第 {} 页（解码后）无结果，终止翻页", page_idx + 1);
