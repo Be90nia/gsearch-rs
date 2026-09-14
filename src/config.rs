@@ -1,7 +1,8 @@
 //! `gsearch.json` 配置文件（M15）：让用户不用环境变量也能配 profile / chrome 路径。
 //!
-//! 查找顺序：`--config <path>` 显式指定 → `./gsearch.json`（工作目录）→ `~/.gsearch/config.json`。
-//! 前两个都只读已存在的文件，不主动创建——不想留痕 C 盘就放前两处。
+//! 查找顺序：`--config <path>` 显式指定 → `./gsearch.json`（工作目录）→ exe 旁 `gsearch.json`
+//! （绿色软件，cwd 无关）→ `~/.gsearch/config.json`。
+//! 自动发现路径只读已存在的文件，不主动创建。
 //!
 //! 优先级（各键独立）：环境变量 > 配置文件 > 默认值。
 //! 格式错误：显式指定的路径报错（用户点名要它）；自动发现的仅 warn 后忽略。
@@ -50,6 +51,14 @@ fn load_from_disk() -> Result<GsearchConfig> {
         Some(p) => vec![(p.clone(), true)],
         None => {
             let mut v = vec![(PathBuf::from("gsearch.json"), false)];
+            // exe 旁边（绿色软件惯例：gsearch.json 随 exe 分发，cwd 无关）。
+            // 用户把配置放 exe 旁却在任意目录调 gsearch 时，前两个候选都落空 →
+            // searxng_url 静默失效走 Google 直爬撞 CAPTCHA 弹窗（真机踩坑，2026-09-11）。
+            if let Ok(exe) = std::env::current_exe()
+                && let Some(dir) = exe.parent()
+            {
+                v.push((dir.join("gsearch.json"), false));
+            }
             if let Some(home) = home_dir() {
                 v.push((home.join(".gsearch").join("config.json"), false));
             }

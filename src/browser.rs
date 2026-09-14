@@ -470,16 +470,26 @@ pub async fn launch_with_kind_proxy(
 }
 
 
-/// 瞬态失败重试一次（≤1s 退避）：上一实例 Chrome 后台 kill 未死透的 profile 锁竞态、
-/// Windows Defender 扫新生 exe 的文件锁（OS error 5）等；二次失败才上抛。
+/// 瞬态失败多轮退避重试：上一实例 Chrome 未死透的 profile 锁竞态、Windows Defender
+/// 扫新生 exe 的文件锁（OS error 5）、以及**多 agent 并发同 profile**（实测：3 个并发
+/// browse 只有 1 个能起，其余 ExitStatus(21)；browse 单次 5-15s，1s 单次重试必然再撞）。
+/// 退避序列 1/3/6/10/15s（累计 35s）盖住前一个实例的完整会话时长；打尽仍失败才上抛。
 async fn launch_with_retry(config: BrowserConfig) -> Result<(Browser, Handler)> {
-    // ponytail: 只重试 1 次盖住已知瞬态族；系统性失败（路径错/profile 活占用）二次也失败
+    const BACKOFF_SECS: [u64; 5] = [1, 3, 6, 10, 15];
     let mut attempt = Browser::launch(config.clone()).await;
-    if attempt.is_err() {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        attempt = Browser::launch(config).await;
+    for (round, wait) in BACKOFF_SECS.into_iter().enumerate() {
+        if attempt.is_ok() {
+            return attempt.map_err(|e| anyhow!("{e}"));
+        }
+        tracing::warn!(
+            "Chrome 启动失败（第 {}/{} 次重试前等待 {wait}s）：profile 疑被并发实例占用",
+            round + 1,
+            BACKOFF_SECS.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        attempt = Browser::launch(config.clone()).await;
     }
-    attempt.map_err(|e| anyhow!("启动 Chrome 失败，profile 可能被另一实例占用: {e}"))
+    attempt.map_err(|e| anyhow!("启动 Chrome 失败（已重试 {} 轮共 35s），profile 可能被长期占用: {e}", BACKOFF_SECS.len()))
 }
 
 /// chaser-stealth transport 补丁序列（launch 层逐 target 按序应用，顺序即检测面）。
