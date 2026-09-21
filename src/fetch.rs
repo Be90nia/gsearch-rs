@@ -59,7 +59,7 @@ pub async fn cmd_fetch(url: &str, opts: &FetchOpts) -> Result<ExitCode> {
     let limit = read_max_chars();
     let fetched = process_html(url, &html, is_html, limit);
 
-    if is_html && looks_like_js_shell(&fetched.text) {
+    if is_html && looks_like_js_shell(&fetched.text, &html) {
         eprintln!("该页无服务端正文（JS 壳），需渲染：用 gsearch browse {url}");
         return Ok(ExitCode::from(1));
     }
@@ -109,10 +109,16 @@ fn process_html(url: &str, html: &str, is_html: bool, limit: usize) -> Fetched {
     Fetched { url: url.to_string(), title, text, truncated, omitted }
 }
 
-/// JS 壳判定：剥标签后正文 < 500 字符。
-/// SPA 挂载点页（id="root"/id="app"）script 剥净后必然剩不了 500 字正文，同样落入此判定。
-fn looks_like_js_shell(text: &str) -> bool {
-    text.trim().chars().count() < SHELL_MIN_CHARS
+/// JS 壳判定：正文 < 500 字符 **且** html 含 SPA 挂载点标记（root/app/__next 等）。
+/// 双条件缺一不可：合法的小静态页（example.com 类）短但无挂载点，不判壳（压测抓到的假阳性）。
+fn looks_like_js_shell(text: &str, html: &str) -> bool {
+    if text.trim().chars().count() >= SHELL_MIN_CHARS {
+        return false;
+    }
+    let lower = html.to_ascii_lowercase();
+    ["id=\"root\"", "id=\"app\"", "id=root", "id=app", "__next"]
+        .iter()
+        .any(|m| lower.contains(m))
 }
 
 /// 轻量正文提取：script/style/noscript/template 连内容删除；注释删除；
@@ -307,18 +313,27 @@ mod tests {
         assert_eq!(decode_entities("plain"), "plain");
     }
 
-    /// looks_like_js_shell：SPA 壳（script+挂载点）判 true，正常正文判 false，500 阈值边界。
+    /// looks_like_js_shell：短正文 + SPA 挂载点才判 true；小静态页（example.com 类）不判壳。
     #[test]
     fn js_shell_detection() {
         let spa = "<html><body><div id=\"root\"></div><script src=\"app.js\"></script>\
                    <noscript>需要 JS</noscript></body></html>";
         let fetched = process_html("https://e.test/", spa, true, 50_000);
-        assert!(looks_like_js_shell(&fetched.text));
+        assert!(looks_like_js_shell(&fetched.text, spa));
+
+        // 短正文但无挂载点 = 合法小静态页（example.com 形态），不判壳（压测回归）
+        let tiny_static = "<html><head><title>Example</title></head><body><div>\
+                           <h1>Example Domain</h1><p>This domain is for use in illustrative examples.</p>\
+                           </div></body></html>";
+        let tiny = process_html("https://e.test/", tiny_static, true, 50_000);
+        assert!(!looks_like_js_shell(&tiny.text, tiny_static));
 
         let body = "正".repeat(600);
-        assert!(!looks_like_js_shell(&body));
-        assert!(looks_like_js_shell(&"正".repeat(499)));
-        assert!(!looks_like_js_shell(&"正".repeat(500)));
+        assert!(!looks_like_js_shell(&body, spa));
+        assert!(looks_like_js_shell(&"正".repeat(499), "<div id=\"app\"></div>"));
+        assert!(!looks_like_js_shell(&"正".repeat(500), "<div id=\"app\"></div>"));
+        // 短正文 + __next（Next.js）也判壳
+        assert!(looks_like_js_shell("", "<div id=\"__next\"></div>"));
     }
 
     /// process_html：截断逻辑（limit 注入）+ 非 HTML 不剥标签（markdown 源码的 `Vec<u8>` 不是标签）。
