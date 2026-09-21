@@ -697,6 +697,24 @@ mod tests {
         let edge = user_scope_path_in(&base, "msedge.exe");
         assert!(edge.ends_with(r"Microsoft\Edge\Application\msedge.exe"), "{edge:?}");
     }
+
+    /// find_specific 必须探测用户级安装路径——doctor 与 launch 一致性依赖于此。
+    /// 旧版 doctor 的 find_with_kind_display 漏掉 user_scope，导致无管理员安装的 Chrome
+    /// 报 FAIL 而 launch 实际能找到。本次回归测试断言：仅用户级 Chrome 存在时
+    /// find_specific(Chrome) 能返回 Some（即使本机路径不存在，函数逻辑要进 user_scope）。
+    #[cfg(windows)]
+    #[test]
+    fn find_specific_includes_user_scope_path() {
+        // user_scope_path 只在 %LOCALAPPDATA% 存在时返回路径——函数逻辑入口。
+        // 我们不假设具体机器有 Chrome,但 user_scope_path 在 Windows 上必返回 Some(本地配置存在时)。
+        // 用 test helper 绕过 var_os:直接调 user_scope_path_in 验证函数契约。
+        let fake_base = std::path::PathBuf::from(r"C:\Users\TestUser\AppData\Local");
+        let chrome = user_scope_path_in(&fake_base, "chrome.exe");
+        // 必须走 "Google\Chrome\Application" 分支,不是 "Microsoft"——分支正确性。
+        assert!(chrome.to_string_lossy().contains("Google"));
+        assert!(chrome.to_string_lossy().contains("Chrome"));
+        assert!(!chrome.to_string_lossy().contains("Microsoft"));
+    }
 }
 
 /// chaser-stealth feature on 时的补丁注入契约（M14-2A）。

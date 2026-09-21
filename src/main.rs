@@ -580,22 +580,18 @@ async fn cmd_doctor() -> Result<ExitCode> {
     let mut fail = 0;
     let mut warn = 0;
 
-    // 1) Chrome 可用
-    let chrome_ok = {
-        let k = gsearch::browser::BrowserKind::Chrome;
-        find_with_kind_display(k)
-    };
-    match &chrome_ok {
-        Some(_) => println!("[ OK ] Chrome: {}", chrome_ok.as_ref().unwrap()),
+    // 1) Chrome 可用（走 find_specific，与 launch 一致：含 %LOCALAPPDATA% 用户级安装路径）
+    match gsearch::browser::find_specific(gsearch::browser::BrowserKind::Chrome) {
+        Some((p, _)) => println!("[ OK ] Chrome: {}", p.display()),
         None => {
-            println!("[FAIL] Chrome 不可用（chrome.exe 未找到）");
+            println!("[FAIL] Chrome 不可用（chrome.exe 未找到；含默认路径与用户级 %LOCALAPPDATA%）");
             fail += 1;
         }
     }
 
     // 2) Edge 可用
-    match find_with_kind_display(gsearch::browser::BrowserKind::Edge) {
-        Some(p) => println!("[ OK ] Edge:   {p}"),
+    match gsearch::browser::find_specific(gsearch::browser::BrowserKind::Edge) {
+        Some((p, _)) => println!("[ OK ] Edge:   {}", p.display()),
         None => {
             println!("[WARN] Edge 不可用（msedge.exe 未找到；仅 Chrome 可跑）");
             warn += 1;
@@ -681,37 +677,6 @@ async fn cmd_doctor() -> Result<ExitCode> {
         println!("\n所有检查通过 ✓（耗时 {elapsed_ms}ms）");
         Ok(ExitCode::SUCCESS)
     }
-}
-
-fn find_with_kind_display(kind: gsearch::browser::BrowserKind) -> Option<String> {
-    use gsearch::browser::*;
-    let exe_name = match kind {
-        BrowserKind::Chrome => "chrome.exe",
-        BrowserKind::Edge => "msedge.exe",
-    };
-    let defaults: &[&str] = match kind {
-        BrowserKind::Chrome => &[r"C:\Program Files\Google\Chrome\Application\chrome.exe"],
-        BrowserKind::Edge => &[
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        ],
-    };
-    for d in defaults {
-        let p = std::path::PathBuf::from(d);
-        if p.is_file() {
-            return Some(p.display().to_string());
-        }
-    }
-    if let Ok(o) = std::process::Command::new("where").arg(exe_name).output()
-        && o.status.success()
-        && let Some(first) = String::from_utf8_lossy(&o.stdout).lines().next()
-    {
-        let p = std::path::PathBuf::from(first.trim());
-        if p.is_file() {
-            return Some(p.display().to_string());
-        }
-    }
-    None
 }
 
 fn test_profile_writable(dir: &std::path::Path) -> anyhow::Result<()> {
