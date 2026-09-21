@@ -74,6 +74,18 @@ pub struct OutputEnvelope<T: Serialize> {
     pub results: T,
 }
 
+/// batch 多查询（`search q1 q2 --json`，issue gsearch-rs-doh）输出的裸数组元素：
+/// 每条自带 meta，单条失败（status=error、results 空、message 给原因）不阻塞其他条目。
+#[derive(Serialize, Clone, Debug)]
+pub struct BatchEntry {
+    pub query: String,
+    pub status: RunStatus,
+    /// status=error 时的人类可读原因；ok 时空串。
+    pub message: String,
+    pub meta: MetaOutput,
+    pub results: Vec<SearchResult>,
+}
+
 /// M14-1A `verify <url>` 的报告。status=0 表示未拿到任何 HTTP 响应（仅 SSL 失败路径）。
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct VerifyReport {
@@ -182,5 +194,40 @@ mod tests {
         m.query = String::new();
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"query\":\"\""), "browse/dl query 应为空串: {s}");
+    }
+
+    /// batch 契约（issue gsearch-rs-doh）：元素含 query/status/message/meta/results 五键，
+    /// status 序列化小写 snake_case；error 条目 results 为空数组且 message 带原因。
+    #[test]
+    fn batch_entry_serializes_contract_keys() {
+        let mut m = sample_meta();
+        m.query = "rust async".into();
+        m.provider = "searxng".into();
+        let ok = BatchEntry {
+            query: "rust async".into(),
+            status: RunStatus::Ok,
+            message: String::new(),
+            meta: m,
+            results: sample_results(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&ok).unwrap();
+        for k in ["query", "status", "message", "meta", "results"] {
+            assert!(v.get(k).is_some(), "缺少键 {k}");
+        }
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["meta"]["provider"], "searxng");
+        assert_eq!(v["meta"]["query"], "rust async");
+
+        let err = BatchEntry {
+            query: "dead query".into(),
+            status: RunStatus::Error,
+            message: "SearXNG 查询失败".into(),
+            meta: sample_meta(),
+            results: vec![],
+        };
+        let v: serde_json::Value = serde_json::to_value(&err).unwrap();
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["message"], "SearXNG 查询失败");
+        assert_eq!(v["results"].as_array().unwrap().len(), 0);
     }
 }

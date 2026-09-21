@@ -115,7 +115,10 @@ enum Command {
 }
 #[derive(Args, Debug)]
 struct SearchArgs {
-    query: String,
+    /// 一到多个查询串：单查询 = 原行为（searxng → Google 回退链）；
+    /// 多查询 = batch 模式（并发 searxng、单条失败不阻塞、禁浏览器回退——浏览器单例不可并发）。
+    #[arg(required = true, num_args = 1..)]
+    query: Vec<String>,
     #[arg(long, default_value_t = 10)]
     limit: usize,
     /// `--open / --read / --dl` 互斥：每次只能指定一个；不可同时传。
@@ -209,25 +212,21 @@ async fn main() -> ExitCode {
 }
 
 async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode> {
+    // batch 多查询：并发 searxng、单条失败不阻塞、禁浏览器回退（issue gsearch-rs-doh）
+    if args.query.len() > 1 {
+        return cmd_search_batch(args).await;
+    }
     let started = std::time::Instant::now();
     // M14-1B：早解析浏览器路径 → meta 头部字段（与 launch 实际选用的 kind 一致）。
     let browser_kind = browser_arg_to_kind(args.browser);
-    let (browser_path, resolved_kind) = match browser_kind {
-        Some(k) => gsearch::browser::find_specific(k)
-            .or_else(|| gsearch::browser::find_browser().ok())
-            .unwrap_or_else(|| {
-                // 兑底：连 find_browser 都失败 → 留空让下面 launch 自己报错。
-                (std::path::PathBuf::new(), k)
-            }),
-        None => gsearch::browser::find_browser().unwrap_or_else(|_| {
-            (std::path::PathBuf::new(), gsearch::browser::BrowserKind::Chrome)
-        }),
-    };
+    let (browser_path, resolved_kind) = resolve_browser_meta(browser_kind);
+    // clap 保证位置参数 ≥1、上面分支保证 =1：单查询路径沿用原行为
+    let query = args.query.first().cloned().unwrap_or_default();
     // M17 惰性启动（Part 1）：先跑 SearXNG 纯 HTTP 源——命中则全程零浏览器；
     // 未配置/失败（try_searxng = None，回退 warn 已打）才 launch 走 Google 直爬。
     let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
     let mut h_slot: Option<tokio::task::JoinHandle<()>> = None;
-    let cfg = gsearch::search::SearchConfig { query: args.query.clone(), limit: args.limit };
+    let cfg = gsearch::search::SearchConfig { query: query.clone(), limit: args.limit };
     let (results, captcha_solved, provider) = if let Some(
         gsearch::search::SearchOutcome::Results { results, captcha_solved, provider },
     ) = gsearch::search::try_searxng(&cfg).await
@@ -252,7 +251,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             }
             // ponytail: 顶层 search 没人在场 stdin 给 noop Arc（human_solved 永远是 false，不影响行为）
             let human_solved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let cfg = gsearch::search::SearchConfig { query: args.query.clone(), limit: args.limit };
+            let cfg = gsearch::search::SearchConfig { query: query.clone(), limit: args.limit };
             let r = gsearch::search::run_search_on_page(&mut browser, cfg, page, &mut h_slot, human_solved).await?;
             *slot.borrow_mut() = Some(browser);
             Ok::<_, anyhow::Error>(r)
@@ -284,7 +283,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             gsearch::search::SearchOutcome::CaptchaTimeout => {
                 // 输出 captcha_timeout JSON（Agent 看到 status 字段就知道等人解超时）
                 if args.json {
-                    emit_captcha_timeout_json(&args, &browser_path, &resolved_kind, proxy.clone(), started.elapsed().as_millis());
+                    emit_captcha_timeout_json(&query, &args, &browser_path, &resolved_kind, proxy.clone(), started.elapsed().as_millis());
                 } else {
                     eprintln!("error: CAPTCHA 亲解超时（{}s）；profile 已养熟，再次执行会跳过 CAPTCHA",
                         gsearch::search::CAPTCHA_TIMEOUT_SECS);
@@ -298,7 +297,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         let meta = gsearch::types::MetaOutput {
             tool: "gsearch",
             version: env!("CARGO_PKG_VERSION"),
-            query: args.query.clone(),
+            query: query.clone(),
             profile: gsearch::browser::profile_name_only(),
             browser_kind: format!("{resolved_kind:?}"),
             browser_path: browser_path.to_string_lossy().into_owned(),
@@ -362,6 +361,107 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     }
 }
 
+/// 早解析浏览器路径 → meta 头部字段（与 launch 实际选用的 kind 一致）；只探测不启动。
+/// batch 模式同样用它填 meta（batch 全程零浏览器）。
+fn resolve_browser_meta(
+    browser_kind: Option<gsearch::browser::BrowserKind>,
+) -> (std::path::PathBuf, gsearch::browser::BrowserKind) {
+    match browser_kind {
+        Some(k) => gsearch::browser::find_specific(k)
+            .or_else(|| gsearch::browser::find_browser().ok())
+            .unwrap_or_else(|| {
+                // 兜底：连 find_browser 都失败 → 留空让 launch 自己报错。
+                (std::path::PathBuf::new(), k)
+            }),
+        None => gsearch::browser::find_browser().unwrap_or_else(|_| {
+            (std::path::PathBuf::new(), gsearch::browser::BrowserKind::Chrome)
+        }),
+    }
+}
+
+/// batch 多查询（issue gsearch-rs-doh）：并发走 SearXNG，单条失败不阻塞其他条目。
+/// 刻意边界：禁浏览器回退（浏览器单例不可并发）；--read/--dl/--open 不参与 batch。
+/// 输出：--json 为裸 BatchEntry 数组；人读模式逐条分隔标题。退出码：全成功 0 / 部分失败 1 / 全部失败 2。
+async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
+    if args.read.is_some() || args.dl.is_some() || args.open.is_some() {
+        return Err(anyhow!(
+            "batch 多查询暂不支持 --read/--dl/--open（batch 无浏览器参与）；请对单查询使用"
+        ));
+    }
+    let started = std::time::Instant::now();
+    let (browser_path, resolved_kind) = resolve_browser_meta(browser_arg_to_kind(args.browser));
+    let outcomes = gsearch::search::run_batch(&args.query, args.limit).await;
+    let elapsed_ms = started.elapsed().as_millis();
+    let profile = gsearch::browser::profile_name_only();
+    let entries: Vec<gsearch::types::BatchEntry> = outcomes
+        .into_iter()
+        .map(|(query, outcome)| {
+            let (status, message, results) = match outcome {
+                Ok(gsearch::search::SearchOutcome::Results { results, .. }) => {
+                    (gsearch::types::RunStatus::Ok, String::new(), results)
+                }
+                // batch 只走 searxng 不撞码，CaptchaTimeout 不可达；防御性兜为 error
+                Ok(_) => (
+                    gsearch::types::RunStatus::Error,
+                    "batch 无浏览器路径，CaptchaTimeout 不应出现".into(),
+                    vec![],
+                ),
+                Err(reason) => (gsearch::types::RunStatus::Error, reason, vec![]),
+            };
+            let meta = gsearch::types::MetaOutput {
+                tool: "gsearch",
+                version: env!("CARGO_PKG_VERSION"),
+                query: query.clone(),
+                profile: profile.clone(),
+                browser_kind: format!("{resolved_kind:?}"),
+                browser_path: browser_path.to_string_lossy().into_owned(),
+                // batch 全程纯 HTTP 直连局域网 searxng（searxng.rs 固定 no_proxy），代理字段恒空
+                proxy: None,
+                humanize: args.humanize,
+                limit: args.limit,
+                elapsed_ms,
+                results_count: results.len(),
+                truncated: results.len() >= args.limit,
+                provider: "searxng".into(),
+            };
+            gsearch::types::BatchEntry {
+                query,
+                status,
+                message,
+                meta,
+                results,
+            }
+        })
+        .collect();
+    if args.json {
+        gsearch::output::print_batch_json(&entries)?;
+    } else {
+        // 人读：逐条分隔标题，条目内部沿用单查询格式
+        for (i, e) in entries.iter().enumerate() {
+            println!("=== [{}/{}] {} ===", i + 1, entries.len(), e.query);
+            if e.status == gsearch::types::RunStatus::Error {
+                println!("  出错: {}", e.message);
+            } else {
+                gsearch::output::print_text(&e.results);
+            }
+        }
+    }
+    let ok_count = entries
+        .iter()
+        .filter(|e| e.status == gsearch::types::RunStatus::Ok)
+        .count();
+    let total = entries.len();
+    eprintln!("batch 完成：{ok_count}/{total} 条成功");
+    if ok_count == total {
+        Ok(ExitCode::SUCCESS)
+    } else if ok_count == 0 {
+        eprintln!("未找到结果");
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::from(1))
+    }
+}
+
 /// M17 惰性启动：--read/--dl 首次用到浏览器时才 launch(headless)。
 /// SearXNG 命中路径全程零浏览器；Google 路径已 launch 则直接复用（slot 已 Some）。
 /// ponytail: Option::insert 返回 &mut——省掉「先判空再取出」的双 borrow 样板。
@@ -385,6 +485,7 @@ async fn ensure_search_browser<'a>(
 
 /// M15：CAPTCHA 超时时输出 status=captcha_timeout 的 JSON 信封。
 fn emit_captcha_timeout_json(
+    query: &str,
     args: &SearchArgs,
     browser_path: &std::path::Path,
     resolved_kind: &gsearch::browser::BrowserKind,
@@ -394,7 +495,7 @@ fn emit_captcha_timeout_json(
     let meta = gsearch::types::MetaOutput {
         tool: "gsearch",
         version: env!("CARGO_PKG_VERSION"),
-        query: args.query.clone(),
+        query: query.to_string(),
         profile: gsearch::browser::profile_name_only(),
         browser_kind: format!("{resolved_kind:?}"),
         browser_path: browser_path.to_string_lossy().into_owned(),
@@ -623,6 +724,21 @@ mod tests {
         let cli2 = Cli::try_parse_from(["gsearch", "search", "test", "--no-humanize"]).unwrap();
         let Command::Search(args2) = cli2.cmd else { panic!("expected search") };
         assert!(!args2.humanize);
+    }
+
+    /// batch（issue gsearch-rs-doh）：多位置参数收集为 Vec；单查询向后兼容；零查询拒绝。
+    #[test]
+    fn search_accepts_one_or_more_queries() {
+        let cli = Cli::try_parse_from(["gsearch", "search", "rust async runtime", "tokio tutorial", "--json"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert_eq!(args.query, vec!["rust async runtime", "tokio tutorial"]);
+        assert!(args.json);
+        // 单查询向后兼容
+        let cli = Cli::try_parse_from(["gsearch", "search", "test"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert_eq!(args.query, vec!["test"]);
+        // 零查询 → clap 解析错误
+        assert!(Cli::try_parse_from(["gsearch", "search"]).is_err());
     }
 
     #[test]

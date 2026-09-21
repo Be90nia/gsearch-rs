@@ -10,10 +10,11 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use chromiumoxide::browser::Browser;
+use serde::Deserialize;
 
 use crate::general::{LOGIN_POLL_SECS, browser_alive, login_poll_decision};
 use gsearch::search::is_captcha;
-use gsearch::skeleton::{extract_adaptive, format_adaptive, format_headings_only, format_json};
+use gsearch::skeleton::{extract_adaptive, format_adaptive, format_headings_only};
 use gsearch::types::SearchResult;
 use gsearch::util::filename_from_url;
 
@@ -23,6 +24,14 @@ const PAGE_TIMEOUT_SECS: u64 = 30;
 const LOGIN_WALL_TIMEOUT_SECS: u64 = 180;
 /// 登录墙 title 判定要求的「正文极短」阈值(innerText 字符数;登录页只有表单文案)
 const LOGIN_WALL_SHORT_BODY: usize = 400;
+/// jp4：read/browse 正文提取的字符硬上限（gsearch.json `read_max_chars` 可覆盖）。
+/// 防超大页撑爆 agent 上下文；正文是注入面，超限一律截断并在 meta 标注。
+const READ_BODY_MAX_CHARS: usize = 50_000;
+/// uhp/j44：原子快照 visibleText 的字符硬顶（jev snapshot.js 同配方；只作 marker/登录墙判定，
+/// 不作正文输出源，read_full 仍走独立 innerText 求值）。
+const SNAPSHOT_MAX_TEXT_CHARS: usize = 6000;
+/// uhp/j44：判稳轮询间隔（两轮快照间 200ms，给 setTimeout 晚跳转留触发窗口）。
+const SNAPSHOT_POLL_MS: u64 = 200;
 
 /// `--{flag} N` 下标校验：1-based；0 或超出结果数报错（含结果数为 0 的情况）
 fn pick<'a>(results: &'a [SearchResult], n: usize, flag: &str) -> Result<&'a str> {
@@ -62,6 +71,165 @@ fn is_http_url(url: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
+/// uhp：单次 Runtime.evaluate 的原子快照——一次 CDP 往返拿 4 类值，压 -32000 时序暴露面。
+/// JS 必须用 `async function` 声明形式（chromiumoxide 第 1 坑：async 箭头函数被当 Expression
+/// 求值成 {}，into_value 报 invalid type）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PageSnapshot {
+    pub ready_state: String,
+    pub title: String,
+    /// TreeWalker 可见文本：跳 script/style/noscript/template 与 aria-hidden/inert 祖先、
+    /// parent checkVisibility、视口内、空白归一、硬顶 {max} 字符。j44 语义 marker 的文本源。
+    pub visible_text: String,
+    // JS 同时返回 links（视口内 <a href> 采集，jev snapshot.js 同配方），留给 shell_snap
+    // 后续复用；本结构暂不消费（serde 忽略未知字段），避免死字段。
+}
+
+/// uhp：原子快照 JS。`{max}` 由 page_snapshot 用 str::replace 注入（format! 会要求转义全部 JS 花括号）。
+const SNAPSHOT_JS: &str = r#"async function () {
+    const MAX = {max};
+    const skip = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE']);
+    const hiddenByAncestor = (el) => {
+        for (let n = el; n; n = n.parentElement) {
+            if (skip.has(n.tagName)) return true;
+            if (n.getAttribute && (n.getAttribute('aria-hidden') === 'true' || n.hasAttribute('inert'))) return true;
+        }
+        return false;
+    };
+    const visible = (el) => {
+        if (el.checkVisibility && !el.checkVisibility()) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0
+            && r.top < window.innerHeight && r.left < window.innerWidth;
+    };
+    const root = document.body || document.documentElement;
+    let text = '';
+    if (root) {
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+            acceptNode(t) {
+                const p = t.parentElement;
+                if (!p || hiddenByAncestor(p) || !visible(p)) return NodeFilter.FILTER_REJECT;
+                return NodeFilter.FILTER_ACCEPT;
+            }
+        });
+        for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+            const s = n.nodeValue.replace(/\s+/g, ' ').trim();
+            if (!s) continue;
+            text += (text ? ' ' : '') + s;
+            if (text.length >= MAX) { text = text.slice(0, MAX); break; }
+        }
+    }
+    const links = [];
+    if (root) {
+        for (const a of root.querySelectorAll('a[href]')) {
+            if (links.length >= 50) break;
+            if (hiddenByAncestor(a) || !visible(a)) continue;
+            links.push({ href: a.href, text: (a.textContent || '').trim().slice(0, 100) });
+        }
+    }
+    return { readyState: document.readyState, title: document.title || '', visibleText: text, links };
+}"#;
+
+/// uhp：执行原子快照。evaluate Err（导航中 / -32000 context 重建）原样上抛，由调用方判稳逻辑消化。
+pub(crate) async fn page_snapshot(page: &chromiumoxide::Page) -> Result<PageSnapshot> {
+    let js = SNAPSHOT_JS.replace("{max}", &SNAPSHOT_MAX_TEXT_CHARS.to_string());
+    page.evaluate(js)
+        .await?
+        .into_value::<PageSnapshot>()
+        .map_err(|e| anyhow!("快照反序列化失败: {e}"))
+}
+
+/// j44 语义新鲜度判稳：轮询原子快照，marker = {title, visibleText}（拼接对等值比较，禁引哈希依赖），
+/// **连续两次相同才判正文定稿**，替代 readyState==complete（知乎限流页等风控页秒 complete 但
+/// 内容是拦截体）。readyState!=complete 仅作必要条件地板（加载中正文未定，且防空 marker
+/// ("","") 在慢加载页两次假定稿），不是定稿判据。evaluate Err 视为未就绪并重置 marker
+/// （晚跳转销毁 context 后在新页重新积累）。无导航页面两轮快照（间隔 200ms）即过，无固定
+/// sleep；窗口耗尽返回最后一次成功快照（一次都没成功 → None），调用方自行兜底。
+/// 共享入口：postproc::goto_page / general::cmd_browse / shell cmd_click。
+pub(crate) async fn wait_content_stable(
+    page: &chromiumoxide::Page,
+    rounds: usize,
+) -> Option<PageSnapshot> {
+    let mut prev_marker: Option<(String, String)> = None;
+    let mut last: Option<PageSnapshot> = None;
+    for i in 0..rounds {
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(SNAPSHOT_POLL_MS)).await;
+        }
+        match page_snapshot(page).await {
+            Ok(s) => {
+                if s.ready_state != "complete" {
+                    prev_marker = None;
+                    continue;
+                }
+                let marker = (s.title.clone(), s.visible_text.clone());
+                let settled = prev_marker.as_ref() == Some(&marker);
+                last = Some(s);
+                if settled {
+                    return last;
+                }
+                prev_marker = Some(marker);
+            }
+            Err(_) => prev_marker = None,
+        }
+    }
+    last
+}
+
+/// jp4：正文截断上限（gsearch.json `read_max_chars` > 缺省 50000）。
+pub(crate) fn read_max_chars() -> usize {
+    gsearch::config::load().read_max_chars.unwrap_or(READ_BODY_MAX_CHARS)
+}
+
+/// jp4：字符级硬截断（按 chars 计，不劈 UTF-8）。返回 (截后文本, 是否截断, 省略字符数)。
+pub(crate) fn cap_chars(s: &str, limit: usize) -> (String, bool, usize) {
+    let total = s.chars().count();
+    if total <= limit {
+        return (s.to_string(), false, 0);
+    }
+    (s.chars().take(limit).collect(), true, total - limit)
+}
+
+/// jp4：AdaptiveRead → 输出串。--json 在序列化对象末尾注入 meta{truncated, omitted,
+/// content_untrusted:true}（网页正文进 agent 上下文 = 注入面，正文永远是数据非指令）；
+/// 文本模式截断时 eprintln 提醒（stdout 保持可解析，stderr 承载告警）。
+pub(crate) fn render_read(
+    read: &gsearch::skeleton::AdaptiveRead,
+    json: bool,
+    headings_only: bool,
+    from: usize,
+    truncated: bool,
+    omitted: usize,
+) -> String {
+    if json {
+        let mut v = match serde_json::to_value(read) {
+            Ok(v) => v,
+            Err(e) => return format!("{{\"error\": \"{e}\"}}"),
+        };
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert(
+                "meta".into(),
+                serde_json::json!({
+                    "truncated": truncated,
+                    "omitted": omitted,
+                    "content_untrusted": true,
+                }),
+            );
+        }
+        v.to_string()
+    } else {
+        if truncated {
+            eprintln!("注意：正文超上限已截断（省略 {omitted} 字符；--json 输出在 meta 字段标注）");
+        }
+        if headings_only {
+            format_headings_only(read)
+        } else {
+            format_adaptive(read, from)
+        }
+    }
+}
+
 /// `--read N` 选项集。M9：默认 AdaptiveRead，`--full/--json/--headings-only/--from K` 互斥选择。
 #[derive(Debug, Clone, Default)]
 pub struct ReadOpts {
@@ -72,6 +240,7 @@ pub struct ReadOpts {
 }
 
 /// `--read N`：M9 默认走 AdaptiveRead（按文章结构自适应）。opts 见 ReadOpts。
+/// jp4：html 先过 read_max_chars 硬截断；--json 在 meta 字段标注 truncated/omitted/content_untrusted。
 pub async fn read(
     browser: &mut Browser,
     h_slot: &mut Option<tokio::task::JoinHandle<()>>,
@@ -80,20 +249,18 @@ pub async fn read(
     opts: &ReadOpts,
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
-    let page = open_page(browser, h_slot, url).await?;
-    let title = eval_string_retry(&page, "document.title").await;
-    let html = content_retry(&page).await;
+    let (page, snap) = open_page(browser, h_slot, url).await?;
+    let title = match &snap {
+        Some(s) => s.title.clone(),
+        None => eval_string_retry(&page, "document.title").await,
+    };
+    let html_full = content_retry(&page).await;
+    let (html, truncated, omitted) = cap_chars(&html_full, read_max_chars());
     let mut read = extract_adaptive(&html);
     read.url = url.to_string();
     read.title = title;
 
-    let out = if opts.json {
-        format_json(&read)
-    } else if opts.headings_only {
-        format_headings_only(&read)
-    } else {
-        format_adaptive(&read, opts.from)
-    };
+    let out = render_read(&read, opts.json, opts.headings_only, opts.from, truncated, omitted);
     println!("{out}");
     Ok(out)
 }
@@ -106,39 +273,42 @@ pub async fn read_full(
     n: usize,
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
-    let page = open_page(browser, h_slot, url).await?;
+    let (page, _) = open_page(browser, h_slot, url).await?;
     read_full_inner(&page, url).await
 }
 
-/// 共享 innerText 5000 字截断 + 打印。
-async fn read_full_inner(page: &chromiumoxide::Page, url: &str) -> Result<String> {
+/// 共享 innerText 5000 字截断 + 打印。pub(crate)：general::cmd_browse --full 复用同一实现。
+pub(crate) async fn read_full_inner(page: &chromiumoxide::Page, url: &str) -> Result<String> {
     let txt = eval_string_retry(page, "document.body.innerText").await;
     let txt: String = txt.chars().take(READ_FULL_MAX_CHARS).collect();
     println!("=== {url} ===\n{txt}");
     Ok(txt)
 }
 
-/// M4 健壮性修复：打开结果页并等 DOM 稳定——read / read_full 共用的 goto 前置。
+/// M4 健壮性修复：打开结果页并等语义定稿——read / read_full 共用的 goto 前置。
 /// 知乎等站 goto resolve 后仍会内部跳转（登录墙/风控重定向），旧 JS context 被销毁，
 /// 紧跟的 content()/evaluate 会撞 CDP -32000 "Cannot find context"（此前被 unwrap_or_default
-/// 吞成空串 → 正文为空）。修法对照 shell.rs settle_after_click 先例：goto 后轮询
-/// document.readyState 到 complete（约 10s 上限），evaluate 类错误（含 -32000）吞掉继续轮询。
+/// 吞成空串 → 正文为空）。j44：等稳定不再看 readyState==complete（风控限流页秒 complete 但
+/// 内容是拦截体），改轮询原子快照语义 marker 连续两次相同（wait_content_stable，约 10s 上限），
+/// evaluate 类错误（含 -32000）视为未就绪继续轮询。
 ///
 /// M17 登录墙（Part 2）：检测到登录墙 → eprintln 提示 → swap_to_headed 弹有头窗
 /// 等人工登录（复用 general::login_poll_decision 决策，180s 超时）→ 登录成功重抓正文。
 /// cookie 随 profile 落盘，下次无感。人关窗 = browser 已死 → 重起 headless 再试一次；
 /// 重抓仍撞墙/CAPTCHA 报错退出（限一次登录机会，防循环弹窗）。
+/// 返回 (page, 定稿快照)；快照 None（窗口内 evaluate 全败）时 title/正文特征退化为空，
+/// 登录墙判定只剩 URL 路径特征（与旧实现 evaluate 全败时的可观测行为一致）。
 async fn open_page(
     browser: &mut Browser,
     h_slot: &mut Option<tokio::task::JoinHandle<()>>,
     url: &str,
-) -> Result<chromiumoxide::Page> {
-    let page = goto_page(browser, url).await?;
+) -> Result<(chromiumoxide::Page, Option<PageSnapshot>)> {
+    let (page, snap) = goto_page(browser, url).await?;
     if is_captcha(&content_retry(&page).await) {
         return Err(anyhow!("{url} 遇 CAPTCHA，M4 后处理不支持人解，请重试或手动浏览器打开"));
     }
-    if !login_wall_hit_page(&page).await {
-        return Ok(page);
+    if !login_wall_hit_page(&page, &snap).await {
+        return Ok((page, snap));
     }
 
     eprintln!(
@@ -152,33 +322,39 @@ async fn open_page(
         *h_slot = Some(gsearch::browser::spawn_handler(handler));
         *browser = b;
     }
-    let page = goto_page(browser, url).await?;
+    let (page, snap) = goto_page(browser, url).await?;
     if is_captcha(&content_retry(&page).await) {
         return Err(anyhow!("{url} 遇 CAPTCHA，请重试或手动浏览器打开"));
     }
-    if login_wall_hit_page(&page).await {
+    if login_wall_hit_page(&page, &snap).await {
         return Err(anyhow!("登录后重抓 {url} 仍遇登录墙（登录未生效？）；可先 `gsearch login <url>` 手动完成登录"));
     }
-    Ok(page)
+    Ok((page, snap))
 }
 
-/// new_page + goto + 等 DOM 稳定（原 open_page 前半，登录墙重抓路径复用）。
-async fn goto_page(browser: &Browser, url: &str) -> Result<chromiumoxide::Page> {
+/// new_page + goto + 等语义定稿（原 open_page 前半，登录墙重抓路径复用）。
+async fn goto_page(
+    browser: &Browser,
+    url: &str,
+) -> Result<(chromiumoxide::Page, Option<PageSnapshot>)> {
     let page = browser.new_page("about:blank").await?;
     tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
         .await
         .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
         .map_err(|e| anyhow!("goto {url} 失败（浏览器被手关？）: {e}"))?;
-    wait_dom_complete(&page, 50).await; // 50×200ms ≈ 10s
-    Ok(page)
+    let snap = wait_content_stable(&page, 50).await; // 50×200ms ≈ 10s
+    Ok((page, snap))
 }
 
-/// 登录墙页内判定：URL 跳转特征 + title/正文特征（见 login_wall_hit）。
-async fn login_wall_hit_page(page: &chromiumoxide::Page) -> bool {
+/// 登录墙页内判定：最终 URL + 定稿快照的 title/可见正文特征（见 login_wall_hit）。
+async fn login_wall_hit_page(page: &chromiumoxide::Page, snap: &Option<PageSnapshot>) -> bool {
     let url = page.url().await.ok().flatten().unwrap_or_default();
-    let title = eval_string_retry(page, "document.title").await;
-    let body = eval_string_retry(page, "document.body ? document.body.innerText : ''").await;
-    login_wall_hit(&url, &title, &body, body.chars().count())
+    let (title, body, body_chars) = match snap {
+        Some(s) => (s.title.as_str(), s.visible_text.as_str(), s.visible_text.chars().count()),
+        // 快照全败 → 只剩 URL 路径特征（与旧实现 evaluate 全败时行为一致）
+        None => ("", "", 0),
+    };
+    login_wall_hit(&url, title, body, body_chars)
 }
 
 /// M17 登录墙判定（契约特征，纯函数可单测）：
@@ -206,7 +382,7 @@ fn login_wall_hit(url: &str, title: &str, body: &str, body_chars: usize) -> bool
 /// 用户关窗 = 完成），语义对齐其 login_poll_decision_* 单测。差异仅两点：
 /// 180s deadline（顶层命令无人守窗）+ 完成后不退出进程而是返回重抓。
 async fn wait_login(browser: &Browser, url: &str) -> Result<()> {
-    let page = goto_page(browser, url).await?;
+    let (page, _) = goto_page(browser, url).await?;
     let initial_url = page
         .url()
         .await
@@ -236,9 +412,9 @@ async fn wait_login(browser: &Browser, url: &str) -> Result<()> {
 }
 
 /// 轮询 document.readyState 到 complete；evaluate 报错（context 重建中的 -32000 等）视为未就绪。
-/// 对照 shell.rs settle_after_click（click 后 4s 版）；此处窗口放宽到 rounds×200ms。
-/// pub(crate)：general::cmd_browse 在 goto 后复用，避免再撞 -32000。
-pub(crate) async fn wait_dom_complete(page: &chromiumoxide::Page, rounds: usize) {
+/// 仅作 content_retry / eval_string_retry 的 -32000 恢复退避；正文定稿判定走 wait_content_stable
+/// （j44：readyState==complete 对风控限流页不可信）。
+async fn wait_dom_complete(page: &chromiumoxide::Page, rounds: usize) {
     for _ in 0..rounds {
         let ok = page
             .evaluate("document.readyState")
@@ -266,6 +442,7 @@ pub(crate) async fn content_retry(page: &chromiumoxide::Page) -> String {
 }
 
 /// page.evaluate(js) → String，带 -32000 容错：等 DOM 稳定后重试，至多 3 次。
+/// pub(crate)：postproc title 兜底 / read_full_inner / general::cmd_browse title 兜底共用。
 pub(crate) async fn eval_string_retry(page: &chromiumoxide::Page, js: &str) -> String {
     for _ in 0..3 {
         match page.evaluate(js).await {
@@ -426,6 +603,37 @@ mod tests {
         // 正文页不误伤:title/DOM 撞词但正文长;URL 含 login 但非登录段
         assert!(!login_wall_hit("https://example.com/article", "如何登录的完全指南", "登录教程正文……", 3000));
     }
+    /// jp4：cap_chars 字符级硬截断（按 chars 计不劈 UTF-8；未超限零拷贝语义）。
+    #[test]
+    fn cap_chars_cases() {
+        let (s, trunc, omitted) = cap_chars("hello", 10);
+        assert!(!trunc && omitted == 0 && s == "hello");
+        let (s, trunc, omitted) = cap_chars("你好世界", 2);
+        assert!(trunc && omitted == 2 && s == "你好");
+        let long = "x".repeat(READ_BODY_MAX_CHARS + 1);
+        let (s, trunc, omitted) = cap_chars(&long, READ_BODY_MAX_CHARS);
+        assert!(trunc && omitted == 1 && s.chars().count() == READ_BODY_MAX_CHARS);
+    }
+
+    /// jp4：render_read 仅 --json 注入 meta{truncated,omitted,content_untrusted}（追加不覆盖
+    /// 既有字段）；文本模式不加任何 JSON 键，截断走 eprintln。
+    #[test]
+    fn render_read_injects_meta_json_only() {
+        let html = r#"<html><head><title>T</title></head><body><h1>One</h1><p>p1 alpha.</p></body></html>"#;
+        // extract_adaptive 不取 title（url/title 由调用方补，与 skeleton 既有测试同款）
+        let mut read = extract_adaptive(html);
+        read.url = "u".into();
+        read.title = "T".into();
+        let v: serde_json::Value =
+            serde_json::from_str(&render_read(&read, true, false, 0, true, 7)).unwrap();
+        assert_eq!(v["meta"]["truncated"], true);
+        assert_eq!(v["meta"]["omitted"], 7);
+        assert_eq!(v["meta"]["content_untrusted"], true);
+        assert_eq!(v["title"], "T");
+        let text = render_read(&read, false, false, 0, false, 0);
+        assert!(!text.contains("content_untrusted"), "文本模式不应出现 meta: {text}");
+    }
+
     /// C1：open() 拒绝非 http(s) scheme（防 cmd 注入 + file:/javascript: 兜底打开）。
     #[test]
     fn open_rejects_non_http_scheme() {

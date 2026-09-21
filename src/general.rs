@@ -15,10 +15,9 @@ use chromiumoxide::cdp::browser_protocol::browser::{
 
 use gsearch::browser::{BrowserKind, launch_with_kind_proxy, spawn_handler};
 use gsearch::search::is_captcha;
-use gsearch::skeleton::{extract_adaptive, format_adaptive, format_headings_only, format_json};
+use gsearch::skeleton::extract_adaptive;
 use gsearch::util::filename_from_url;
 
-const TEXT_MAX_CHARS: usize = 5000;
 const PAGE_TIMEOUT_SECS: u64 = 30;
 /// login 轮询间隔(postproc 登录墙等待复用同一节奏)
 pub(crate) const LOGIN_POLL_SECS: u64 = 2;
@@ -44,8 +43,8 @@ pub struct BrowseOpts {
 /// CAPTCHA 路径：撞码报错退出，提示用 login 手工验证。
 /// H2+M2：launch 后所有 ? 早返回路径（new_page / goto / evaluate / content / parse）由外层
 /// graceful_close 收尾；不再裸 close+wait。
-/// M6：goto 后复用 postproc::wait_dom_complete 等 DOM 稳定；正文取自 postproc::content_retry
-/// （避免 CDP -32000 空抓）。
+/// uhp/j44：goto 后等语义定稿走 postproc::wait_content_stable 原子快照（title 一并带回）；
+/// jp4：html 过 read_max_chars 硬截断，--json 在 meta 字段标注 truncated/omitted/content_untrusted。
 pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
     use crate::postproc;
     let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
@@ -58,8 +57,8 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
             .await
             .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
             .map_err(|e| anyhow!("goto {url} 失败: {e}"))?;
-        // M6：等 DOM 稳定，避免 -32000。postproc::wait_dom_complete 50 轮×200ms ≈10s。
-        postproc::wait_dom_complete(&page, 50).await;
+        // uhp/j44：等语义定稿（marker 连续两次相同），避免 -32000 与风控页假 complete。
+        let snap = postproc::wait_content_stable(&page, 50).await; // 50×200ms ≈ 10s
 
         if is_captcha(&postproc::content_retry(&page).await) {
             return Err(anyhow!(
@@ -67,28 +66,24 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
             ));
         }
 
-        // --full：纯 innerText 5000 字
+        // --full：纯 innerText 5000 字（与 postproc::read_full 同一实现）
         if opts.full {
-            let text = postproc::eval_string_retry(&page, "document.body.innerText").await;
-            let text: String = text.chars().take(TEXT_MAX_CHARS).collect();
-            println!("=== {url} ===\n{text}");
+            postproc::read_full_inner(&page, url).await?;
             browser_opt = Some(browser);
             return Ok(());
         }
 
-        let title = postproc::eval_string_retry(&page, "document.title").await;
-        let html = postproc::content_retry(&page).await;
+        let title = match &snap {
+            Some(s) => s.title.clone(),
+            None => postproc::eval_string_retry(&page, "document.title").await,
+        };
+        let html_full = postproc::content_retry(&page).await;
+        let (html, truncated, omitted) = postproc::cap_chars(&html_full, postproc::read_max_chars());
         let mut read = extract_adaptive(&html);
         read.url = url.to_string();
         read.title = title;
 
-        let out = if opts.json {
-            format_json(&read)
-        } else if opts.headings_only {
-            format_headings_only(&read)
-        } else {
-            format_adaptive(&read, opts.from)
-        };
+        let out = postproc::render_read(&read, opts.json, opts.headings_only, opts.from, truncated, omitted);
         println!("{out}");
         browser_opt = Some(browser);
         Ok(())

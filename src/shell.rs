@@ -21,9 +21,11 @@ use chromiumoxide::browser::Browser;
 use gsearch::browser;
 use gsearch::output::print_text;
 use gsearch::search::{SearchConfig, SearchOutcome, is_captcha, run_search};
-use gsearch::skeleton::{extract_adaptive, format_adaptive, format_headings_only, format_json};
+use gsearch::skeleton::extract_adaptive;
 use gsearch::types::SearchResult;
 use gsearch::util::filename_from_url;
+
+use crate::postproc::{cap_chars, read_max_chars, render_read, wait_content_stable};
 
 const TEXT_MAX_CHARS: usize = 5000;
 const PAGE_TIMEOUT_SECS: u64 = 30;
@@ -277,7 +279,14 @@ async fn cmd_click(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
                 println!("已跳转到: {}", el.href);
             } else {
                 click_snap_elem(&ctx.page, &el).await?;
-                settle_after_click(&ctx.page).await;
+                // 元素 click 可能触发导航（如 onclick location.href），导航销毁旧 JS context，
+                // 紧跟的 evaluate 撞 CDP -32000 "Cannot find context"。j44：等语义定稿走
+                // postproc::wait_content_stable——marker 连续两次相同才过。旧版只等 readyState，
+                // 晚跳转（setTimeout 后 location）在旧页 complete 时首轮漏判（原 settle_after_click
+                // 的 ponytail 记账项，本次由 marker 判稳闭合：跳转触发后 evaluate Err 重置 marker，
+                // 在新页重新积累到连续两次相同才放行）。无导航时两轮快照（200ms 间隔）即过，
+                // 无固定 sleep；窗口 20×200ms ≈ 4s 与旧版量级一致。
+                wait_content_stable(&ctx.page, 20).await;
                 if let Some(u) = ctx.page.url().await.ok().flatten() {
                     ctx.current_url = u;
                 }
@@ -286,25 +295,6 @@ async fn cmd_click(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// 元素 click 可能触发导航（如 onclick location.href），导航会销毁旧 JS context，
-/// 紧跟的 evaluate 会撞 CDP -32000 "Cannot find context"。轮询 readyState 到 complete
-/// （无导航时首轮即过零开销），让后续命令落在稳定 context 上。
-/// ponytail: 只等 readyState，不监听网络空闲；晚于 4s 窗口的异步跳转（setTimeout 后 location）仍可能漏。
-async fn settle_after_click(page: &Page) {
-    for _ in 0..20 {
-        let ok = page
-            .evaluate("document.readyState")
-            .await
-            .ok()
-            .and_then(|v| v.into_value::<String>().ok())
-            .is_some_and(|s| s == "complete");
-        if ok {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
 }
 
 /// `snap` / `snapshot`：抓当前页可交互元素，打印 eN ref 列表存入 last_snap。
@@ -325,8 +315,8 @@ async fn cmd_snap(ctx: &mut ShellCtx) -> Result<()> {
 
 async fn cmd_read(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     let opts = parse_shell_read_opts(args, "read")?;
-    let html = ctx.page.content().await.unwrap_or_default();
-    if is_captcha(&html) {
+    let html_full = ctx.page.content().await.unwrap_or_default();
+    if is_captcha(&html_full) {
         return Err(anyhow!(
             "当前页遇 CAPTCHA：用 `login <url>` 切有头窗人工验证后再回 shell"
         ));
@@ -344,6 +334,8 @@ async fn cmd_read(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
         println!("=== {cur} ===\n{text}");
         return Ok(());
     }
+    // jp4：与顶层 read 同一截断契约（read_max_chars 硬顶 + --json meta 标注）
+    let (html, truncated, omitted) = cap_chars(&html_full, read_max_chars());
     let title = ctx
         .page
         .evaluate("document.title")
@@ -353,13 +345,7 @@ async fn cmd_read(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     let mut read = extract_adaptive(&html);
     read.url = if ctx.current_url.is_empty() { "(未设)".into() } else { ctx.current_url.clone() };
     read.title = title;
-    let out = if opts.json {
-        format_json(&read)
-    } else if opts.headings_only {
-        format_headings_only(&read)
-    } else {
-        format_adaptive(&read, opts.from)
-    };
+    let out = render_read(&read, opts.json, opts.headings_only, opts.from, truncated, omitted);
     println!("{out}");
     Ok(())
 }

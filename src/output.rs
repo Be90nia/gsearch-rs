@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::types::{OutputEnvelope, SearchResult};
+use crate::types::{BatchEntry, OutputEnvelope, SearchResult};
 
 /// snippet 截断长度（按字符不按字节，中文摘要不会截出乱码）
 const SNIPPET_MAX_CHARS: usize = 160;
@@ -54,6 +54,13 @@ pub(crate) fn strip_ansi(s: &str) -> String {
 /// 泛型让 search 数组 / browse AdaptiveRead 共用同一序列化路径。
 pub fn print_envelope_json<T: serde::Serialize>(envelope: &OutputEnvelope<T>) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(envelope)?);
+    Ok(())
+}
+
+/// batch 多查询（issue gsearch-rs-doh）：`--json` 输出裸 BatchEntry 数组
+/// （无外层信封——每条元素自带 meta/status，单条失败不阻塞数组整体）。
+pub fn print_batch_json(entries: &[BatchEntry]) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(entries)?);
     Ok(())
 }
 

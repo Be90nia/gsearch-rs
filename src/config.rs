@@ -21,6 +21,9 @@ pub struct GsearchConfig {
     pub chrome: Option<String>,
     /// M16 SearXNG 实例 base URL（语义同 GSEARCH_SEARXNG_URL）；None = 走 Google 直爬。
     pub searxng_url: Option<String>,
+    /// jp4：read/browse 正文提取的字符硬上限；None = 缺省 50000（postproc::READ_BODY_MAX_CHARS）。
+    /// 防超大页正文撑爆 agent 上下文。
+    pub read_max_chars: Option<usize>,
 }
 
 static CONFIG: OnceLock<GsearchConfig> = OnceLock::new();
@@ -96,6 +99,15 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// jp4：read_max_chars 可配（缺 key = None，不破坏旧配置文件）。
+    #[test]
+    fn parses_read_max_chars() {
+        let cfg: GsearchConfig = serde_json::from_str(r#"{"read_max_chars": 80000}"#).unwrap();
+        assert_eq!(cfg.read_max_chars, Some(80000));
+        let cfg: GsearchConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.read_max_chars, None);
+    }
+
     #[test]
     fn parses_both_keys() {
         let cfg: GsearchConfig = serde_json::from_str(

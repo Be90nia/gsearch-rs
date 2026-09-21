@@ -210,21 +210,35 @@ pub async fn run_search_on_page(
 ///   * json+html 双失败/双空：已有部分结果自然终止，否则 warn 一行后 None
 ///     （回退 Google 直爬）。
 pub async fn try_searxng(cfg: &SearchConfig) -> Option<SearchOutcome> {
-    let base = match crate::config::load().searxng_url.clone() {
-        Some(b) => b,
-        None => return None,
-    };
+    let base = crate::config::load().searxng_url.clone()?;
+    match searxng_collect(&base, cfg).await {
+        Ok(results) => Some(SearchOutcome::Results {
+            results,
+            captcha_solved: false,
+            provider: "searxng",
+        }),
+        Err(reason) => {
+            warn_searxng_fallback(&base, &reason);
+            None
+        }
+    }
+}
+
+/// SearXNG-only 收集内核（单查询与 batch 共用）：翻页凑 limit。
+/// Err(原因) = 未能凑到任何结果；中途双源失败但已有部分结果时有多少用多少。
+/// 回退 warn 不在此打——单查询措辞是"已回退 Google 直爬"，batch 无回退，由调用方决定。
+async fn searxng_collect(base: &str, cfg: &SearchConfig) -> Result<Vec<SearchResult>, String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut collected: Vec<SearchResult> = Vec::new();
     let mut degraded = false; // 降级提示整次查询只打一行
     for page_no in 1..=MAX_PAGES as u32 {
-        let results = match crate::searxng::search(&base, &cfg.query, page_no).await {
-            Ok(results) if !results.is_empty() => Some(results),
-            Ok(_) => degrade_html(&base, &cfg.query, page_no, &mut degraded, "查询无结果").await,
-            Err(e) => degrade_html(&base, &cfg.query, page_no, &mut degraded, &format!("{e:#}")).await,
+        let page = match crate::searxng::search(base, &cfg.query, page_no).await {
+            Ok(results) if !results.is_empty() => Ok(results),
+            Ok(_) => degrade_html(base, &cfg.query, page_no, &mut degraded, "查询无结果").await,
+            Err(e) => degrade_html(base, &cfg.query, page_no, &mut degraded, &format!("{e:#}")).await,
         };
-        match results {
-            Some(results) => {
+        match page {
+            Ok(results) => {
                 for r in results {
                     // 与 Google 路径同一去重语义（不同页可能重复）
                     if seen.insert(r.url.clone()) {
@@ -236,47 +250,70 @@ pub async fn try_searxng(cfg: &SearchConfig) -> Option<SearchOutcome> {
                 }
             }
             // json+html 均无结果：已有部分结果视为自然终止（有多少用多少）
-            None if !collected.is_empty() => break,
-            None => return None, // 回退 warn 已在 degrade_html 打过
+            Err(_) if !collected.is_empty() => break,
+            Err(reason) => return Err(reason),
         }
     }
     if collected.is_empty() {
-        return None;
+        // 循环正常结束仍为空：各页结果全被去重掉（首查即空走的是上面的 Err 分支）
+        return Err("各页结果去重后为空".into());
     }
     collected.truncate(cfg.limit);
-    Some(SearchOutcome::Results {
-        results: collected,
-        captcha_solved: false,
-        provider: "searxng",
-    })
+    Ok(collected)
+}
+
+/// batch 单条（issue gsearch-rs-doh）：SearXNG-only，禁浏览器回退——浏览器单例不可并发，
+/// 这是刻意边界（Google 回退链仅单查询模式走）。Err 文本直接作为该条目的 error message。
+async fn batch_one(cfg: &SearchConfig) -> Result<SearchOutcome, String> {
+    let base = crate::config::load().searxng_url.clone().ok_or_else(|| {
+        "SearXNG 未配置（gsearch.json 缺 searxng_url）；batch 模式禁浏览器回退，请改用单查询".to_string()
+    })?;
+    searxng_collect(&base, cfg)
+        .await
+        .map(|results| SearchOutcome::Results {
+            results,
+            captcha_solved: false,
+            provider: "searxng",
+        })
+        .map_err(|reason| format!("SearXNG 查询失败（{reason}）；batch 模式禁浏览器回退"))
+}
+
+/// batch 入口：多查询并发走 SearXNG，单条失败不阻塞其他条目，返回顺序与输入一致。
+/// ponytail: 并发数未设上限——共享 reqwest 客户端 + 局域网实例，查询量到几十条再加分批。
+pub async fn run_batch(
+    queries: &[String],
+    limit: usize,
+) -> Vec<(String, Result<SearchOutcome, String>)> {
+    let futs = queries.iter().map(|q| async {
+        let cfg = SearchConfig {
+            query: q.clone(),
+            limit,
+        };
+        (q.clone(), batch_one(&cfg).await)
+    });
+    futures::future::join_all(futs).await
 }
 
 /// json 不可用（Err / 零结果）时的单页降级：抓 HTML 结果页。
-/// 成功非空 → 打一行降级 warn（整次查询一次）并返回结果；
-/// html 也空/失败 → 打回退 warn 返回 None，由调用方按空页语义收口。
+/// Ok(results) = html 命中（整次查询首次命中打一行降级提示）；
+/// Err(原因) = html 亦空/失败（原因含 json 层 + html 层；回退措辞由调用方按单/批语义打）。
 async fn degrade_html(
     base: &str,
     query: &str,
     page_no: u32,
     degraded: &mut bool,
     reason: &str,
-) -> Option<Vec<SearchResult>> {
+) -> Result<Vec<SearchResult>, String> {
     match crate::searxng::search_html(base, query, page_no).await {
         Ok(results) if !results.is_empty() => {
             if !*degraded {
                 *degraded = true;
                 eprintln!("SearXNG JSON 不可用（{reason}），已降级 HTML 结果页");
             }
-            Some(results)
+            Ok(results)
         }
-        Ok(_) => {
-            warn_searxng_fallback(base, &format!("{reason}，HTML 结果页亦无结果"));
-            None
-        }
-        Err(e) => {
-            warn_searxng_fallback(base, &format!("{e:#}"));
-            None
-        }
+        Ok(_) => Err(format!("{reason}，HTML 结果页亦无结果")),
+        Err(e) => Err(format!("{e:#}")),
     }
 }
 
