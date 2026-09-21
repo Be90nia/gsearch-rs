@@ -211,9 +211,8 @@ pub fn find_specific(kind: BrowserKind) -> Option<(PathBuf, BrowserKind)> {
         defaults.push(u);
     }
     for d in defaults {
-        let p = PathBuf::from(d);
-        if p.is_file() {
-            return Some((p, kind));
+        if d.is_file() {
+            return Some((d, kind));
         }
     }
     if let Ok(o) = std::process::Command::new("where").arg(exe_name).output()
@@ -653,7 +652,9 @@ pub async fn graceful_close(browser: &mut Browser) {
 
 #[cfg(test)]
 mod tests {
-    use super::{profile_name, redact_proxy, user_scope_path_in};
+    use super::{profile_name, redact_proxy};
+    #[cfg(windows)]
+    use super::user_scope_path_in;
 
     #[test]
     fn profile_name_uses_last_path_component() {
