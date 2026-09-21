@@ -21,7 +21,8 @@ scraper = "0.20"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # M16 SearXNG：chromiumoxide 已拖 reqwest 0.13 进依赖树，这里只开 json（局域网 http 直连，无需 TLS）。
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# gsearch-rs-fetch：fetch 子命令要抓公网 https，补开 rustls（0.13 起为 default-tls 本体，纯 Rust 三平台 CI 友好）。
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 futures = "0.3"
 
 [dev-dependencies]

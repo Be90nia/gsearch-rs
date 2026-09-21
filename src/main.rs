@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 
+mod fetch;
 mod general;
 mod postproc;
 mod shell;
@@ -112,6 +113,13 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// 纯 HTTP GET 取网页正文（issue gsearch-rs-fetch，无需 Chrome；JS 壳页会提示用 browse）
+    Fetch {
+        url: String,
+        /// 输出结构化 JSON（默认人类可读 text）
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 #[derive(Args, Debug)]
 struct SearchArgs {
@@ -196,6 +204,9 @@ async fn main() -> ExitCode {
         Command::Shell => shell::run_shell().await,
         Command::Doctor => cmd_doctor().await,
         Command::Verify { url, json } => gsearch::verify::cmd_verify(&url, json, proxy.as_deref()),
+        Command::Fetch { url, json } => {
+            fetch::cmd_fetch(&url, &fetch::FetchOpts { json, proxy: proxy.clone() }).await
+        }
     };
 
     match result {
