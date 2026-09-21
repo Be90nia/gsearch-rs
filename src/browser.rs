@@ -117,6 +117,19 @@ pub const STEALTH_INIT_SCRIPT: &str = r#"
 "#;
 
 const DEFAULT_CHROME: &str = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+/// 用户级安装（无管理员权限时 Chrome/Edge 默认装这里，且不会自加入 PATH，`where` 探不到）。
+fn user_scope_path(exe_name: &str) -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|la| user_scope_path_in(&PathBuf::from(la), exe_name))
+}
+
+fn user_scope_path_in(local_app_data: &std::path::Path, exe_name: &str) -> PathBuf {
+    let vendor = if exe_name == "chrome.exe" { "Google" } else { "Microsoft" };
+    local_app_data
+        .join(vendor)
+        .join(if exe_name == "chrome.exe" { "Chrome" } else { "Edge" })
+        .join("Application")
+        .join(exe_name)
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserKind {
     Chrome,
@@ -149,12 +162,22 @@ pub fn find_browser() -> Result<(PathBuf, BrowserKind)> {
     if default.is_file() {
         return Ok((default, BrowserKind::Chrome));
     }
+    if let Some(p) = user_scope_path("chrome.exe")
+        && p.is_file()
+    {
+        return Ok((p, BrowserKind::Chrome));
+    }
 
     for default in [DEFAULT_EDGE_64, DEFAULT_EDGE] {
         let p = PathBuf::from(default);
         if p.is_file() {
             return Ok((p, BrowserKind::Edge));
         }
+    }
+    if let Some(p) = user_scope_path("msedge.exe")
+        && p.is_file()
+    {
+        return Ok((p, BrowserKind::Edge));
     }
 
     for (exe_name, kind) in [("chrome.exe", BrowserKind::Chrome), ("msedge.exe", BrowserKind::Edge)] {
@@ -171,7 +194,7 @@ pub fn find_browser() -> Result<(PathBuf, BrowserKind)> {
     }
 
     Err(anyhow!(
-        "找不到 Chrome 或 Edge；请装 Chrome 到 {DEFAULT_CHROME}，或 Edge 到 {DEFAULT_EDGE}，或设 GSEARCH_CHROME env / 配置文件 chrome 键"
+        "找不到 Chrome 或 Edge；请设 GSEARCH_CHROME env / 配置文件 chrome 键，或安装到 {DEFAULT_CHROME}、%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe（用户级）、Edge 同理"
     ))
 }
 /// 给定 BrowserKind 查找对应路径；找不到返回 None（让 launch() 兑底到 find_browser）。
@@ -180,10 +203,13 @@ pub fn find_specific(kind: BrowserKind) -> Option<(PathBuf, BrowserKind)> {
         BrowserKind::Chrome => "chrome.exe",
         BrowserKind::Edge => "msedge.exe",
     };
-    let defaults: &[&str] = match kind {
-        BrowserKind::Chrome => &[DEFAULT_CHROME],
-        BrowserKind::Edge => &[DEFAULT_EDGE_64, DEFAULT_EDGE],
+    let mut defaults: Vec<PathBuf> = match kind {
+        BrowserKind::Chrome => vec![PathBuf::from(DEFAULT_CHROME)],
+        BrowserKind::Edge => vec![PathBuf::from(DEFAULT_EDGE_64), PathBuf::from(DEFAULT_EDGE)],
     };
+    if let Some(u) = user_scope_path(exe_name) {
+        defaults.push(u);
+    }
     for d in defaults {
         let p = PathBuf::from(d);
         if p.is_file() {
@@ -627,7 +653,7 @@ pub async fn graceful_close(browser: &mut Browser) {
 
 #[cfg(test)]
 mod tests {
-    use super::{profile_name, redact_proxy};
+    use super::{profile_name, redact_proxy, user_scope_path_in};
 
     #[test]
     fn profile_name_uses_last_path_component() {
@@ -656,6 +682,16 @@ mod tests {
     #[test]
     fn redact_proxy_keeps_credential_free_input() {
         assert_eq!(redact_proxy("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
+    }
+
+    /// 用户级安装探测（换机兼容）：vendor 目录按 exe 区分（Google\Chrome vs Microsoft\Edge）。
+    #[test]
+    fn user_scope_path_maps_vendor_by_exe() {
+        let base = std::path::PathBuf::from(r"C:\Users\t\AppData\Local");
+        let chrome = user_scope_path_in(&base, "chrome.exe");
+        assert!(chrome.ends_with(r"Google\Chrome\Application\chrome.exe"), "{chrome:?}");
+        let edge = user_scope_path_in(&base, "msedge.exe");
+        assert!(edge.ends_with(r"Microsoft\Edge\Application\msedge.exe"), "{edge:?}");
     }
 }
 
