@@ -3,6 +3,15 @@
 use anyhow::{Result, anyhow};
 
 /// 文件名 = URL 路径最后一段（去 query/hash、剥 scheme://authority）；为空（裸 origin/尾斜杠）则 download.bin。
+///
+/// 安全门（I9，cmd_dl -o 路径安全）：URL 派生的文件名是潜在注入面——
+/// agent 流程里 URL 可能来自搜索/抓取结果，若未过滤：
+///   - 路径分隔符 `/` `\` → 写到 dir 外
+///   - Windows 保留字符 `: * ? " < > |` + 设备名 `CON/PRN/AUX/NUL/COM1-9/LPT1-9` → 写入失败或越权
+///   - `..` 段 → 路径穿越
+///   - 控制字符 / 过长 → 文件系统拒绝 / 静默截断
+///
+/// 策略：把可疑字符替换为 `_`，整段为 `..`/纯分隔/过长（>200 字节）则落到 `download.bin`。
 /// 原本 postproc.rs / general.rs / shell.rs 各一份（M4/M6/M7 各加的），现在统一。
 pub fn filename_from_url(url: &str) -> String {
     let path = url.split(['#', '?']).next().unwrap_or(url);
@@ -12,9 +21,51 @@ pub fn filename_from_url(url: &str) -> String {
     };
     let last = path.rsplit('/').next().unwrap_or("");
     if last.is_empty() {
+        return "download.bin".into();
+    }
+    let safe = sanitize_filename(last);
+    if safe.is_empty() || safe == ".." {
         "download.bin".into()
     } else {
-        last.into()
+        safe
+    }
+}
+
+/// I9：URL 末段字符过滤——禁路径分隔符 / Win 保留字符 / `..`，禁控制字符，封顶 200 字节。
+/// 不引依赖（PLAN §1）；这函数可能受 Windows 设备名影响单测覆盖。
+fn sanitize_filename(raw: &str) -> String {
+    // Win 保留字符 + 路径分隔符 + 控制字符 → '_'
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    // 折叠连续 '_'（防 '////' 这种 URL 经 raw 末段解析后被过滤成 '____'）
+    let mut collapsed = String::with_capacity(cleaned.len());
+    let mut prev_us = false;
+    for c in cleaned.chars() {
+        if c == '_' && prev_us {
+            continue;
+        }
+        prev_us = c == '_';
+        collapsed.push(c);
+    }
+    // 截首尾空白与 '.'（Windows 拒绝末尾 '.')；超 200 字节截断（按字符边界）
+    let trimmed = collapsed.trim_matches(|c: char| c.is_whitespace() || c == '.');
+    if trimmed.is_empty() || trimmed == ".." {
+        return String::new();
+    }
+    if trimmed.chars().count() > 200 {
+        trimmed.chars().take(200).collect()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -68,6 +119,30 @@ mod tests {
         assert_eq!(filename_from_url("https://example.com/"), "download.bin");
         assert_eq!(filename_from_url("https://example.com"), "download.bin");
         assert_eq!(filename_from_url("https://example.com/index.html"), "index.html");
+    }
+
+    /// I9：URL 派生的文件名安全门——禁路径分隔符、Win 保留字符、路径穿越 `..`、控制字符。
+    /// 这层过滤是 cmd_dl 的最后一道防线，文件名直接进 std::fs::write。
+    #[test]
+    fn filename_from_url_sanitizes_unsafe_chars() {
+        // 路径分隔符：被滤为 _，结果不含 / \
+        assert!(!filename_from_url("https://x.com/a/../../../etc/passwd").contains('/'));
+        assert!(!filename_from_url("https://x.com/a\\..\\windows\\system32").contains('\\'));
+        // Win 保留字符：: * ? " < > | 全部 _ 替
+        let bad = filename_from_url("https://x.com/a:b*c?d\"e<f>g|h.bin");
+        assert!(!bad.contains([':', '*', '?', '"', '<', '>', '|']));
+        // 整段 = ".." 或纯分隔 → download.bin
+        assert_eq!(filename_from_url("https://x.com/a/.."), "download.bin");
+        assert_eq!(filename_from_url("https://x.com/a/../.."), "download.bin");
+        // 控制字符（0x00/0x01/0x1f）→ _，不出文件名
+        let ctrl = filename_from_url("https://x.com/a/file\u{0000}\u{0001}\u{001f}name.txt");
+        assert!(!ctrl.chars().any(|c| c.is_control()));
+        // 长末段 → 200 字符封顶
+        let long = "a".repeat(500);
+        let capped = filename_from_url(&format!("https://x.com/b/{long}"));
+        assert!(capped.chars().count() <= 200);
+        // 正常 case 不变
+        assert_eq!(filename_from_url("https://x.com/release notes v2.zip"), "release notes v2.zip");
     }
 
     /// M13 三处下载路径一致性基线：filename_from_url + Path::join + std::fs::write
