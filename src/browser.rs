@@ -685,6 +685,9 @@ mod tests {
     }
 
     /// 用户级安装探测（换机兼容）：vendor 目录按 exe 区分（Google\Chrome vs Microsoft\Edge）。
+    /// 概念上是 Windows-only（macOS 对应位置 ~/Library/Application Support 且未实现），CI 在 macOS/ubuntu
+    /// 上跑时 cfg gate 掉——避免用 Windows 路径字面量在 Unix 文件系统上不可断言。
+    #[cfg(windows)]
     #[test]
     fn user_scope_path_maps_vendor_by_exe() {
         let base = std::path::PathBuf::from(r"C:\Users\t\AppData\Local");
