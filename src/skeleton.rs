@@ -4,7 +4,6 @@
 //! - 自适应规则：`<10` 段给全文；`10..=50` 段给前 10 段；`>50` 段给前 5 段。
 //! - `format_adaptive`：渲染三段（目录 + 摘要 + 段落索引）。
 //! - `format_headings_only`：仅目录，最省 token（~50）。
-//! - `format_json`：返回 AdaptiveRead 结构 JSON。
 //! - `slice_from`：应用 `--from K`（仅在摘要起点偏移）。
 
 use scraper::{Html, Selector};
@@ -233,11 +232,6 @@ pub fn format_headings_only(read: &AdaptiveRead) -> String {
     out
 }
 
-/// JSON 序列化（agent 解析友好）。
-pub fn format_json(read: &AdaptiveRead) -> String {
-    serde_json::to_string(read).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,21 +422,5 @@ mod tests {
         assert!(!summary_section.contains("Paragraph number 3."));
         assert!(summary_section.contains("Paragraph number 4."));
         assert!(summary_section.contains("Paragraph number 5."));
-    }
-
-    #[test]
-    fn format_json_roundtrip() {
-        let html = build_html(&["p1. more.", "p2"], &["h1T"]);
-        let mut read = extract_adaptive(&html);
-        read.url = "u".into();
-        read.title = "t".into();
-        let json = format_json(&read);
-        // 应为合法 JSON
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["url"], "u");
-        assert_eq!(v["title"], "t");
-        assert_eq!(v["headings"][0]["text"], "T");
-        assert_eq!(v["summary_paragraphs"][0], "p1. more.");
-        assert_eq!(v["paragraph_index"][0]["index"], 1);
     }
 }

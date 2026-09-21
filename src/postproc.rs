@@ -146,6 +146,8 @@ pub(crate) async fn page_snapshot(page: &chromiumoxide::Page) -> Result<PageSnap
 /// ("","") 在慢加载页两次假定稿），不是定稿判据。evaluate Err 视为未就绪并重置 marker
 /// （晚跳转销毁 context 后在新页重新积累）。无导航页面两轮快照（间隔 200ms）即过，无固定
 /// sleep；窗口耗尽返回最后一次成功快照（一次都没成功 → None），调用方自行兜底。
+/// 持续动态页（行情条 / 相对时间戳等 visibleText 持续变化的内容）会烧满判稳窗口
+/// （read/browse +10s、click +4s）后返回 last 快照，结果无损纯延迟。
 /// 共享入口：postproc::goto_page / general::cmd_browse / shell cmd_click。
 pub(crate) async fn wait_content_stable(
     page: &chromiumoxide::Page,

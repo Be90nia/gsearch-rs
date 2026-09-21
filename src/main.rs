@@ -139,6 +139,10 @@ enum Command {
         /// 输出结构化 JSON（默认人类可读 text）
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// 放行私网地址（loopback / RFC1918 / link-local / 云 metadata）。默认拒（SSRF 门）；
+        /// 也可通过 `GSEARCH_FETCH_ALLOW_PRIVATE=1` 环境变量放行。
+        #[arg(long, default_value_t = false)]
+        allow_private: bool,
     },
 }
 #[derive(Args, Debug)]
@@ -228,8 +232,8 @@ async fn main() -> ExitCode {
         Command::Shell => shell::run_shell().await,
         Command::Doctor => cmd_doctor().await,
         Command::Verify { url, json } => gsearch::verify::cmd_verify(&url, json, proxy.as_deref()),
-        Command::Fetch { url, json } => {
-            fetch::cmd_fetch(&url, &fetch::FetchOpts { json, proxy: proxy.clone() }).await
+        Command::Fetch { url, json, allow_private } => {
+            fetch::cmd_fetch(&url, &fetch::FetchOpts { json, proxy: proxy.clone(), allow_private }).await
         }
     };
 

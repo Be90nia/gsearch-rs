@@ -315,21 +315,29 @@ async fn batch_one(cfg: &SearchConfig) -> Result<SearchOutcome, String> {
 }
 
 /// batch 入口：多查询并发走 SearXNG，单条失败不阻塞其他条目，返回顺序与输入一致。
-/// ponytail: 并发数未设上限——共享 reqwest 客户端 + 局域网实例，查询量到几十条再加分批。
+/// ponytail: 并发硬封顶 `min(queries.len(), 32)`（SearXNG 默认限速 + botdetection
+/// 在 ~30 并发触发 403；硬顶放这里，分批/限速是后续优化方向）。
 pub async fn run_batch(
     queries: &[String],
     limit: usize,
     recency: Option<Recency>,
 ) -> Vec<(String, Result<SearchOutcome, String>)> {
-    let futs = queries.iter().map(|q| async {
-        let cfg = SearchConfig {
-            query: q.clone(),
-            limit,
-            recency,
-        };
-        (q.clone(), batch_one(&cfg).await)
-    });
-    futures::future::join_all(futs).await
+    use futures::stream::StreamExt;
+    let cap = queries.len().min(32);
+    // stream::iter(...).map(|q| async {...}).buffer_unordered(cap)
+    //   -> 流式拉取，cap 控制并发在飞数量；map 同步产出保证输入序（输出顺序无关性靠 slots 重排）。
+    let mut futs = futures::stream::iter(queries.iter().enumerate())
+        .map(|(pos, q)| async move {
+            let cfg = SearchConfig { query: q.clone(), limit, recency };
+            (pos, q.clone(), batch_one(&cfg).await)
+        })
+        .buffer_unordered(cap);
+    let mut slots: Vec<Option<(String, Result<SearchOutcome, String>)>> =
+        (0..queries.len()).map(|_| None).collect();
+    while let Some((pos, q, r)) = futs.next().await {
+        slots[pos] = Some((q, r));
+    }
+    slots.into_iter().map(Option::unwrap).collect()
 }
 
 /// json 不可用（Err / 零结果）时的单页降级：抓 HTML 结果页。
