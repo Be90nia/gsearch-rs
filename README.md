@@ -9,6 +9,7 @@ Google 搜索 + 通用浏览器代理 CLI：单 exe、零扩展、零运行时�
 ```
 gsearch search "python asyncio" --limit 10
 gsearch search "fastapi tutorial" --json
+gsearch search "rust release" --recency week   # 时间过滤 day|week|month|year
 gsearch search "..." --humanize=false   # 跳过搜索前 warmup
 gsearch search "..." --read 1
 gsearch search "..." --dl 1
@@ -16,6 +17,8 @@ gsearch search "..." --open 1
 ```
 
 `--humanize` 默认启用：Google 搜索前随机访问 Wikipedia/GitHub/HN，滚动并短暂停留；指纹补丁仅用于 search，不改变 browse/login。
+
+`--recency day|week|month|year` 时间过滤双 provider 生效：SearXNG 请求追加 `time_range`，Google SERP URL 追加 `tbs=qdr:d/w/m/y`；不传时请求 URL 与旧版逐字节一致。`site:` 等查询语法原样透传，无专属参数。batch 多查询同样生效（batch 仅 SearXNG 源）。`--json` 的 `meta.recency` 回显本次过滤值（未传为 null）。
 
 #### batch（多查询并发，供 agent 使用）
 

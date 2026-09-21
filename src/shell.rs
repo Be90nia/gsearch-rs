@@ -167,6 +167,7 @@ async fn cmd_search(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
         SearchConfig {
             query: query.clone(),
             limit,
+            recency: None,
         },
         &mut ctx.handler_task,
         ctx.human_solved.clone(),

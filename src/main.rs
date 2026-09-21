@@ -67,6 +67,26 @@ impl From<BrowserArg> for Option<gsearch::browser::BrowserKind> {
         }
     }
 }
+/// --recency 的 CLI 枚举（镜像 lib 侧 gsearch::search::Recency，同 BrowserArg/BrowserKind 惯例）
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum RecencyArg {
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+impl From<RecencyArg> for gsearch::search::Recency {
+    fn from(r: RecencyArg) -> Self {
+        match r {
+            RecencyArg::Day => Self::Day,
+            RecencyArg::Week => Self::Week,
+            RecencyArg::Month => Self::Month,
+            RecencyArg::Year => Self::Year,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Google 搜索（M2 实现；M9 `--read N` 默认 AdaptiveRead）
@@ -129,6 +149,10 @@ struct SearchArgs {
     query: Vec<String>,
     #[arg(long, default_value_t = 10)]
     limit: usize,
+    /// 时间过滤：只看 day/week/month/year 内的结果。SearXNG 加 time_range，Google SERP 加 tbs=qdr。
+    /// `site:` 等查询语法原样透传，无专属参数。
+    #[arg(long, value_enum)]
+    recency: Option<RecencyArg>,
     /// `--open / --read / --dl` 互斥：每次只能指定一个；不可同时传。
     #[arg(long, group = "post")]
     read: Option<usize>,
@@ -233,11 +257,12 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     let (browser_path, resolved_kind) = resolve_browser_meta(browser_kind);
     // clap 保证位置参数 ≥1、上面分支保证 =1：单查询路径沿用原行为
     let query = args.query.first().cloned().unwrap_or_default();
+    let recency = args.recency.map(gsearch::search::Recency::from);
     // M17 惰性启动（Part 1）：先跑 SearXNG 纯 HTTP 源——命中则全程零浏览器；
     // 未配置/失败（try_searxng = None，回退 warn 已打）才 launch 走 Google 直爬。
     let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
     let mut h_slot: Option<tokio::task::JoinHandle<()>> = None;
-    let cfg = gsearch::search::SearchConfig { query: query.clone(), limit: args.limit };
+    let cfg = gsearch::search::SearchConfig { query: query.clone(), limit: args.limit, recency };
     let (results, captcha_solved, provider) = if let Some(
         gsearch::search::SearchOutcome::Results { results, captcha_solved, provider },
     ) = gsearch::search::try_searxng(&cfg).await
@@ -262,7 +287,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             }
             // ponytail: 顶层 search 没人在场 stdin 给 noop Arc（human_solved 永远是 false，不影响行为）
             let human_solved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let cfg = gsearch::search::SearchConfig { query: query.clone(), limit: args.limit };
+            let cfg = gsearch::search::SearchConfig { query: query.clone(), limit: args.limit, recency };
             let r = gsearch::search::run_search_on_page(&mut browser, cfg, page, &mut h_slot, human_solved).await?;
             *slot.borrow_mut() = Some(browser);
             Ok::<_, anyhow::Error>(r)
@@ -294,7 +319,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             gsearch::search::SearchOutcome::CaptchaTimeout => {
                 // 输出 captcha_timeout JSON（Agent 看到 status 字段就知道等人解超时）
                 if args.json {
-                    emit_captcha_timeout_json(&query, &args, &browser_path, &resolved_kind, proxy.clone(), started.elapsed().as_millis());
+                    emit_captcha_timeout_json(&query, &args, &browser_path, &resolved_kind, proxy.clone(), recency, started.elapsed().as_millis());
                 } else {
                     eprintln!("error: CAPTCHA 亲解超时（{}s）；profile 已养熟，再次执行会跳过 CAPTCHA",
                         gsearch::search::CAPTCHA_TIMEOUT_SECS);
@@ -319,6 +344,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             results_count: results.len(),
             truncated: results.len() >= args.limit,
             provider: provider.into(),
+            recency: recency.map(|r| r.as_str().into()),
         };
         let run = gsearch::types::RunStatusInfo {
             status: gsearch::types::RunStatus::Ok,
@@ -401,7 +427,8 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
     }
     let started = std::time::Instant::now();
     let (browser_path, resolved_kind) = resolve_browser_meta(browser_arg_to_kind(args.browser));
-    let outcomes = gsearch::search::run_batch(&args.query, args.limit).await;
+    let recency = args.recency.map(gsearch::search::Recency::from);
+    let outcomes = gsearch::search::run_batch(&args.query, args.limit, recency).await;
     let elapsed_ms = started.elapsed().as_millis();
     let profile = gsearch::browser::profile_name_only();
     let entries: Vec<gsearch::types::BatchEntry> = outcomes
@@ -434,6 +461,7 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
                 results_count: results.len(),
                 truncated: results.len() >= args.limit,
                 provider: "searxng".into(),
+                recency: recency.map(|r| r.as_str().into()),
             };
             gsearch::types::BatchEntry {
                 query,
@@ -501,6 +529,7 @@ fn emit_captcha_timeout_json(
     browser_path: &std::path::Path,
     resolved_kind: &gsearch::browser::BrowserKind,
     proxy: Option<String>,
+    recency: Option<gsearch::search::Recency>,
     elapsed_ms: u128,
 ) {
     let meta = gsearch::types::MetaOutput {
@@ -518,6 +547,7 @@ fn emit_captcha_timeout_json(
         truncated: false,
         // CAPTCHA 超时只发生在 Google 直爬路径（searxng 不撞码）
         provider: "google".into(),
+        recency: recency.map(|r| r.as_str().into()),
     };
     let run = gsearch::types::RunStatusInfo {
         status: gsearch::types::RunStatus::CaptchaTimeout,
@@ -722,7 +752,7 @@ async fn fetch_public_ip() -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{Cli, Command, RecencyArg};
     use clap::Parser;
 
 
@@ -783,5 +813,26 @@ mod tests {
         let cli = Cli::try_parse_from(["gsearch", "verify", "https://example.com"]).unwrap();
         let Command::Verify { json, .. } = cli.cmd else { panic!("expected verify") };
         assert!(!json);
+    }
+
+    /// --recency：day/week/month/year 枚举解析、缺省 None（URL 不得带过滤）、非法值拒绝。
+    #[test]
+    fn recency_flag_parses_enum_values() {
+        for (value, want) in [
+            ("day", RecencyArg::Day),
+            ("week", RecencyArg::Week),
+            ("month", RecencyArg::Month),
+            ("year", RecencyArg::Year),
+        ] {
+            let cli = Cli::try_parse_from(["gsearch", "search", "x", "--recency", value]).unwrap();
+            let Command::Search(args) = cli.cmd else { panic!("expected search") };
+            assert_eq!(args.recency, Some(want));
+        }
+        // 缺省 = None：请求 URL 与改动前一致（不带时间过滤参数）
+        let cli = Cli::try_parse_from(["gsearch", "search", "x"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert_eq!(args.recency, None);
+        // 非法值 clap 直接拒绝
+        assert!(Cli::try_parse_from(["gsearch", "search", "x", "--recency", "hour"]).is_err());
     }
 }

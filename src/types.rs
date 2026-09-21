@@ -37,6 +37,8 @@ pub struct MetaOutput {
     pub truncated: bool,
     /// M16：本次搜索来源："searxng"（配了 SearXNG 且成功）或 "google"（直爬 / 回退 / browse / dl）。
     pub provider: String,
+    /// 时间过滤回显（--recency 的原始值）；未传时 None → JSON null（同 proxy 风格）。
+    pub recency: Option<String>,
 }
 
 /// M14-1B：`--json` 输出的统一信封，`results` 是真正的载荷（Vec 或 AdaptiveRead）。
@@ -126,6 +128,7 @@ mod tests {
             results_count: 1,
             truncated: false,
             provider: "google".into(),
+            recency: None,
         }
     }
 

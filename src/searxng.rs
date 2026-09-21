@@ -2,7 +2,7 @@
 //! 纯 HTTP GET，不经浏览器、不走代理。
 //!
 //! 请求形态对照参考实现 D:/Project/searxng/src/searxng.rs（ureq 同步版 → reqwest async）：
-//! `GET {base}/search?q=<urlencoded>&format=json&pageno=<N>`，5s 超时。
+//! `GET {base}/search?q=<urlencoded>&format=json[&time_range=<recency>]&pageno=<N>`，5s 超时。
 //! SearXNG 是局域网直连实例，**不走 GSEARCH_PROXY / 系统代理**。
 
 use std::collections::HashSet;
@@ -51,15 +51,42 @@ struct SearxngResponse {
     results: Vec<SearxngResult>,
 }
 
-/// GET `{base}/search?q=<encoded>&format=json&pageno=<page>`；5s 超时、明确禁代理。
-/// 成功返回映射后的 SearchResult（snippet ← SearXNG content 字段）。
-pub async fn search(base_url: &str, query: &str, page: u32) -> Result<Vec<SearchResult>> {
-    let url = format!(
-        "{}/search?q={}&format=json&pageno={}",
+/// 构造 `/search` 请求 URL：`q → [format=json] → [time_range] → pageno`。
+/// recency=None 时与旧版 URL 逐字节一致（验收要求）。
+fn build_url(
+    base_url: &str,
+    query: &str,
+    page: u32,
+    json: bool,
+    recency: Option<crate::search::Recency>,
+) -> String {
+    let mut url = format!(
+        "{}/search?q={}",
         base_url.trim_end_matches('/'),
         crate::search::urlencode(query),
-        page,
     );
+    if json {
+        url.push_str("&format=json");
+    }
+    if let Some(r) = recency {
+        url.push_str("&time_range=");
+        url.push_str(r.as_str());
+    }
+    url.push_str("&pageno=");
+    url.push_str(&page.to_string());
+    url
+}
+
+/// GET `{base}/search?q=<encoded>&format=json[&time_range=]<&pageno>`；5s 超时、明确禁代理。
+/// recency=Some 追加 `&time_range=<day|week|month|year>`（None 时 URL 与旧版逐字节一致）。
+/// 成功返回映射后的 SearchResult（snippet ← SearXNG content 字段）。
+pub async fn search(
+    base_url: &str,
+    query: &str,
+    page: u32,
+    recency: Option<crate::search::Recency>,
+) -> Result<Vec<SearchResult>> {
+    let url = build_url(base_url, query, page, true, recency);
     let resp = SHARED_CLIENT
         .get(&url)
         .send()
@@ -87,14 +114,14 @@ fn parse(text: &str) -> Result<Vec<SearchResult>> {
 }
 /// 降级路径：抓 SearXNG HTML 结果页（format=json 不可用如 403 时）。
 /// `GET {base}/search?q=<encoded>&pageno=<page>`（不带 format=json），
-/// 5s 超时、明确禁代理，与 json 同款请求参数。
-pub async fn search_html(base_url: &str, query: &str, page: u32) -> Result<Vec<SearchResult>> {
-    let url = format!(
-        "{}/search?q={}&pageno={}",
-        base_url.trim_end_matches('/'),
-        crate::search::urlencode(query),
-        page,
-    );
+/// 5s 超时、明确禁代理，与 json 同款请求参数（含 time_range）。
+pub async fn search_html(
+    base_url: &str,
+    query: &str,
+    page: u32,
+    recency: Option<crate::search::Recency>,
+) -> Result<Vec<SearchResult>> {
+    let url = build_url(base_url, query, page, false, recency);
     let resp = SHARED_CLIENT
         .get(&url)
         .send()
@@ -274,5 +301,34 @@ mod tests {
         assert_eq!(results[0].snippet, "first snippet");
         assert_eq!(results[1].title, "Beta");
         assert_eq!(results[1].snippet, "second snippet");
+    }
+
+    use super::build_url;
+    use crate::search::Recency;
+
+    /// recency=None：json 与 html 两种 URL 均与改动前逐字节一致（验收要求）。
+    #[test]
+    fn build_url_without_recency_matches_legacy_shape() {
+        assert_eq!(
+            build_url("http://192.168.1.10:8888/", "rust", 1, true, None),
+            "http://192.168.1.10:8888/search?q=rust&format=json&pageno=1"
+        );
+        assert_eq!(
+            build_url("http://192.168.1.10:8888", "rust", 2, false, None),
+            "http://192.168.1.10:8888/search?q=rust&pageno=2"
+        );
+    }
+
+    /// recency=Some：在 format=json 之后、pageno 之前追加 time_range=<SearXNG 值>。
+    #[test]
+    fn build_url_appends_time_range() {
+        assert_eq!(
+            build_url("http://x:8888", "rust async", 1, true, Some(Recency::Week)),
+            "http://x:8888/search?q=rust%20async&format=json&time_range=week&pageno=1"
+        );
+        assert_eq!(
+            build_url("http://x:8888", "rust", 3, false, Some(Recency::Day)),
+            "http://x:8888/search?q=rust&time_range=day&pageno=3"
+        );
     }
 }

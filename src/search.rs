@@ -24,9 +24,43 @@ const PAGE_TIMEOUT_SECS: u64 = 30;
 pub const CAPTCHA_TIMEOUT_SECS: u64 = 120;
 const CAPTCHA_POLL_SECS: u64 = 1;
 
+/// 时间窗（--recency）：SearXNG 走 `time_range=<as_str>`，Google 走 `tbs=qdr:<qdr_letter>`。
+/// 对齐 tavily/exa/brave 等搜索 API 的时间过滤参数（agent 检索高频需求）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recency {
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+impl Recency {
+    /// SearXNG `time_range` 参数值。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Year => "year",
+        }
+    }
+
+    /// Google SERP `tbs=qdr:<字母>` 的窗口字母（公开 SERP 约定）。
+    pub fn qdr_letter(self) -> &'static str {
+        match self {
+            Self::Day => "d",
+            Self::Week => "w",
+            Self::Month => "m",
+            Self::Year => "y",
+        }
+    }
+}
+
 pub struct SearchConfig {
     pub query: String,
     pub limit: usize,
+    /// Some = 只看该时间窗内的结果；None = 不过滤（请求 URL 与旧版逐字节一致）。
+    pub recency: Option<Recency>,
 }
 
 pub fn is_captcha(html: &str) -> bool {
@@ -89,11 +123,7 @@ pub async fn run_search_on_page(
         if collected.len() >= cfg.limit {
             break;
         }
-        let url = format!(
-            "https://www.google.com/search?q={}&start={}",
-            urlencode(&cfg.query),
-            page_idx * RESULTS_PER_PAGE
-        );
+        let url = serp_url(&cfg.query, page_idx * RESULTS_PER_PAGE, cfg.recency);
         // H1：每个 ? 早返回前先 close page（句柄已死的 swap 后旧 page close 吞错），
         // 防 load / new_page / poll_until_solved 任一失败时 page 在 headless/headed 浏览器上残留。
         let mut content = match load(&page, &url).await {
@@ -232,10 +262,16 @@ async fn searxng_collect(base: &str, cfg: &SearchConfig) -> Result<Vec<SearchRes
     let mut collected: Vec<SearchResult> = Vec::new();
     let mut degraded = false; // 降级提示整次查询只打一行
     for page_no in 1..=MAX_PAGES as u32 {
-        let page = match crate::searxng::search(base, &cfg.query, page_no).await {
+        let page = match crate::searxng::search(base, &cfg.query, page_no, cfg.recency).await {
             Ok(results) if !results.is_empty() => Ok(results),
-            Ok(_) => degrade_html(base, &cfg.query, page_no, &mut degraded, "查询无结果").await,
-            Err(e) => degrade_html(base, &cfg.query, page_no, &mut degraded, &format!("{e:#}")).await,
+            Ok(_) => {
+                degrade_html(base, &cfg.query, page_no, cfg.recency, &mut degraded, "查询无结果")
+                    .await
+            }
+            Err(e) => {
+                degrade_html(base, &cfg.query, page_no, cfg.recency, &mut degraded, &format!("{e:#}"))
+                    .await
+            }
         };
         match page {
             Ok(results) => {
@@ -283,11 +319,13 @@ async fn batch_one(cfg: &SearchConfig) -> Result<SearchOutcome, String> {
 pub async fn run_batch(
     queries: &[String],
     limit: usize,
+    recency: Option<Recency>,
 ) -> Vec<(String, Result<SearchOutcome, String>)> {
     let futs = queries.iter().map(|q| async {
         let cfg = SearchConfig {
             query: q.clone(),
             limit,
+            recency,
         };
         (q.clone(), batch_one(&cfg).await)
     });
@@ -301,10 +339,11 @@ async fn degrade_html(
     base: &str,
     query: &str,
     page_no: u32,
+    recency: Option<Recency>,
     degraded: &mut bool,
     reason: &str,
 ) -> Result<Vec<SearchResult>, String> {
-    match crate::searxng::search_html(base, query, page_no).await {
+    match crate::searxng::search_html(base, query, page_no, recency).await {
         Ok(results) if !results.is_empty() => {
             if !*degraded {
                 *degraded = true;
@@ -393,6 +432,18 @@ async fn load(page: &Page, url: &str) -> Result<String> {
     .map_err(|e| anyhow!("加载 {url} 失败: {e}"))
 }
 
+/// Google SERP URL：`q → [tbs=qdr:<w>] → start`。recency=None 时与旧版逐字节一致。
+fn serp_url(query: &str, start: usize, recency: Option<Recency>) -> String {
+    let tbs = recency
+        .map(|r| format!("&tbs=qdr:{}", r.qdr_letter()))
+        .unwrap_or_default();
+    format!(
+        "https://www.google.com/search?q={}{tbs}&start={}",
+        urlencode(query),
+        start
+    )
+}
+
 /// ponytail: 查询串就几十字节，手写 10 行不引 percent_encoding crate。
 /// M16：searxng.rs 复用同一 URL 编码（q 参数语义相同），故 pub(crate)。
 pub(crate) fn urlencode(s: &str) -> String {
@@ -448,6 +499,38 @@ mod tests {
         assert_eq!(urlencode("abc-_.~"), "abc-_.~");
         let big = "a".repeat(2000);
         assert_eq!(urlencode(&big).len(), 2000);
+    }
+
+    use super::{serp_url, Recency};
+
+    /// --recency 未传：Google URL 与改动前逐字节一致（验收：无 tbs 段）。
+    #[test]
+    fn serp_url_without_recency_is_unchanged() {
+        assert_eq!(
+            serp_url("rust async", 0, None),
+            "https://www.google.com/search?q=rust%20async&start=0"
+        );
+    }
+
+    /// tbs=qdr 映射：day/week/month/year → d/w/m/y；段序 q → tbs → start。
+    #[test]
+    fn serp_url_appends_tbs_qdr_letter() {
+        assert_eq!(
+            serp_url("rust", 10, Some(Recency::Week)),
+            "https://www.google.com/search?q=rust&tbs=qdr:w&start=10"
+        );
+        assert_eq!(Recency::Day.qdr_letter(), "d");
+        assert_eq!(Recency::Month.qdr_letter(), "m");
+        assert_eq!(Recency::Year.qdr_letter(), "y");
+    }
+
+    /// SearXNG time_range 参数值映射（searxng.rs 拼 URL 时消费）。
+    #[test]
+    fn recency_as_str_matches_searxng_time_range_values() {
+        assert_eq!(Recency::Day.as_str(), "day");
+        assert_eq!(Recency::Week.as_str(), "week");
+        assert_eq!(Recency::Month.as_str(), "month");
+        assert_eq!(Recency::Year.as_str(), "year");
     }
 }
 
