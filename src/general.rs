@@ -123,7 +123,7 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
         };
         let html_full = postproc::content_retry(&page).await;
         let (html, truncated, omitted) = postproc::cap_chars(&html_full, postproc::read_max_chars());
-        let mut read = extract_adaptive(&html);
+        let mut read = extract_adaptive(&html, None);
         read.url = url.to_string();
         read.title = title;
 

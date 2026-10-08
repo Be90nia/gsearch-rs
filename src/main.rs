@@ -87,6 +87,12 @@ impl From<RecencyArg> for gsearch::search::Recency {
     }
 }
 
+/// nx4：--envelope 的 CLI 枚举。v2 = batch --json 输出顶层 {meta,results}（批统计一次）。
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum EnvelopeArg {
+    V2,
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Google 搜索（M2 实现；M9 `--read N` 默认 AdaptiveRead）
@@ -205,6 +211,14 @@ struct SearchArgs {
     /// `--read N --headings-only`：只输出目录（最省 token fast path）
     #[arg(long, default_value_t = false)]
     headings_only: bool,
+    /// e1i：`--read N --excerpt N`——paragraph_index 每项附该段前 N 字符实际文本（--json 生效，
+    /// 受 read_max_chars 总 cap 约束）。与 --full/--headings-only 互斥；默认不启用（输出逐键不变）。
+    #[arg(long, conflicts_with_all = ["full", "headings_only"])]
+    excerpt: Option<usize>,
+    /// nx4：batch --json 输出信封形态。v2 = 顶层 {meta,results}（批统计一次，元素不带 meta）；
+    /// 默认裸数组（存量 agent 零破坏）。单查询模式忽略此 flag。
+    #[arg(long, value_enum)]
+    envelope: Option<EnvelopeArg>,
     /// 6dp：meta 压缩到 6 字段（query/results_count/truncated/provider/elapsed_ms/recency）。
     /// 默认关（14 字段全量）；--verbose debug 或 GSEARCH_LOG=debug 时强制全量（排障现场保留）。
     #[arg(long, default_value_t = false)]
@@ -438,6 +452,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
                 json: args.json,
                 headings_only: args.headings_only,
                 from: args.from.unwrap_or(0),
+                excerpt: args.excerpt,
             };
             let content = if opts.full {
                 postproc::read_full(browser, &mut h_slot, &results, n, &opts).await?
@@ -562,7 +577,33 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
         })
         .collect();
     if args.json {
-        gsearch::output::print_batch_json(&entries)?;
+        if args.envelope == Some(EnvelopeArg::V2) {
+            // nx4：v2 信封——批统计一次，元素丢 14 字段 meta（opt-in，默认裸数组不变）
+            let n_ok = entries
+                .iter()
+                .filter(|e| e.status == gsearch::types::RunStatus::Ok)
+                .count();
+            let env = gsearch::types::BatchEnvelopeV2 {
+                meta: gsearch::types::BatchMetaV2 {
+                    n_total: entries.len(),
+                    n_ok,
+                    n_fail: entries.len() - n_ok,
+                    elapsed_ms,
+                },
+                results: entries
+                    .iter()
+                    .map(|e| gsearch::types::BatchEntryV2 {
+                        query: e.query.clone(),
+                        status: e.status.clone(),
+                        message: e.message.clone(),
+                        results: e.results.clone(),
+                    })
+                    .collect(),
+            };
+            gsearch::output::print_batch_envelope_v2(&env)?;
+        } else {
+            gsearch::output::print_batch_json(&entries)?;
+        }
     } else {
         // 人读：逐条分隔标题，条目内部沿用单查询格式
         for (i, e) in entries.iter().enumerate() {

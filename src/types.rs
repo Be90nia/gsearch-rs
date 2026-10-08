@@ -132,6 +132,33 @@ pub struct BatchEntry {
     pub results: Vec<SearchResult>,
 }
 
+/// nx4：`--envelope v2` 的 batch 信封——批统计 meta 只出一层，元素不带 14 字段 meta。
+/// 默认仍是裸数组（BatchEntry）；v2 为 opt-in，存量 agent 零破坏。
+#[derive(Serialize, Clone, Debug)]
+pub struct BatchEnvelopeV2 {
+    pub meta: BatchMetaV2,
+    pub results: Vec<BatchEntryV2>,
+}
+
+/// nx4：批处理级统计（一次）；原每条 meta 的 elapsed_ms 并入此处。
+#[derive(Serialize, Clone, Debug)]
+pub struct BatchMetaV2 {
+    pub n_total: usize,
+    pub n_ok: usize,
+    pub n_fail: usize,
+    pub elapsed_ms: u128,
+}
+
+/// nx4：v2 数组元素——只留 query/status/message/results（14 字段 meta 移除）。
+#[derive(Serialize, Clone, Debug)]
+pub struct BatchEntryV2 {
+    pub query: String,
+    pub status: RunStatus,
+    /// status=error 时的人类可读原因；ok 时空串（与 BatchEntry 同语义）。
+    pub message: String,
+    pub results: Vec<SearchResult>,
+}
+
 /// M14-1A `verify <url>` 的报告。status=0 表示未拿到任何 HTTP 响应（仅 SSL 失败路径）。
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct VerifyReport {
@@ -303,5 +330,44 @@ mod tests {
         assert_eq!(v["status"], "error");
         assert_eq!(v["message"], "SearXNG 查询失败");
         assert_eq!(v["results"].as_array().unwrap().len(), 0);
+    }
+
+    /// nx4 契约：v2 信封顶层 meta{n_total,n_ok,n_fail,elapsed_ms} 只出一层；
+    /// 元素四键 query/status/message/results，无 meta。
+    #[test]
+    fn batch_envelope_v2_contract_keys() {
+        let env = BatchEnvelopeV2 {
+            meta: BatchMetaV2 { n_total: 2, n_ok: 1, n_fail: 1, elapsed_ms: 88 },
+            results: vec![
+                BatchEntryV2 {
+                    query: "q1".into(),
+                    status: RunStatus::Ok,
+                    message: String::new(),
+                    results: sample_results(),
+                },
+                BatchEntryV2 {
+                    query: "q2".into(),
+                    status: RunStatus::Error,
+                    message: "boom".into(),
+                    results: vec![],
+                },
+            ],
+        };
+        let v: serde_json::Value = serde_json::to_value(&env).unwrap();
+        let m = &v["meta"];
+        assert_eq!(m["n_total"], 2);
+        assert_eq!(m["n_ok"], 1);
+        assert_eq!(m["n_fail"], 1);
+        assert_eq!(m["elapsed_ms"], 88);
+        let arr = v["results"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        for e in arr {
+            for k in ["query", "status", "message", "results"] {
+                assert!(e.get(k).is_some(), "缺少键 {k}");
+            }
+            assert!(e.get("meta").is_none(), "v2 元素不应带 meta: {e}");
+        }
+        assert_eq!(arr[0]["status"], "ok");
+        assert_eq!(arr[1]["status"], "error");
     }
 }

@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::types::{BatchEntry, OutputEnvelope, SearchResult};
+use crate::types::{BatchEntry, BatchEnvelopeV2, OutputEnvelope, SearchResult};
 
 /// snippet 截断长度（按字符不按字节，中文摘要不会截出乱码）
 const SNIPPET_MAX_CHARS: usize = 160;
@@ -62,6 +62,12 @@ pub fn print_envelope_json<T: serde::Serialize>(envelope: &OutputEnvelope<T>) ->
 /// （无外层信封——每条元素自带 meta/status，单条失败不阻塞数组整体）。
 pub fn print_batch_json(entries: &[BatchEntry]) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(entries)?);
+    Ok(())
+}
+
+/// nx4：`--envelope v2` batch 信封——顶层 meta 批统计一次，元素不带 14 字段 meta。
+pub fn print_batch_envelope_v2(envelope: &BatchEnvelopeV2) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(envelope)?);
     Ok(())
 }
 

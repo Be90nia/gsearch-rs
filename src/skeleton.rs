@@ -22,6 +22,10 @@ pub struct Paragraph {
     pub index: usize,           // 1-based
     pub first_sentence: String,
     pub char_count: usize,
+    /// e1i：--excerpt N 时填该段前 N 字符实际文本（--json 生效）；未启用 None → 不出键，
+    /// 默认输出逐键不变（元审计：默认行为零变更）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
 }
 
 /// 自适应读取结果：目录 + 选中摘要 + 全量段落索引。
@@ -48,7 +52,9 @@ const LONG_TAKE: usize = 5;        // > 50 给前 LONG_TAKE 段
 const LONG_THRESHOLD: usize = 50;
 
 /// 从 HTML 提取 AdaptiveRead。url/title 由调用方拿到 HTML 后补（HTML <title> 不一定可信）。
-pub fn extract_adaptive(html: &str) -> AdaptiveRead {
+/// excerpt_chars：Some(N) = paragraph_index 每项附该段前 N 字符（html 已被调用方 cap 过
+/// read_max_chars，excerpt 总量天然受总 cap 约束）。
+pub fn extract_adaptive(html: &str, excerpt_chars: Option<usize>) -> AdaptiveRead {
     let doc = Html::parse_document(html);
     let h_sel = Selector::parse(SEL_HEADINGS).expect("静态选择器必然合法");
     let p_sel = Selector::parse(SEL_P).expect("静态选择器必然合法");
@@ -99,6 +105,7 @@ pub fn extract_adaptive(html: &str) -> AdaptiveRead {
             index: i + 1,
             first_sentence: first_sentence(p),
             char_count: p.chars().count(),
+            excerpt: excerpt_chars.map(|n| p.chars().take(n).collect()),
         })
         .collect();
 
@@ -263,7 +270,7 @@ mod tests {
         let paras = empty_paragraphs(5);
         let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
         let html = build_html(&refs, &["h1Title"]);
-        let read = extract_adaptive(&html);
+        let read = extract_adaptive(&html, None);
         assert_eq!(read.summary_paragraphs.len(), 5);
         assert_eq!(read.paragraph_index.len(), 5);
         // summary 第一段包含全部段落原文
@@ -275,7 +282,7 @@ mod tests {
         let paras = empty_paragraphs(30);
         let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
         let html = build_html(&refs, &["h1Title"]);
-        let read = extract_adaptive(&html);
+        let read = extract_adaptive(&html, None);
         assert_eq!(read.summary_paragraphs.len(), 10);
         assert_eq!(read.paragraph_index.len(), 30);
         // 首段是全文第一个 paragraph
@@ -289,7 +296,7 @@ mod tests {
         let paras = empty_paragraphs(100);
         let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
         let html = build_html(&refs, &["h1Title"]);
-        let read = extract_adaptive(&html);
+        let read = extract_adaptive(&html, None);
         assert_eq!(read.summary_paragraphs.len(), 5);
         assert_eq!(read.paragraph_index.len(), 100);
         assert!(read.summary_paragraphs[4].contains("Paragraph number 5."));
@@ -300,7 +307,7 @@ mod tests {
         let paras = empty_paragraphs(10);
         let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
         let html = build_html(&refs, &["h1Title"]);
-        let read = extract_adaptive(&html);
+        let read = extract_adaptive(&html, None);
         // <10 段走 SHORT_MAX → 给全文 = 10 段
         assert_eq!(read.summary_paragraphs.len(), 10);
     }
@@ -310,7 +317,7 @@ mod tests {
         let paras = empty_paragraphs(50);
         let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
         let html = build_html(&refs, &["h1Title"]);
-        let read = extract_adaptive(&html);
+        let read = extract_adaptive(&html, None);
         // 10..=50 走 MEDIUM_TAKE = 10
         assert_eq!(read.summary_paragraphs.len(), 10);
     }
@@ -320,7 +327,7 @@ mod tests {
         let paras = empty_paragraphs(51);
         let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
         let html = build_html(&refs, &["h1Title"]);
-        let read = extract_adaptive(&html);
+        let read = extract_adaptive(&html, None);
         assert_eq!(read.summary_paragraphs.len(), 5);
     }
 
@@ -329,7 +336,7 @@ mod tests {
         let paras = empty_paragraphs(100);
         let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
         let html = build_html(&refs, &["h1Title"]);
-        let read = extract_adaptive(&html);
+        let read = extract_adaptive(&html, None);
         assert_eq!(read.paragraph_index.len(), 100);
         // 索引条目包含首句
         assert!(!read.paragraph_index[0].first_sentence.is_empty());
@@ -343,7 +350,7 @@ mod tests {
             &["p1"],
             &["h1First", "h2Second", "h3Third", "h1Fourth"],
         );
-        let read = extract_adaptive(&html);
+        let read = extract_adaptive(&html, None);
         assert_eq!(read.headings.len(), 4);
         assert_eq!(read.headings[0].level, 1);
         assert_eq!(read.headings[0].text, "First");
@@ -373,7 +380,7 @@ mod tests {
     #[test]
     fn format_headings_only_contains_all_headings() {
         let html = build_html(&["p"], &["h1A", "h2B", "h3C"]);
-        let mut read = extract_adaptive(&html);
+        let mut read = extract_adaptive(&html, None);
         read.url = "https://e.test".into();
         read.title = "T".into();
         let out = format_headings_only(&read);
@@ -391,7 +398,7 @@ mod tests {
         let paras = empty_paragraphs(100);
         let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
         let html = build_html(&refs, &["h1Title"]);
-        let mut read = extract_adaptive(&html);
+        let mut read = extract_adaptive(&html, None);
         read.url = "u".into();
         read.title = "t".into();
         let out = format_adaptive(&read, 0);
@@ -406,7 +413,7 @@ mod tests {
         let paras = empty_paragraphs(100);
         let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
         let html = build_html(&refs, &["h1Title"]);
-        let mut read = extract_adaptive(&html);
+        let mut read = extract_adaptive(&html, None);
         read.url = "u".into();
         read.title = "t".into();
         // --from 3：摘要从第 3 段开始（共 LONG_TAKE - 3 = 2 段）
@@ -422,5 +429,25 @@ mod tests {
         assert!(!summary_section.contains("Paragraph number 3."));
         assert!(summary_section.contains("Paragraph number 4."));
         assert!(summary_section.contains("Paragraph number 5."));
+    }
+
+    /// e1i：--excerpt opt-in——Some(N) 填该段前 N 字符实际文本；None 时 excerpt 键
+    /// 不出 JSON（默认输出逐键不变，回归闸）。
+    #[test]
+    fn excerpt_opt_in_fills_and_skips() {
+        let html = "<html><body><p>hello world。</p><p>second</p></body></html>";
+        let with = extract_adaptive(html, Some(5));
+        assert_eq!(with.paragraph_index[0].excerpt.as_deref(), Some("hello"));
+        assert_eq!(with.paragraph_index[1].excerpt.as_deref(), Some("secon"));
+        // 截断长度上限生效：请求 100 字符只给段落实长
+        let full = extract_adaptive(html, Some(100));
+        assert_eq!(full.paragraph_index[1].excerpt.as_deref(), Some("second"));
+
+        let none = extract_adaptive(html, None);
+        assert!(none.paragraph_index[0].excerpt.is_none());
+        let s = serde_json::to_string(&none.paragraph_index[0]).unwrap();
+        assert!(!s.contains("excerpt"), "默认档不应出 excerpt 键: {s}");
+        let s = serde_json::to_string(&with.paragraph_index[0]).unwrap();
+        assert!(s.contains(r#""excerpt":"hello""#), "{s}");
     }
 }

@@ -248,6 +248,8 @@ pub struct ReadOpts {
     pub json: bool,
     pub headings_only: bool,
     pub from: usize,
+    /// e1i：Some(N) = paragraph_index 每项附前 N 字符 excerpt（--json 生效）；None 行为不变。
+    pub excerpt: Option<usize>,
 }
 
 /// `--read N`：M9 默认走 AdaptiveRead（按文章结构自适应）。opts 见 ReadOpts。
@@ -267,7 +269,7 @@ pub async fn read(
     };
     let html_full = content_retry(&page).await;
     let (html, truncated, omitted) = cap_chars(&html_full, read_max_chars());
-    let mut read = extract_adaptive(&html);
+    let mut read = extract_adaptive(&html, opts.excerpt);
     read.url = url.to_string();
     read.title = title;
 
@@ -594,7 +596,7 @@ mod tests {
 <h3>Three</h3>
 <p>p3.</p>
 </body></html>"#;
-        let r = extract_adaptive(html);
+        let r = extract_adaptive(html, None);
         assert_eq!(r.headings.len(), 3);
         assert_eq!(r.headings[0].level, 1);
         assert_eq!(r.headings[0].text, "One");
@@ -642,7 +644,7 @@ mod tests {
     fn render_read_injects_meta_json_only() {
         let html = r#"<html><head><title>T</title></head><body><h1>One</h1><p>p1 alpha.</p></body></html>"#;
         // extract_adaptive 不取 title（url/title 由调用方补，与 skeleton 既有测试同款）
-        let mut read = extract_adaptive(html);
+        let mut read = extract_adaptive(html, None);
         read.url = "u".into();
         read.title = "T".into();
         let v: serde_json::Value =
