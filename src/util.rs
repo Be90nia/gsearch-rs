@@ -98,6 +98,80 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// nw4：SERP 来源类型标注——纯 host/后缀启发式，零网络请求、保守不猜（未命中一律 other）。
+/// 值域即 JSON `domain_class` 字段：docs/github/wikipedia/blog/forum/video/news/qa/other。
+pub fn domain_class(url: &str) -> &'static str {
+    // host 提取：剥 scheme → 截到第一个 / ? # → 去端口 → 去 www. → 小写
+    let rest = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => url,
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = host.split(':').next().unwrap_or(host);
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    let host = host.to_ascii_lowercase();
+    // site 匹配 = host 全等，或 `site` 前一位是 `.`（子域覆盖 en.wikipedia.org / old.reddit.com）
+    fn host_matches(host: &str, site: &str) -> bool {
+        host == site
+            || (host.len() > site.len()
+                && host.ends_with(site)
+                && host.as_bytes()[host.len() - site.len() - 1] == b'.')
+    }
+    if host_matches(&host, "github.com") {
+        return "github";
+    }
+    if host_matches(&host, "wikipedia.org") || host_matches(&host, "wikidata.org") {
+        return "wikipedia";
+    }
+    // docs：docs.rs、doc./docs. 前缀（docs.python.org / doc.rust-lang.org）、readthedocs、MDN、MS Learn
+    if host == "docs.rs"
+        || host.starts_with("doc.")
+        || host_matches(&host, "readthedocs.io")
+        || host == "developer.mozilla.org"
+        || host == "learn.microsoft.com"
+    {
+        return "docs";
+    }
+    // qa：Stack 全家 + Quora / 知乎
+    if ["stackoverflow.com", "stackexchange.com", "superuser.com", "serverfault.com", "askubuntu.com", "quora.com", "zhihu.com"]
+        .iter()
+        .any(|s| host_matches(&host, s))
+    {
+        return "qa";
+    }
+    // video
+    if ["youtube.com", "youtu.be", "vimeo.com", "bilibili.com"]
+        .iter()
+        .any(|s| host_matches(&host, s))
+    {
+        return "video";
+    }
+    // forum：Reddit / HN / V2EX
+    if host == "news.ycombinator.com"
+        || ["reddit.com", "v2ex.com"].iter().any(|s| host_matches(&host, s))
+    {
+        return "forum";
+    }
+    // news
+    if ["nytimes.com", "bbc.com", "bbc.co.uk", "reuters.com", "theguardian.com", "cnn.com", "cnbc.com", "bloomberg.com", "wsj.com", "theverge.com", "arstechnica.com", "36kr.com"]
+        .iter()
+        .any(|s| host_matches(&host, s))
+    {
+        return "news";
+    }
+    // blog：托管平台 + 个人博客（github.io 是个人博客；与 github.com 官方仓库页不冲突）
+    if host_matches(&host, "medium.com")
+        || host_matches(&host, "dev.to")
+        || host_matches(&host, "habr.com")
+        || ["substack.com", "github.io", "wordpress.com", "blogspot.com"]
+            .iter()
+            .any(|s| host_matches(&host, s))
+    {
+        return "blog";
+    }
+    "other"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +193,34 @@ mod tests {
         assert_eq!(filename_from_url("https://example.com/"), "download.bin");
         assert_eq!(filename_from_url("https://example.com"), "download.bin");
         assert_eq!(filename_from_url("https://example.com/index.html"), "index.html");
+    }
+
+    /// nw4：分类器——host 后缀匹配、www/端口/大小写归一、未命中 other。
+    #[test]
+    fn domain_class_cases() {
+        assert_eq!(domain_class("https://github.com/tokio-rs/tokio"), "github");
+        assert_eq!(domain_class("https://gist.github.com/x/1"), "github");
+        assert_eq!(domain_class("https://en.wikipedia.org/wiki/Rust"), "wikipedia");
+        assert_eq!(domain_class("https://docs.rs/tokio/latest/tokio/"), "docs");
+        assert_eq!(domain_class("https://doc.rust-lang.org/book/"), "docs");
+        assert_eq!(domain_class("https://tokio.readthedocs.io/en/latest/"), "docs");
+        assert_eq!(domain_class("https://stackoverflow.com/q/123"), "qa");
+        assert_eq!(domain_class("https://rust-lang.stackexchange.com/q/1"), "qa");
+        assert_eq!(domain_class("https://www.youtube.com/watch?v=1"), "video");
+        assert_eq!(domain_class("https://youtu.be/abc"), "video");
+        assert_eq!(domain_class("https://old.reddit.com/r/rust/"), "forum");
+        assert_eq!(domain_class("https://news.ycombinator.com/item?id=1"), "forum");
+        assert_eq!(domain_class("https://www.nytimes.com/2026/10/08/x.html"), "news");
+        assert_eq!(domain_class("https://alice.github.io/post/"), "blog");
+        assert_eq!(domain_class("https://medium.com/@x/post"), "blog");
+        // 归一与边界
+        assert_eq!(domain_class("https://WWW.GitHub.COM/x"), "github");
+        assert_eq!(domain_class("https://192.168.89.249:8888/search?q=x"), "other");
+        // 近似域名不误标：notgithub.io ≠ github.io，dockerns ≠ docs
+        assert_eq!(domain_class("https://notgithub.io/post/"), "other");
+        assert_eq!(domain_class("https://docker.com/"), "other");
+        assert_eq!(domain_class("https://example.com/foo"), "other");
+        assert_eq!(domain_class("not a url"), "other");
     }
 
     /// I9：URL 派生的文件名安全门——禁路径分隔符、Win 保留字符、路径穿越 `..`、控制字符。

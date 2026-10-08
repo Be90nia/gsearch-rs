@@ -30,10 +30,13 @@ pub fn parse_serp(html: &str) -> Vec<SearchResult> {
             let Some(title_el) = el.select(&h3).next() else {
                 continue;
             };
+            let url = absolutize(el.value().attr("href").unwrap_or_default().trim(), "https://www.google.com");
+            let domain_class = crate::util::domain_class(&url);
             results.push(SearchResult {
                 title: text_of(&title_el),
-                url: absolutize(el.value().attr("href").unwrap_or_default().trim(), "https://www.google.com"),
+                url,
                 snippet: String::new(),
+                domain_class,
             });
             pending.push(results.len() - 1);
         } else {

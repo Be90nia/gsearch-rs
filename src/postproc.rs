@@ -18,7 +18,6 @@ use gsearch::skeleton::{extract_adaptive, format_adaptive, format_headings_only}
 use gsearch::types::SearchResult;
 use gsearch::util::filename_from_url;
 
-const READ_FULL_MAX_CHARS: usize = 5000;
 const PAGE_TIMEOUT_SECS: u64 = 30;
 /// M17 登录墙:等人工登录的总超时(顶层命令无人守窗,不能像 `login` 命令那样不限时)
 const LOGIN_WALL_TIMEOUT_SECS: u64 = 180;
@@ -281,7 +280,7 @@ pub async fn read(
     Ok(out)
 }
 
-/// `--read N --full` 兜底：纯 innerText 5000 字。--json（0mf）时静默返回正文串，由 cmd_search
+/// `--read N --full` 兜底：纯 innerText。--json（0mf）时静默返回正文串，由 cmd_search
 /// 装配进单一 JSON 文档；文本模式照旧打印 `=== url ===` 头。
 pub async fn read_full(
     browser: &mut Browser,
@@ -292,25 +291,18 @@ pub async fn read_full(
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
     let (page, _) = open_page(browser, h_slot, url).await?;
-    let txt = read_full_text(&page).await?;
+    let (txt, _, _) = read_full_text(&page).await?;
     if !opts.json {
         println!("=== {url} ===\n{txt}");
     }
     Ok(txt)
 }
 
-/// 共享 innerText 5000 字截断 + 打印。pub(crate)：general::cmd_browse --full 复用同一实现。
-pub(crate) async fn read_full_inner(page: &chromiumoxide::Page, url: &str) -> Result<String> {
-    let txt = read_full_text(page).await?;
-    println!("=== {url} ===\n{txt}");
-    Ok(txt)
-}
-
-/// innerText 5000 字截断（不打印）。read_full（--json 静默装配）/ read_full_inner（browse 打印）共用。
-pub(crate) async fn read_full_text(page: &chromiumoxide::Page) -> Result<String> {
+/// innerText 截断 + 截断标注（fve：cap 与 AdaptiveRead 同一 READ_BODY_MAX_CHARS 上限；
+/// browse --full --json 在 meta.truncated 照标）。read_full / general::cmd_browse 共用。
+pub(crate) async fn read_full_text(page: &chromiumoxide::Page) -> Result<(String, bool, usize)> {
     let txt = eval_string_retry(page, "document.body.innerText").await;
-    let txt: String = txt.chars().take(READ_FULL_MAX_CHARS).collect();
-    Ok(txt)
+    Ok(cap_chars(&txt, READ_BODY_MAX_CHARS))
 }
 
 /// M4 健壮性修复：打开结果页并等语义定稿——read / read_full 共用的 goto 前置。
@@ -580,6 +572,7 @@ mod tests {
             title: "t".into(),
             url: "u".into(),
             snippet: "s".into(),
+            domain_class: "other",
         }];
         assert!(pick(&r, 0, "read").is_err());
         assert!(pick(&r, 2, "read").is_err());
@@ -711,6 +704,7 @@ mod live_tests {
             title: "t".into(),
             url: "https://example.com/".into(),
             snippet: "s".into(),
+            domain_class: "other",
         }]
     }
 

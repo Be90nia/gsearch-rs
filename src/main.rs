@@ -94,14 +94,18 @@ enum Command {
     /// 任意 URL → 渲染后页面正文（M1 主验收点；M9 默认 AdaptiveRead）
     Browse {
         url: String,
-        #[arg(long, default_value_t = false)]
+        /// fve：纯 innerText 全文（50000 cap）；与 --headings-only 互斥
+        #[arg(long, default_value_t = false, group = "browse_mode")]
         full: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
         #[arg(long)]
         from: Option<usize>,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, group = "browse_mode")]
         headings_only: bool,
+        /// 6dp：meta 压缩（仅 --json --full 信封生效；debug 日志强制全量）
+        #[arg(long, default_value_t = false)]
+        compact_meta: bool,
         #[arg(long, value_enum, default_value_t = BrowserArg::Auto)]
         /// 选择浏览器（M11）
         browser: BrowserArg,
@@ -113,29 +117,51 @@ enum Command {
         /// 选择浏览器（M11）
         browser: BrowserArg,
     },
-    /// 带 profile 登录态下载（M6）
+    /// 带 profile 登录态下载（M6）。-o 末段带扩展名 = 落该文件；纯目录名 = 目录语义（README 不变）。
     Dl {
         url: String,
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// 显式文件语义：产物固定落该文件（与 -o 的目录/文件二义解耦）。
+        #[arg(long)]
+        output_file: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = BrowserArg::Auto)]
         /// 选择浏览器（M11）
         browser: BrowserArg,
     },
     /// 交互式 shell：起一次 Chrome 会话复用（M7 追加里程碑）
     Shell,
-    /// 检测浏览器 / profile / 网络连通性 / 出口 IP（M11 doctor）
-    Doctor,
-    /// HEADless URL 健康检查：HEAD/GET + redirect 链 + SSL + 延迟（M14-1A，无需 Chrome）
-    Verify {
-        url: String,
-        /// 输出结构化 JSON（默认人类可读 text）
+    /// 检测浏览器 / profile / 网络连通性 / 出口 IP / SearXNG 健康度（M11 doctor + ptb 探测）
+    Doctor {
+        /// 2i1：输出结构化 JSON（{checks, elapsed_ms, fail_count, warn_count}；默认人类可读）
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// 纯 HTTP GET 取网页正文（issue gsearch-rs-fetch，无需 Chrome；JS 壳页会提示用 browse）
+    /// HEADless URL 健康检查：HEAD/GET + redirect 链 + SSL + 延迟（M14-1A，无需 Chrome）
+    Verify {
+        /// 单 URL = 原行为；多 URL 或 --urls-file = 批量对比表（issue gsearch-rs-e58）。
+        /// 不设 required=true 以放行 --urls-file；零值由 required_unless_present 拒绝。
+        #[arg(required_unless_present = "urls_file", num_args = 1..)]
+        url: Vec<String>,
+        /// 输出结构化 JSON（默认人类可读 text）
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// 单条探测总预算秒数（含 redirect；issue gsearch-rs-7qx：CDN 抖动端点可调高）
+        #[arg(long, default_value_t = gsearch::verify::VERIFY_TIMEOUT_SECS)]
+        timeout: u64,
+        /// 批量：逐行读 URL 的文件（空行忽略），与位置参数互斥
+        #[arg(long, conflicts_with = "url")]
+        urls_file: Option<std::path::PathBuf>,
+    },
+    /// 纯 HTTP GET 取网页正文（issue gsearch-rs-fetch，无需 Chrome；JS 壳页会提示用 browse）。
+    /// 单 URL = 原行为；多 URL = batch 并发（上限 5、单条失败不阻塞，退出码 0 全成功 / 1 部分失败 / 2 全失败）。
     Fetch {
-        url: String,
+        #[arg(required = true, num_args = 1..)]
+        url: Vec<String>,
+        /// 逗号分隔 CSS selector（如 "main,article"）：命中时取首个命中容器的正文并跳过 JS 壳判定；
+        /// 未命中回退全文提取，--json 在 meta.include_hit=false 标注。
+        #[arg(long)]
+        include: Option<String>,
         /// 输出结构化 JSON（默认人类可读 text）
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -179,6 +205,10 @@ struct SearchArgs {
     /// `--read N --headings-only`：只输出目录（最省 token fast path）
     #[arg(long, default_value_t = false)]
     headings_only: bool,
+    /// 6dp：meta 压缩到 6 字段（query/results_count/truncated/provider/elapsed_ms/recency）。
+    /// 默认关（14 字段全量）；--verbose debug 或 GSEARCH_LOG=debug 时强制全量（排障现场保留）。
+    #[arg(long, default_value_t = false)]
+    compact_meta: bool,
     /// `--dl N -o DIR`：把下载文件落到 DIR 下（按 URL 末段命名）；DIR 缺省落 CWD。M13 修复两处不一致。
     #[arg(short = 'o', long = "output")]
     output: Option<PathBuf>,
@@ -214,9 +244,21 @@ async fn main() -> ExitCode {
     }
     // GSEARCH_PROXY env 作为默认值（CLI --proxy 覆盖）
     let proxy = cli.proxy.clone().or_else(|| std::env::var("GSEARCH_PROXY").ok().filter(|s| !s.is_empty()));
+    // 6dp：--compact-meta 生效门——opt-in 且 debug 日志（--verbose debug / GSEARCH_LOG=debug）强制全量。
+    // 进程级一次性设置（信封构造方零改动），派发前算好。
+    let compact_requested = match &cli.cmd {
+        Command::Search(a) => a.compact_meta,
+        Command::Browse { compact_meta, .. } => *compact_meta,
+        _ => false,
+    };
+    let debug_logging = cli.verbose.eq_ignore_ascii_case("debug")
+        || std::env::var("GSEARCH_LOG")
+            .map(|v| v.to_ascii_lowercase().contains("debug"))
+            .unwrap_or(false);
+    gsearch::types::set_compact_meta(compact_requested && !debug_logging);
     let result: Result<ExitCode> = match cli.cmd {
         Command::Search(args) => cmd_search(args, proxy.clone()).await,
-        Command::Browse { url, full, json, from, headings_only, browser } => {
+        Command::Browse { url, full, json, from, headings_only, compact_meta: _, browser } => {
             let opts = general::BrowseOpts {
                 full,
                 json,
@@ -228,12 +270,16 @@ async fn main() -> ExitCode {
             general::cmd_browse(&url, &opts).await
         }
         Command::Login { url, browser } => general::cmd_login(&url, browser.into(), proxy.clone()).await,
-        Command::Dl { url, output, browser } => general::cmd_dl(&url, output.as_deref(), browser.into(), proxy.clone()).await,
+        Command::Dl { url, output, output_file, browser } => {
+            general::cmd_dl(&url, output.as_deref(), output_file.as_deref(), browser.into(), proxy.clone()).await
+        }
         Command::Shell => shell::run_shell().await,
-        Command::Doctor => cmd_doctor().await,
-        Command::Verify { url, json } => gsearch::verify::cmd_verify(&url, json, proxy.as_deref()),
-        Command::Fetch { url, json, allow_private } => {
-            fetch::cmd_fetch(&url, &fetch::FetchOpts { json, proxy: proxy.clone(), allow_private }).await
+        Command::Doctor { json } => cmd_doctor(json).await,
+        Command::Verify { url, json, timeout, urls_file } => {
+            gsearch::verify::cmd_verify(&url, json, proxy.as_deref(), timeout, urls_file.as_deref())
+        }
+        Command::Fetch { url, json, allow_private, include } => {
+            fetch::cmd_fetch(&url, &fetch::FetchOpts { json, proxy: proxy.clone(), allow_private, include }).await
         }
     };
 
@@ -267,12 +313,23 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
     let mut h_slot: Option<tokio::task::JoinHandle<()>> = None;
     let cfg = gsearch::search::SearchConfig { query: query.clone(), limit: args.limit, recency };
-    let (results, captcha_solved, provider) = if let Some(
-        gsearch::search::SearchOutcome::Results { results, captcha_solved, provider },
-    ) = gsearch::search::try_searxng(&cfg).await
-    {
-        (results, captcha_solved, provider)
-    } else {
+    // zc6：SearXNG 单次尝试四态——Results 直接用；CircuitBroken 熔断早退；
+    // NotConfigured/FallbackGoogle 走原 Google 链（IP 正常时行为与旧版一致）。
+    let searxng = gsearch::search::try_searxng(&cfg).await;
+    if matches!(searxng, gsearch::search::SearxngAttempt::CircuitBroken) {
+        if args.json {
+            // stderr 诊断行已由 try_searxng 打（豁免未来任何静默策略）
+            emit_searxng_degraded_json(&query, &args, &browser_path, &resolved_kind, proxy.clone(), recency, started.elapsed().as_millis());
+        }
+        // 人读模式 stdout 不打假结果；退出码 2 = 无结果语义族
+        return Ok(ExitCode::from(2));
+    }
+    let (results, captcha_solved, provider) = match searxng {
+        gsearch::search::SearxngAttempt::Results(
+            gsearch::search::SearchOutcome::Results { results, captcha_solved, provider },
+        ) => (results, captcha_solved, provider),
+        // NotConfigured（未配 SearXNG）/ FallbackGoogle（预检通过，回退 warn 已打）→ Google 直爬
+        _ => {
         // H2 包成 async 块统一收尾：launch 成功后所有 ? 早返回路径（new_page / install_init_script /
         // browser 用 Cell 模式（Option<Browser>）保留到外层，Err 路径也走 graceful_close 再上抛
         // （防 Browser::drop 在 Windows 上不杀子进程的漏）。
@@ -331,6 +388,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
                 gsearch::browser::graceful_close(&mut browser).await;
                 return Ok(ExitCode::from(3));
             }
+        }
         }
     };
     // 0mf：--json + --read 时 read 产物并入单一 JSON 文档——envelope 延后装配，stdout 只出
@@ -591,6 +649,44 @@ fn emit_captcha_timeout_json(
     let _ = gsearch::output::print_envelope_json(&envelope);
 }
 
+/// zc6：SearXNG 熔断输出——status=searxng_degraded（元审计硬约束值）、provider 照实标
+/// searxng、results 空；message 带诊断行让 Agent 无需解析 stderr。
+fn emit_searxng_degraded_json(
+    query: &str,
+    args: &SearchArgs,
+    browser_path: &std::path::Path,
+    resolved_kind: &gsearch::browser::BrowserKind,
+    proxy: Option<String>,
+    recency: Option<gsearch::search::Recency>,
+    elapsed_ms: u128,
+) {
+    let meta = gsearch::types::MetaOutput {
+        tool: "gsearch",
+        version: env!("CARGO_PKG_VERSION"),
+        query: query.to_string(),
+        profile: gsearch::browser::profile_name_only(),
+        browser_kind: format!("{resolved_kind:?}"),
+        browser_path: browser_path.to_string_lossy().into_owned(),
+        proxy,
+        humanize: args.humanize,
+        limit: args.limit,
+        elapsed_ms,
+        results_count: 0,
+        truncated: false,
+        // 熔断时结果确实来自 SearXNG 链路（provider 照实标注，非 google）
+        provider: "searxng".into(),
+        recency: recency.map(|r| r.as_str().into()),
+    };
+    let run = gsearch::types::RunStatusInfo {
+        status: gsearch::types::RunStatus::SearxngDegraded,
+        captcha_solved: false,
+        message: gsearch::search::SEARXNG_CIRCUIT_MSG.into(),
+    };
+    let envelope: gsearch::types::OutputEnvelope<Vec<()>> =
+        gsearch::types::OutputEnvelope { meta, run, results: vec![] };
+    let _ = gsearch::output::print_envelope_json(&envelope);
+}
+
 fn browser_arg_to_kind(arg: BrowserArg) -> Option<gsearch::browser::BrowserKind> {
     match arg {
         BrowserArg::Auto => None,
@@ -601,107 +697,200 @@ fn browser_arg_to_kind(arg: BrowserArg) -> Option<gsearch::browser::BrowserKind>
 
 /// doctor 总耗时 <3s；不启动 Chrome。每项输出 `[OK] 描述 + 路径 / [WARN] ... / [FAIL] ...`。
 /// 全部 OK 退出 0；任意 FAIL 退出 1；仅 WARN 退出 0。
-async fn cmd_doctor() -> Result<ExitCode> {
+/// 2i1：--json 输出 {checks:[{name,status,message}], elapsed_ms, fail_count, warn_count}
+/// （status 语义 ok/warn/fail/skip；exit 规则不变）。人读模式文本与旧版逐字节一致（除新增项）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DoctorStatus {
+    Ok,
+    Warn,
+    Fail,
+    Skip,
+}
+
+#[derive(serde::Serialize)]
+struct DoctorCheck {
+    name: &'static str,
+    status: DoctorStatus,
+    message: String,
+}
+
+#[derive(serde::Serialize)]
+struct DoctorOutput {
+    checks: Vec<DoctorCheck>,
+    elapsed_ms: u128,
+    fail_count: usize,
+    warn_count: usize,
+}
+
+/// 记一项检查；fail/warn 计数与 status 同源，防双记账漂移。
+fn record_check(
+    checks: &mut Vec<DoctorCheck>,
+    fail: &mut usize,
+    warn: &mut usize,
+    name: &'static str,
+    status: DoctorStatus,
+    message: String,
+) {
+    match status {
+        DoctorStatus::Fail => *fail += 1,
+        DoctorStatus::Warn => *warn += 1,
+        _ => {}
+    }
+    checks.push(DoctorCheck { name, status, message });
+}
+
+async fn cmd_doctor(json: bool) -> Result<ExitCode> {
     let started = std::time::Instant::now();
-    println!("gsearch doctor");
+    let mut checks: Vec<DoctorCheck> = Vec::new();
     let mut fail = 0;
     let mut warn = 0;
 
     // 1) Chrome 可用（走 find_specific，与 launch 一致：含 %LOCALAPPDATA% 用户级安装路径）
-    match gsearch::browser::find_specific(gsearch::browser::BrowserKind::Chrome) {
-        Some((p, _)) => println!("[ OK ] Chrome: {}", p.display()),
-        None => {
-            println!("[FAIL] Chrome 不可用（chrome.exe 未找到；含默认路径与用户级 %LOCALAPPDATA%）");
-            fail += 1;
-        }
-    }
+    let (st, msg) = match gsearch::browser::find_specific(gsearch::browser::BrowserKind::Chrome) {
+        Some((p, _)) => (DoctorStatus::Ok, format!("Chrome: {}", p.display())),
+        None => (
+            DoctorStatus::Fail,
+            "Chrome 不可用（chrome.exe 未找到；含默认路径与用户级 %LOCALAPPDATA%）".to_string(),
+        ),
+    };
+    record_check(&mut checks, &mut fail, &mut warn, "chrome", st, msg);
 
     // 2) Edge 可用
-    match gsearch::browser::find_specific(gsearch::browser::BrowserKind::Edge) {
-        Some((p, _)) => println!("[ OK ] Edge:   {}", p.display()),
-        None => {
-            println!("[WARN] Edge 不可用（msedge.exe 未找到；仅 Chrome 可跑）");
-            warn += 1;
-        }
-    }
+    let (st, msg) = match gsearch::browser::find_specific(gsearch::browser::BrowserKind::Edge) {
+        Some((p, _)) => (DoctorStatus::Ok, format!("Edge:   {}", p.display())),
+        None => (
+            DoctorStatus::Warn,
+            "Edge 不可用（msedge.exe 未找到；仅 Chrome 可跑）".to_string(),
+        ),
+    };
+    record_check(&mut checks, &mut fail, &mut warn, "edge", st, msg);
 
     // 3) profile 可写
-    match gsearch::browser::profile_dir() {
+    let (st, msg) = match gsearch::browser::profile_dir() {
         Ok(dir) => match test_profile_writable(&dir) {
-            Ok(()) => println!("[ OK ] profile 可写: {}", dir.display()),
-            Err(e) => {
-                println!("[FAIL] profile 不可写: {} ({e})", dir.display());
-                fail += 1;
-            }
+            Ok(()) => (DoctorStatus::Ok, format!("profile 可写: {}", dir.display())),
+            Err(e) => (
+                DoctorStatus::Fail,
+                format!("profile 不可写: {} ({e})", dir.display()),
+            ),
         },
-        Err(e) => {
-            println!("[FAIL] profile 解析失败: {e}");
-            fail += 1;
-        }
-    }
+        Err(e) => (DoctorStatus::Fail, format!("profile 解析失败: {e}")),
+    };
+    record_check(&mut checks, &mut fail, &mut warn, "profile_writable", st, msg);
 
     // 4) 出口 IP（明文 HTTP GET 80 端口，3s 超时；失败降 WARN）
-    match tokio::time::timeout(
+    let (st, msg) = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         fetch_public_ip(),
     )
     .await
     {
-        Ok(Ok(ip)) => println!("[ OK ] 出口 IP: {ip}"),
-        Ok(Err(e)) => {
-            println!("[WARN] 出口 IP 不可达（撞码调试辅助；改用代理/VPN 后重试）: {e}");
-            warn += 1;
-        }
-        Err(_) => {
-            println!("[WARN] 出口 IP 检测超时（2s）");
-            warn += 1;
-        }
-    }
+        Ok(Ok(ip)) => (DoctorStatus::Ok, format!("出口 IP: {ip}")),
+        Ok(Err(e)) => (
+            DoctorStatus::Warn,
+            format!("出口 IP 不可达（撞码调试辅助；改用代理/VPN 后重试）: {e}"),
+        ),
+        Err(_) => (DoctorStatus::Warn, "出口 IP 检测超时（2s）".to_string()),
+    };
+    record_check(&mut checks, &mut fail, &mut warn, "exit_ip", st, msg);
 
     // 5) 网络连通（TCP connect google.com:443，2s 超时）
-    match tokio::time::timeout(
+    let (st, msg) = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tokio::net::TcpStream::connect(("www.google.com", 443)),
     )
     .await
     {
-        Ok(Ok(_)) => println!("[ OK ] 网络连通 (www.google.com:443)"),
-        Ok(Err(e)) => {
-            println!("[FAIL] 网络不可达 (www.google.com:443): {e}");
-            fail += 1;
-        }
-        Err(_) => {
-            println!("[FAIL] 网络连接超时 (www.google.com:443)");
-            fail += 1;
-        }
-    }
+        Ok(Ok(_)) => (DoctorStatus::Ok, "网络连通 (www.google.com:443)".to_string()),
+        Ok(Err(e)) => (DoctorStatus::Fail, format!("网络不可达 (www.google.com:443): {e}")),
+        Err(_) => (DoctorStatus::Fail, "网络连接超时 (www.google.com:443)".to_string()),
+    };
+    record_check(&mut checks, &mut fail, &mut warn, "network", st, msg);
 
     // 6) 生效 profile 来源检查（env > 配置文件 > default）
-    if let Ok(v) = std::env::var("GSEARCH_PROFILE")
+    let (st, msg) = if let Ok(v) = std::env::var("GSEARCH_PROFILE")
         && !v.trim().is_empty()
     {
         let p = std::path::PathBuf::from(v.trim());
         if p.exists() {
-            println!("[ OK ] GSEARCH_PROFILE 已设置且存在: {}", p.display());
+            (DoctorStatus::Ok, format!("GSEARCH_PROFILE 已设置且存在: {}", p.display()))
         } else {
-            println!("[WARN] GSEARCH_PROFILE 已设置但路径不存在: {}（gsearch 会自动创建）", p.display());
-            warn += 1;
+            (
+                DoctorStatus::Warn,
+                format!("GSEARCH_PROFILE 已设置但路径不存在: {}（gsearch 会自动创建）", p.display()),
+            )
         }
     } else if let Some(p) = gsearch::config::load().profile.clone() {
-        println!("[ OK ] profile 来自配置文件: {p}");
+        (DoctorStatus::Ok, format!("profile 来自配置文件: {p}"))
     } else {
-        println!("[ OK ] GSEARCH_PROFILE 未设置（默认 ~/.gsearch/profiles/default/）");
+        (DoctorStatus::Ok, "GSEARCH_PROFILE 未设置（默认 ~/.gsearch/profiles/default/）".to_string())
+    };
+    record_check(&mut checks, &mut fail, &mut warn, "profile_source", st, msg);
+
+    // 7) SearXNG 健康度（ptb）：查询级探测抓「端点活但零结果」盲区——doctor 只查 TCP 查不出
+    match gsearch::config::load().searxng_url.clone() {
+        None => record_check(
+            &mut checks,
+            &mut fail,
+            &mut warn,
+            "searxng",
+            DoctorStatus::Skip,
+            "SearXNG: 未配置（GSEARCH_SEARXNG_URL / gsearch.json searxng_url），跳过".to_string(),
+        ),
+        Some(base) => {
+            let (st, msg) = match gsearch::searxng::probe(&base).await {
+                Ok(p) if p.results > 0 => (
+                    DoctorStatus::Ok,
+                    format!(
+                        "SearXNG: HTTP {}, results={}, unresponsive_engines={} ({base})",
+                        p.http_status, p.results, p.unresponsive_engines
+                    ),
+                ),
+                Ok(p) => (
+                    DoctorStatus::Warn,
+                    format!(
+                        "SearXNG 可达但零结果（引擎降级/IP 信誉嫌疑）：HTTP {}, results=0, unresponsive_engines={} ({base})",
+                        p.http_status, p.unresponsive_engines
+                    ),
+                ),
+                Err(e) => (DoctorStatus::Warn, format!("SearXNG 探测失败: {e} ({base})")),
+            };
+            record_check(&mut checks, &mut fail, &mut warn, "searxng", st, msg);
+        }
     }
 
     let elapsed_ms = started.elapsed().as_millis();
-    if fail > 0 {
-        println!("\n[{fail} 项 FAIL] 检查上面建议。（耗时 {elapsed_ms}ms）");
-        Ok(ExitCode::from(1))
-    } else if warn > 0 {
-        println!("\n[{warn} 项 WARN] 整体可用。（耗时 {elapsed_ms}ms）");
-        Ok(ExitCode::SUCCESS)
+    if json {
+        let out = DoctorOutput {
+            checks,
+            elapsed_ms,
+            fail_count: fail,
+            warn_count: warn,
+        };
+        println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
-        println!("\n所有检查通过 ✓（耗时 {elapsed_ms}ms）");
+        println!("gsearch doctor");
+        for c in &checks {
+            let tag = match c.status {
+                DoctorStatus::Ok => "[ OK ]",
+                DoctorStatus::Warn => "[WARN]",
+                DoctorStatus::Fail => "[FAIL]",
+                DoctorStatus::Skip => "[SKIP]",
+            };
+            println!("{tag} {}", c.message);
+        }
+        if fail > 0 {
+            println!("\n[{fail} 项 FAIL] 检查上面建议。（耗时 {elapsed_ms}ms）");
+        } else if warn > 0 {
+            println!("\n[{warn} 项 WARN] 整体可用。（耗时 {elapsed_ms}ms）");
+        } else {
+            println!("\n所有检查通过 ✓（耗时 {elapsed_ms}ms）");
+        }
+    }
+    if fail > 0 {
+        Ok(ExitCode::from(1))
+    } else {
         Ok(ExitCode::SUCCESS)
     }
 }
@@ -798,12 +987,46 @@ mod tests {
         assert!(r.is_ok(), "--read 单用应通过");
     }
 
+    /// fve：browse --full 与 --headings-only clap 阶段互斥；单用通过。
+    #[test]
+    fn browse_full_headings_only_mutually_exclusive() {
+        let r = Cli::try_parse_from(["gsearch", "browse", "https://example.com", "--full", "--headings-only"]);
+        assert!(r.is_err(), "--full + --headings-only 应在 clap 阶段被拒绝");
+        let r = Cli::try_parse_from(["gsearch", "browse", "https://example.com", "--full"]);
+        assert!(r.is_ok(), "--full 单用应通过");
+    }
+
+    /// 6dp：--compact-meta 在 search / browse 上可解析、默认关。
+    #[test]
+    fn compact_meta_flag_parses() {
+        let cli = Cli::try_parse_from(["gsearch", "search", "x", "--compact-meta"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert!(args.compact_meta);
+        let cli = Cli::try_parse_from(["gsearch", "search", "x"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert!(!args.compact_meta, "默认应关（14 字段全量）");
+        let cli = Cli::try_parse_from(["gsearch", "browse", "https://example.com", "--compact-meta"]).unwrap();
+        let Command::Browse { compact_meta, .. } = cli.cmd else { panic!("expected browse") };
+        assert!(compact_meta);
+    }
+
+    /// 2i1：doctor --json flag 可解析、默认关。
+    #[test]
+    fn doctor_json_flag_parses() {
+        let cli = Cli::try_parse_from(["gsearch", "doctor", "--json"]).unwrap();
+        let Command::Doctor { json } = cli.cmd else { panic!("expected doctor") };
+        assert!(json);
+        let cli = Cli::try_parse_from(["gsearch", "doctor"]).unwrap();
+        let Command::Doctor { json } = cli.cmd else { panic!("expected doctor") };
+        assert!(!json);
+    }
+
     /// M14-1A：verify 子命令 + --json flag 正常解析。
     #[test]
     fn verify_subcommand_parses_with_json_flag() {
         let cli = Cli::try_parse_from(["gsearch", "verify", "https://example.com", "--json"]).unwrap();
-        let Command::Verify { url, json } = cli.cmd else { panic!("expected verify") };
-        assert_eq!(url, "https://example.com");
+        let Command::Verify { url, json, .. } = cli.cmd else { panic!("expected verify") };
+        assert_eq!(url, vec!["https://example.com"]);
         assert!(json);
         // 不带 flag 默认 text
         let cli = Cli::try_parse_from(["gsearch", "verify", "https://example.com"]).unwrap();

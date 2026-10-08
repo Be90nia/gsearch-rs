@@ -25,6 +25,8 @@ pub(crate) const LOGIN_POLL_SECS: u64 = 2;
 const DL_TOTAL_TIMEOUT_SECS: u64 = 60;
 /// 下载嗅探窗口：窗口内目录无任何新文件（连 .crdownload 都没有）→ 判定渲染型 URL，走页内 fetch 落盘
 const DL_SNIFF_SECS: u64 = 4;
+/// v97 direct 直链总超时：流式 GET 大文件慢网场景，独立于 fetch 的 10s。
+const DL_DIRECT_TIMEOUT_SECS: u64 = 300;
 
 /// M9 `browse <url>` 选项集。与 postproc::ReadOpts 字段一致（agent 心智统一）。
 #[derive(Debug, Clone, Default)]
@@ -39,7 +41,8 @@ pub struct BrowseOpts {
     pub proxy: Option<String>,
 }
 
-/// `browse <url>`：headless 渲染 → 默认 AdaptiveRead（M9），`--full` 拿纯 innerText 5000 字。
+/// `browse <url>`：headless 渲染 → 默认 AdaptiveRead（M9），`--full` 纯 innerText（50000 cap，
+/// fve：--json 走 0mf 同款信封 + content_text；与 --headings-only clap 互斥）。
 /// CAPTCHA 路径：撞码报错退出，提示用 login 手工验证。
 /// H2+M2：launch 后所有 ? 早返回路径（new_page / goto / evaluate / content / parse）由外层
 /// graceful_close 收尾；不再裸 close+wait。
@@ -47,6 +50,7 @@ pub struct BrowseOpts {
 /// jp4：html 过 read_max_chars 硬截断，--json 在 meta 字段标注 truncated/omitted/content_untrusted。
 pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
     use crate::postproc;
+    let started = std::time::Instant::now();
     let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
     let result: Result<()> = async {
         let (browser, handler) =
@@ -66,9 +70,49 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
             ));
         }
 
-        // --full：纯 innerText 5000 字（与 postproc::read_full 同一实现）
+        // fve：--full 纯 innerText（READ_BODY_MAX_CHARS 50000 cap，截断照标）；
+        // --json 对齐 0mf search 契约：信封（meta.truncated 标内容截断）+ content_text 单文档
         if opts.full {
-            postproc::read_full_inner(&page, url).await?;
+            let (txt, truncated, omitted) = postproc::read_full_text(&page).await?;
+            if opts.json {
+                let (browser_path, resolved_kind) = crate::resolve_browser_meta(opts.browser);
+                let meta = gsearch::types::MetaOutput {
+                    tool: "gsearch",
+                    version: env!("CARGO_PKG_VERSION"),
+                    // browse 侧 query 恒空（schema 约定同 browse/dl）
+                    query: String::new(),
+                    profile: gsearch::browser::profile_name_only(),
+                    browser_kind: format!("{resolved_kind:?}"),
+                    browser_path: browser_path.to_string_lossy().into_owned(),
+                    proxy: opts.proxy.clone(),
+                    humanize: false,
+                    limit: 0,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    results_count: 0,
+                    truncated,
+                    provider: "google".into(),
+                    recency: None,
+                };
+                let run = gsearch::types::RunStatusInfo {
+                    status: gsearch::types::RunStatus::Ok,
+                    captcha_solved: false,
+                    message: String::new(),
+                };
+                let mut doc = serde_json::to_value(gsearch::types::OutputEnvelope {
+                    meta,
+                    run,
+                    results: Vec::<()>::new(),
+                })?;
+                if let Some(obj) = doc.as_object_mut() {
+                    obj.insert("content_text".into(), serde_json::Value::String(txt));
+                }
+                println!("{doc}");
+            } else {
+                println!("=== {url} ===\n{txt}");
+                if truncated {
+                    eprintln!("注意：正文超上限已截断（省略 {omitted} 字符；--json 输出在 meta 字段标注）");
+                }
+            }
             browser_opt = Some(browser);
             return Ok(());
         }
@@ -179,12 +223,23 @@ pub(crate) async fn browser_alive(browser: &chromiumoxide::Browser) -> bool {
     browser.version().await.is_ok()
 }
 
-/// `dl <url> [-o PATH]`：CDP `Browser.setDownloadBehavior` 走 Chrome 原生下载（带 profile 登录态）。
+/// `dl <url> [-o DIR|FILE] [--output-file FILE]`：
+/// v97 先 reqwest HEAD 预检——无 Set-Cookie 且非 text/html 的公开直链直接流式 GET 落盘（mode: direct），
+/// 免 Chrome 导航 30s；有登录墙/挑战嫌疑才起 Chrome（mode: browser，profile 登录态）。
+/// i9a 消歧义：-o 末段带扩展名 = 文件路径；纯目录名 = 目录语义（README 不变）；--output-file 显式文件。
 /// 渲染型 URL（普通网页，Chrome 不触发下载）回退页内 fetch 落盘（PLAN §3.5 raw-file 路径，同源 cookie）。
-pub async fn cmd_dl(url: &str, output: Option<&Path>, browser: Option<BrowserKind>, proxy: Option<String>) -> Result<ExitCode> {
+pub async fn cmd_dl(url: &str, output: Option<&Path>, output_file: Option<&Path>, browser: Option<BrowserKind>, proxy: Option<String>) -> Result<ExitCode> {
     use crate::postproc;
-    let dir: PathBuf = std::path::absolute(output.unwrap_or(Path::new(".")))?;
+    let (dir, file_target) = resolve_dl_target(output, output_file)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
+    // v97 直链快路径；direct 一旦进入下载阶段失败 → Err 冒泡（不伪装回退，半截文件留给用户判断重试）。
+    let direct_path = file_target.clone().unwrap_or_else(|| dir.join(filename_from_url(url)));
+    if let Some(size) = dl_direct(url, proxy.as_deref(), &direct_path).await? {
+        println!("mode: direct");
+        println!("已下载: {} ({size} bytes)", direct_path.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
     let result: Result<()> = async {
         let (browser_inst, handler) = launch_with_kind_proxy(true, browser, proxy).await?;
@@ -209,17 +264,27 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>, browser: Option<BrowserKin
 
         match wait_new_file(&dir, &before).await? {
             Some(name) => {
-                let size = std::fs::metadata(dir.join(&name)).map(|m| m.len()).unwrap_or(0);
-                println!("已下载: {} ({size} bytes)", dir.join(&name).display());
+                let mut path = dir.join(&name);
+                // i9a：Chrome 自命名 ≠ 目标文件名 → rename 到位（同 dir 下，无跨盘风险）。
+                if let Some(target) = &file_target
+                    && path != *target
+                {
+                    std::fs::rename(&path, target)
+                        .with_context(|| format!("重命名下载产物失败: {} → {}", path.display(), target.display()))?;
+                    path = target.clone();
+                }
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                println!("mode: browser");
+                println!("已下载: {} ({size} bytes)", path.display());
             }
             None => {
                 let bytes = postproc::fetch_in_page(&page, url).await?;
                 if bytes.is_empty() {
                     return Err(anyhow!("下载内容为空（{url}"));
                 }
-                let name = filename_from_url(url);
-                let path = dir.join(&name);
+                let path = file_target.clone().unwrap_or_else(|| dir.join(filename_from_url(url)));
                 std::fs::write(&path, &bytes).with_context(|| format!("写文件失败: {}", path.display()))?;
+                println!("mode: browser");
                 println!("已下载: {} ({})", path.display(), bytes.len());
             }
         }
@@ -231,6 +296,77 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>, browser: Option<BrowserKin
     }
     result?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// i9a：dl 输出目标消歧义。--output-file 显式文件；-o 末段带 '.' 视为文件路径；否则目录语义（README 不变）。
+/// 返回 (目录, 指定文件名)。目录恒为绝对路径（Chrome download_path 与落盘都需要）。
+/// 已知边界：目录名本身带 '.'（如 v0.2.9/）会被视为文件——help 已注明用 --output-file 消歧义。
+fn resolve_dl_target(output: Option<&Path>, output_file: Option<&Path>) -> Result<(PathBuf, Option<PathBuf>)> {
+    let dash_o_file = match output {
+        Some(p) if p.file_name().is_some_and(|f| f.to_string_lossy().contains('.')) => {
+            Some(std::path::absolute(p)?)
+        }
+        _ => None,
+    };
+    match output_file.map(std::path::absolute).transpose()?.or(dash_o_file) {
+        Some(f) => {
+            let dir = f.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+            Ok((dir, Some(f)))
+        }
+        None => {
+            let dir: PathBuf = std::path::absolute(output.unwrap_or(Path::new(".")))?;
+            Ok((dir, None))
+        }
+    }
+}
+
+/// v97 直链快路径：HEAD 预检（无 Set-Cookie 且 Content-Type 非 text/html）→ 流式 GET 落盘。
+/// 返回 Ok(Some(size)) = 已落盘；Ok(None) = 登录墙/挑战嫌疑或私网 → 回退 Chrome 老路径。
+/// SSRF 门与 fetch 同源（gate_check + 重定向每跳 Policy），allow=false：dl 无 --allow-private 语义，
+/// 私网/解析失败一律回退 browser（与旧版全 Chrome 路径行为一致，门不削弱）。
+async fn dl_direct(url: &str, proxy: Option<&str>, path: &Path) -> Result<Option<u64>> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    if crate::fetch::gate_check(url, false).is_err() {
+        return Ok(None);
+    }
+    let client = crate::fetch::build_client(proxy, false, Duration::from_secs(DL_DIRECT_TIMEOUT_SECS))?;
+    let head = match client.head(url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Ok(None), // HEAD 被拒/不支持/网络错 → 无法判定 → browser
+    };
+    let html_ct = head
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.to_ascii_lowercase().contains("html"))
+        .unwrap_or(false);
+    if html_ct || head.headers().get(reqwest::header::SET_COOKIE).is_some() {
+        return Ok(None); // cookie 挑战/HTML 登录墙嫌疑 → Chrome（profile 登录态正有用武之地）
+    }
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        // 预检通过但 GET 被掐（网络抖动/RST 常见）→ 与 HEAD 失败同语义回退 browser；此刻文件未创建零副作用
+        Err(e) => {
+            eprintln!("direct GET 失败（{e}），回退浏览器下载");
+            return Ok(None);
+        }
+    };
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .with_context(|| format!("创建文件失败: {}", path.display()))?;
+    let mut size: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("direct 下载中断")?;
+        file.write_all(&chunk).await.with_context(|| format!("写文件失败: {}", path.display()))?;
+        size += chunk.len() as u64;
+    }
+    file.flush().await.context("flush 下载文件失败")?;
+    Ok(Some(size))
 }
 
 
@@ -280,7 +416,28 @@ fn list_dir(dir: &Path) -> Result<HashSet<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::login_poll_decision;
+    use super::*;
+
+    /// i9a：-o 末段带扩展名 = 文件；纯目录名 = 目录；--output-file 优先；都缺省 = CWD 目录。
+    #[test]
+    fn resolve_dl_target_disambiguation() {
+        // -o 带扩展名 → 文件语义（dir = 其父目录）
+        let (dir, file) = resolve_dl_target(Some(Path::new("out/foo.exe")), None).unwrap();
+        assert_eq!(file.unwrap().file_name().unwrap(), "foo.exe");
+        assert!(dir.ends_with("out"), "dir: {}", dir.display());
+        // -o 纯目录名 → 目录语义（README 行为不变）
+        let (dir, file) = resolve_dl_target(Some(Path::new("out/dir")), None).unwrap();
+        assert!(file.is_none());
+        assert!(dir.ends_with("dir"), "dir: {}", dir.display());
+        // --output-file 显式文件，压过 -o
+        let (dir, file) = resolve_dl_target(Some(Path::new("outdir")), Some(Path::new("out/bin/file.bin"))).unwrap();
+        assert_eq!(file.unwrap().file_name().unwrap(), "file.bin");
+        assert!(dir.ends_with("bin"), "dir: {}", dir.display());
+        // 都不给 → CWD 目录
+        let (dir, file) = resolve_dl_target(None, None).unwrap();
+        assert!(file.is_none());
+        assert!(dir.is_absolute());
+    }
 
     /// M13 C1 bug fix: 登录后 URL 变化（跳到 dashboard）= 登录完成，退出循环。
     /// 模拟 evaluate 仍成功（dashboard 页 JS 正常）+ page 仍在列表（target_id 未变），

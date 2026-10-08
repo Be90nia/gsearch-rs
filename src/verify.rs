@@ -1,43 +1,150 @@
 //! M14-1A `verify <url>`：headless URL 健康检查（不启动 Chrome）。
 //!
 //! 传输层直接调系统 curl（Windows 10+ 自带 curl.exe，Schannel 后端 = OS 证书库真验证），
-//! HTTP 语义在本模块手写：状态行解析、redirect 链提取、405→GET 回退、错误分类。
+//! HTTP 语义在本模块手写：状态行解析、redirect 链提取、403/405→GET 回退、错误分类。
 //! ponytail: 上游指令原文是「std::net 手写 HTTP」，但验收要求 https 的 ssl_valid=true——
 //! 纯 TcpStream 无法完成 TLS 握手，依赖树亦无 rustls/native-tls；零新依赖约束下
 //! curl.exe 是唯一能真验 TLS 的路径（doctor 的 fetch_public_ip 有同款先例）。
 
+use std::fs;
+use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 
 use crate::types::VerifyReport;
 
 /// verify 总预算（含全部 redirect hop），对应 curl --max-time；轻量快查不拖累。
-const VERIFY_TIMEOUT_SECS: u64 = 5;
+/// 也是 `--timeout` 默认值（issue gsearch-rs-7qx：CDN 5-10s 抖动端点可调高）。
+pub const VERIFY_TIMEOUT_SECS: u64 = 5;
 /// redirect hop 上限，防 A→B→A 死循环把超时吃满。
 const MAX_REDIRECT_HOPS: u32 = 10;
 /// `-w` 输出分隔标记：stdout = 各 hop 响应头 dump + 本标记 + 最终 URL。
 const FINAL_URL_MARKER: &str = "__GSEARCH_FINAL__";
 
-/// `gsearch verify <url>`：HTTP HEAD（405 时回退 GET）→ 5 项报告 + 分类退出码。
-/// 退出码：0=OK / 2=404 / 3=SSL 失败 / 4=DNS 失败 / 5=超时 / 1=其他。
-pub fn cmd_verify(url: &str, json: bool, proxy: Option<&str>) -> Result<ExitCode> {
-    let started = Instant::now();
+/// `gsearch verify <url>...`：HTTP HEAD（403/405 回退 GET）→ 5 项报告 + 分类退出码。
+/// 退出码：0=OK / 2=404 / 3=SSL 失败 / 4=DNS 失败 / 5=超时 / 1=其他；批量全 OK 0 / 否则 1。
+pub fn cmd_verify(
+    urls: &[String],
+    json: bool,
+    proxy: Option<&str>,
+    timeout: u64,
+    urls_file: Option<&Path>,
+) -> Result<ExitCode> {
+    let mut targets: Vec<String> = urls.to_vec();
+    if let Some(f) = urls_file {
+        let content =
+            fs::read_to_string(f).with_context(|| format!("无法读取 urls 文件: {}", f.display()))?;
+        targets.extend(
+            content
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    match targets.as_slice() {
+        // 单 URL：行为/输出与旧版一致（向后兼容闸）
+        [one] => {
+            let probe = probe_url(one, proxy, timeout)?;
+            match probe.transport {
+                // 传输层失败沿用旧行为：仅 SSL 出报告，其余只出 stderr 分类行
+                Some((kind, curl_code)) => Ok(transport_exit(&probe, kind, curl_code, json)),
+                None => {
+                    print_probe(&probe, json);
+                    Ok(ExitCode::from(probe.verdict))
+                }
+            }
+        }
+        [] => anyhow::bail!("verify: 未提供任何 URL（参数为空或 urls 文件无有效行）"),
+        many => {
+            let probes = many
+                .iter()
+                .map(|u| {
+                    let p = probe_url(u, proxy, timeout)?;
+                    if let Some((kind, code)) = p.transport {
+                        eprintln!("verify {u}: {kind} (curl exit {code})");
+                    }
+                    Ok(p)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            print_batch(many, &probes, json);
+            // 批量退出码对齐 batch search（main.rs cmd_search_batch）：全 OK 0 / 部分失败 1 / 全失败 2
+            let all_ok = probes.iter().all(|p| p.verdict == 0);
+            let any_ok = probes.iter().any(|p| p.verdict == 0);
+            Ok(ExitCode::from(if all_ok {
+                0
+            } else if any_ok {
+                1
+            } else {
+                2
+            }))
+        }
+    }
+}
 
-    let (code, stdout) = {
-        let (code, stdout, _) = run_curl(&curl_args(url, proxy, true))?;
-        // 405 Method Not Allowed → 回退 GET 重测（spec 点名的 fallback）
-        if code == 0 && final_status(&stdout) == Some(405) {
-            let (code, stdout, _) = run_curl(&curl_args(url, proxy, false))?;
-            (code, stdout)
+/// 单条探测结果：报告 + 分类判定 + 输出元数据（标注/表格用）。
+struct Probe {
+    report: VerifyReport,
+    /// HEAD 被拒（403/405）后走了 GET 回退。
+    get_fallback: bool,
+    /// 分类退出码：0=OK / 2=404 / 3=SSL / 4=DNS / 5=超时 / 1=其他。
+    verdict: u8,
+    /// 传输层失败（未拿到 HTTP 响应）= Some((类别, curl exit code))。
+    transport: Option<(&'static str, i32)>,
+}
+
+impl Probe {
+    /// 探测方式标注；无回退时省略，保持旧输出结构不变。
+    fn probe_tag(&self) -> Option<&'static str> {
+        self.get_fallback.then_some("get-fallback")
+    }
+}
+
+/// JSON 元素 = VerifyReport 平铺 + 可选 probe 标注。
+#[derive(Serialize)]
+struct ProbeJson<'a> {
+    #[serde(flatten)]
+    report: &'a VerifyReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe: Option<&'static str>,
+}
+
+/// HEAD 探测被 403/405 拒 → GET（Range: bytes=0-0）重测一次再判定：
+/// Cloudflare 类反爬只拒 HEAD，连通本身正常，直接报状态不符是误判（issue gsearch-rs-02z）。
+fn should_get_fallback(curl_code: i32, stdout: &str) -> bool {
+    curl_code == 0 && matches!(final_status(stdout), Some(403) | Some(405))
+}
+
+fn probe_url(url: &str, proxy: Option<&str>, timeout: u64) -> Result<Probe> {
+    let started = Instant::now();
+    let (curl_code, stdout, get_fallback) = {
+        let (code, out, _) = run_curl(&curl_args(url, proxy, timeout, true))?;
+        if should_get_fallback(code, &out) {
+            let (code, out, _) = run_curl(&curl_args(url, proxy, timeout, false))?;
+            (code, out, true)
         } else {
-            (code, stdout)
+            (code, out, false)
         }
     };
 
-    if code != 0 {
-        return Ok(handle_transport_error(code, url, json, started));
+    if curl_code != 0 {
+        let verdict = classify_curl_exit(curl_code);
+        return Ok(Probe {
+            report: VerifyReport {
+                status: 0,
+                final_url: url.to_owned(),
+                redirect_chain: Vec::new(),
+                // 未拿到任何 HTTP 响应，TLS 状态无从谈起：按 false 上报（SSL 路径同旧值）
+                ssl_valid: false,
+                latency_ms: started.elapsed().as_millis() as u64,
+            },
+            get_fallback,
+            verdict,
+            transport: Some((transport_kind(verdict), curl_code)),
+        });
     }
 
     let (headers, mut final_url) = split_final_url(&stdout);
@@ -47,50 +154,101 @@ pub fn cmd_verify(url: &str, json: bool, proxy: Option<&str>) -> Result<ExitCode
     if final_url.is_empty() {
         final_url = url.to_owned();
     }
-    let report = VerifyReport {
-        status,
-        final_url,
-        redirect_chain: chain,
-        // https：握手+证书已由 curl/Schannel 验证通过；http：无握手即无异常。
-        ssl_valid: true,
-        latency_ms: started.elapsed().as_millis() as u64,
-    };
-    print_report(&report, json);
-    Ok(ExitCode::from(exit_for_status(status)))
+    Ok(Probe {
+        report: VerifyReport {
+            status,
+            final_url,
+            redirect_chain: chain,
+            // https：握手+证书已由 curl/Schannel 验证通过；http：无握手即无异常。
+            ssl_valid: true,
+            latency_ms: started.elapsed().as_millis() as u64,
+        },
+        get_fallback,
+        verdict: exit_for_status(status),
+        transport: None,
+    })
 }
 
-/// curl 传输失败（非 HTTP 响应）：分类退出码；SSL 失败仍出 ssl_valid=false 的报告。
-/// 不透传 curl 原始 stderr：中文 Windows 上 Schannel 报错是 GBK 本地化文本，
+/// curl 传输失败分类名：不透传原始 stderr——中文 Windows 上 Schannel 报错是 GBK 文本，
 /// 透传到 UTF-8 控制台会乱码；kind + curl exit code 已足够定位。
-fn handle_transport_error(code: i32, url: &str, json: bool, started: Instant) -> ExitCode {
-    let exit = classify_curl_exit(code);
-    if exit == 3 {
-        // spec：握手错误 ssl_valid=false。status=0 表示未拿到任何 HTTP 响应。
-        let report = VerifyReport {
-            status: 0,
-            final_url: url.to_owned(),
-            redirect_chain: Vec::new(),
-            ssl_valid: false,
-            latency_ms: started.elapsed().as_millis() as u64,
-        };
-        print_report(&report, json);
-    }
-    let kind = match exit {
+fn transport_kind(verdict: u8) -> &'static str {
+    match verdict {
         3 => "SSL 失败",
         4 => "DNS 失败",
         5 => "超时",
         _ => "网络错误",
-    };
-    eprintln!("verify {kind} (curl exit {code})");
-    ExitCode::from(exit)
+    }
+}
+
+/// 单 URL 传输层失败：仅 SSL 失败出 ssl_valid=false 的报告，其余只出 stderr 分类行。
+fn transport_exit(probe: &Probe, kind: &'static str, curl_code: i32, json: bool) -> ExitCode {
+    if probe.verdict == 3 {
+        print_report(&probe.report, json);
+    }
+    eprintln!("verify {kind} (curl exit {curl_code})");
+    ExitCode::from(probe.verdict)
+}
+
+fn print_probe(p: &Probe, json: bool) {
+    if !json {
+        print_report(&p.report, false);
+        if let Some(tag) = p.probe_tag() {
+            println!("probe:       {tag}");
+        }
+        return;
+    }
+    match p.probe_tag() {
+        // 无标注：直接序列化报告，与旧 VerifyReport 输出逐字节一致
+        // （flatten 走 serde_json::Map 会按字典序重排字段，旧结构不能走这条路）
+        None => print_json(&p.report),
+        Some(tag) => print_json(&ProbeJson {
+            report: &p.report,
+            probe: Some(tag),
+        }),
+    }
+}
+
+/// 批量输出：--json 为报告数组（元素含可选 probe 标注）；人读为对比表。
+fn print_batch(urls: &[String], probes: &[Probe], json: bool) {
+    if json {
+        let rows: Vec<ProbeJson> = probes
+            .iter()
+            .map(|p| ProbeJson {
+                report: &p.report,
+                probe: p.probe_tag(),
+            })
+            .collect();
+        print_json(&rows);
+        return;
+    }
+    let w = urls.iter().map(String::len).max().unwrap_or(3).max(3);
+    println!(
+        "{:<w$}  {:>6}  {:>5}  {:>10}",
+        "url", "status", "ssl", "latency_ms",
+        w = w
+    );
+    for (u, p) in urls.iter().zip(probes) {
+        println!(
+            "{:<w$}  {:>6}  {:>5}  {:>10}",
+            u,
+            p.report.status,
+            p.report.ssl_valid,
+            p.report.latency_ms,
+            w = w
+        );
+    }
+}
+
+fn print_json<T: Serialize>(v: &T) {
+    match serde_json::to_string_pretty(v) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("JSON 序列化失败: {e}"),
+    }
 }
 
 fn print_report(r: &VerifyReport, json: bool) {
     if json {
-        match serde_json::to_string_pretty(r) {
-            Ok(s) => println!("{s}"),
-            Err(e) => eprintln!("JSON 序列化失败: {e}"),
-        }
+        print_json(r);
     } else {
         println!("status:      {}", r.status);
         println!("final_url:   {}", r.final_url);
@@ -104,11 +262,11 @@ fn print_report(r: &VerifyReport, json: bool) {
     }
 }
 
-fn curl_args(url: &str, proxy: Option<&str>, head: bool) -> Vec<String> {
+fn curl_args(url: &str, proxy: Option<&str>, timeout: u64, head: bool) -> Vec<String> {
     let mut args = vec![
         "-sS".to_owned(),
         "--max-time".to_owned(),
-        VERIFY_TIMEOUT_SECS.to_string(),
+        timeout.to_string(),
         "-L".to_owned(),
         "--max-redirs".to_owned(),
         MAX_REDIRECT_HOPS.to_string(),
@@ -121,6 +279,10 @@ fn curl_args(url: &str, proxy: Option<&str>, head: bool) -> Vec<String> {
     ];
     if head {
         args.push("--head".to_owned());
+    } else {
+        // GET 探测只取首字节防大文件拉满；不认 Range 的站点由 -o NUL 兜底
+        args.push("-H".to_owned());
+        args.push("Range: bytes=0-0".to_owned());
     }
     if let Some(p) = proxy {
         args.push("--proxy".to_owned());
@@ -294,5 +456,69 @@ content-type: text/html\r\n\
         let (code, _, _) = run_curl(&args).expect("系统 curl 应可用");
         assert_eq!(code, 28, "回环不响应应在 1s 触发 --max-time，实际 curl exit {code}");
         assert_eq!(classify_curl_exit(code), 5);
+    }
+
+    #[test]
+    fn curl_args_honor_timeout_flag() {
+        let args = curl_args("https://x/", None, 10, true);
+        let i = args.iter().position(|a| a == "--max-time").unwrap();
+        assert_eq!(args[i + 1], "10");
+        // 默认值常量与旧硬编码一致（向后兼容闸）
+        assert_eq!(VERIFY_TIMEOUT_SECS, 5);
+    }
+
+    #[test]
+    fn get_probe_sends_range_and_drops_head() {
+        let get = curl_args("https://x/", None, 5, false);
+        assert!(!get.iter().any(|a| a == "--head"));
+        assert!(get.iter().any(|a| a == "Range: bytes=0-0"));
+        let head = curl_args("https://x/", None, 5, true);
+        assert!(head.iter().any(|a| a == "--head"));
+        assert!(!head.iter().any(|a| a == "Range: bytes=0-0"));
+    }
+
+    #[test]
+    fn get_fallback_on_403_and_405_only() {
+        let dump = |code: u16| format!("HTTP/1.1 {code}\r\n\r\n");
+        assert!(should_get_fallback(0, &dump(403)));
+        assert!(should_get_fallback(0, &dump(405)));
+        assert!(!should_get_fallback(0, &dump(200)));
+        assert!(!should_get_fallback(0, &dump(500)));
+        // 传输层失败（curl exit != 0）没有状态可判，不回退
+        assert!(!should_get_fallback(28, &dump(403)));
+    }
+
+    fn probe_fixture(get_fallback: bool) -> Probe {
+        Probe {
+            report: VerifyReport {
+                status: 200,
+                final_url: "https://x/".into(),
+                redirect_chain: vec![],
+                ssl_valid: true,
+                latency_ms: 7,
+            },
+            get_fallback,
+            verdict: 0,
+            transport: None,
+        }
+    }
+
+    /// 无回退时无 probe 标注 → print_probe 走旧 VerifyReport 直序列化路径（JSON 不变形）。
+    #[test]
+    fn no_fallback_probe_has_no_tag() {
+        let p = probe_fixture(false);
+        assert_eq!(p.probe_tag(), None);
+    }
+
+    #[test]
+    fn probe_json_marks_get_fallback() {
+        let p = probe_fixture(true);
+        let out = ProbeJson {
+            report: &p.report,
+            probe: p.probe_tag(),
+        };
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(s.contains(r#""probe":"get-fallback""#));
+        assert!(s.contains(r#""status":200"#));
     }
 }

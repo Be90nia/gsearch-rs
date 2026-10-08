@@ -102,8 +102,12 @@ pub async fn run_search(
     // M16/M17：SearXNG 纯 HTTP 源在此分流（shell 会话入口）。顶层 search 命令已在
     // cmd_search 惰性启动时先跑过 try_searxng 并直接调 run_search_on_page——此处不再
     // 重复查询（否则 SearXNG 双失败会打两遍回退 warn、白跑两轮 HTTP）。
-    if let Some(outcome) = try_searxng(&cfg).await {
-        return Ok(outcome);
+    match try_searxng(&cfg).await {
+        SearxngAttempt::Results(outcome) => return Ok(outcome),
+        // zc6：熔断（SearXNG 空 + Google:443 预检不通）。shell 没有结构化 status 可标，
+        // 报错文案带同款诊断行，不再空耗浏览器 30s 超时。
+        SearxngAttempt::CircuitBroken => return Err(anyhow!("{SEARXNG_CIRCUIT_MSG}")),
+        SearxngAttempt::NotConfigured | SearxngAttempt::FallbackGoogle => {}
     }
     let page = browser.new_page("about:blank").await?;
     run_search_on_page(browser, cfg, page, h_slot, human_solved).await
@@ -232,26 +236,63 @@ pub async fn run_search_on_page(
     })
 }
 
-/// M16：SearXNG 分流。未配置 searxng_url → None（直接走 Google）。
+/// M16：SearXNG 分流。未配置 searxng_url → NotConfigured（直接走 Google）。
 /// 翻页：pageno 从 1 递增，凑满 limit / 空页 / 打满 MAX_PAGES 收口。
 /// 每页先试 format=json；Err 或零结果时降级抓 HTML 结果页（同页重试一次），
 /// 都空才按空页语义收口。provider 语义不变（"searxng" 涵盖 json/html 两种来源）。
-///   * 成功凑到结果 → Some(Results, provider="searxng")
-///   * json+html 双失败/双空：已有部分结果自然终止，否则 warn 一行后 None
-///     （回退 Google 直爬）。
-pub async fn try_searxng(cfg: &SearchConfig) -> Option<SearchOutcome> {
-    let base = crate::config::load().searxng_url.clone()?;
+///
+/// zc6：json+html 双空/双失败不再无条件回退——先 TCP 预检 google:443（1.5s）。
+/// IP 正常时 FallbackGoogle（老行为不变）；被墙/断网时段 CircuitBroken 熔断，
+/// 不再空耗 30s 等浏览器超时。
+#[derive(Debug)]
+pub enum SearxngAttempt {
+    /// 未配置 searxng_url——用户没要 SearXNG，直接 Google 直爬（不预检）。
+    NotConfigured,
+    /// SearXNG 出结果（provider=searxng）。
+    Results(SearchOutcome),
+    /// SearXNG 空/失败，但 Google 预检通过——按老行为回退（回退 warn 已打）。
+    FallbackGoogle,
+    /// 熔断：SearXNG 空 + Google 预检不通——回退必然空耗，直接返回（诊断行已打 stderr）。
+    CircuitBroken,
+}
+
+/// zc6：熔断诊断行（stderr，一行原则；元审计豁免未来任何静默策略）。
+pub const SEARXNG_CIRCUIT_MSG: &str =
+    "SearXNG 零结果已熔断（基础设施降级，非查询无资料）；建议换短 query/跑 doctor/直接 fetch 已知源";
+
+pub async fn try_searxng(cfg: &SearchConfig) -> SearxngAttempt {
+    let Some(base) = crate::config::load().searxng_url.clone() else {
+        return SearxngAttempt::NotConfigured;
+    };
     match searxng_collect(&base, cfg).await {
-        Ok(results) => Some(SearchOutcome::Results {
+        Ok(results) => SearxngAttempt::Results(SearchOutcome::Results {
             results,
             captcha_solved: false,
             provider: "searxng",
         }),
         Err(reason) => {
-            warn_searxng_fallback(&base, &reason);
-            None
+            if google_fallback_precheck().await {
+                warn_searxng_fallback(&base, &reason);
+                SearxngAttempt::FallbackGoogle
+            } else {
+                eprintln!("{SEARXNG_CIRCUIT_MSG}");
+                SearxngAttempt::CircuitBroken
+            }
         }
     }
+}
+
+/// zc6：Google 回退预检——TCP 连 www.google.com:443，1.5s 封顶（与 doctor 第 5 项同款探测）。
+/// ponytail: 直连探测不感知 GSEARCH_PROXY（显式代理场景可能假熔断）；本部署走透明代理直出，无此形态。
+async fn google_fallback_precheck() -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(1500),
+            tokio::net::TcpStream::connect(("www.google.com", 443)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 /// SearXNG-only 收集内核（单查询与 batch 共用）：翻页凑 limit。

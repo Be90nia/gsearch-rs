@@ -15,7 +15,8 @@ pub fn print_text(results: &[SearchResult]) {
         let title = strip_ansi(&r.title);
         let url = strip_ansi(&r.url);
         let snippet: String = strip_ansi(&r.snippet).chars().take(SNIPPET_MAX_CHARS).collect();
-        println!("{}. {}\n   {}\n   {}\n", i + 1, title, url, snippet);
+        // nw4：标题行尾 [class] 来源标注（与 --json domain_class 同源），AI/人一眼挑权威源
+        println!("{}. {} [{}]\n   {}\n   {}\n", i + 1, title, r.domain_class, url, snippet);
     }
 }
 

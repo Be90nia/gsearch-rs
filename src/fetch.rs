@@ -25,6 +25,9 @@ const SHELL_MIN_CHARS: usize = 500;
 const MAX_REDIRECTS: usize = 10;
 /// 响应体硬上限（Important-3）：超过此字节数立即停下载，避免 OOM/zip-bomb。
 const FETCH_BODY_LIMIT: usize = 10 * 1024 * 1024;
+/// fetch batch 并发上限（防目标站/出口压力）。
+const FETCH_CONCURRENCY: usize = 5;
+
 /// `fetch <url>` 选项集（与 general::BrowseOpts 同风格）。
 #[derive(Debug, Clone, Default)]
 pub struct FetchOpts {
@@ -33,6 +36,9 @@ pub struct FetchOpts {
     pub proxy: Option<String>,
     /// 放行私网（loopback / RFC1918 / link-local）。默认 false：SSRF 门。
     pub allow_private: bool,
+    /// 逗号分隔 CSS selector（如 "main,article"）：命中时取首个命中容器的正文并跳过 JS 壳判定；
+    /// 未命中回退全文提取，--json 在 meta.include_hit=false 标注（用户明确知道要什么，壳判定不适用）。
+    pub include: Option<String>,
 }
 
 /// scheme 前缀校验（大小写不敏感）。非 http(s) 一律拒（fetch 子命令的契约定位 = 互联网只读）。
@@ -90,7 +96,7 @@ fn is_ula_v6(v6: Ipv6Addr) -> bool {
 
 /// 放行判定：--allow-private flag 或 GSEARCH_FETCH_ALLOW_PRIVATE=1。env 走值语义（仅 "1"/"true"
 /// 生效）——presence 语义会让 `=0`/空值静默开洞。
-fn allow_private_requested(flag: bool) -> bool {
+pub(crate) fn allow_private_requested(flag: bool) -> bool {
     flag
         || std::env::var("GSEARCH_FETCH_ALLOW_PRIVATE")
             .map(|v| v.trim() == "1" || v.eq_ignore_ascii_case("true"))
@@ -99,7 +105,7 @@ fn allow_private_requested(flag: bool) -> bool {
 
 /// 私网门判定核心：URL → host → IP → 私网判定。返回 (host, ip, 是否私网)。
 /// allow_private=true 时仍解析返回——调用方需要私网性决定是否放行内网明文 http。
-fn gate_check(url: &str, allow_private: bool) -> Result<(String, IpAddr, bool)> {
+pub(crate) fn gate_check(url: &str, allow_private: bool) -> Result<(String, IpAddr, bool)> {
     let scheme_end = url.find("://").ok_or_else(|| anyhow!("URL 无 scheme: {url}"))?;
     let after_scheme = &url[scheme_end + 3..];
     // host 提取：IPv6 字面量（[...]）vs 主机名（首个 '/?#:' 截断）
@@ -141,26 +147,12 @@ fn accumulate_chunk(mut buf: Vec<u8>, chunk: &[u8], limit: usize) -> (Vec<u8>, b
     }
 }
 
-/// `gsearch fetch <url>`：GET → 轻量正文提取 → 人读 / --json 输出。
-/// 退出码：0 成功；1 JS 壳（需渲染）/ 私网门拒（由 main 统一打印，HTTP 错误经 anyhow → exit 1）。
-pub async fn cmd_fetch(url: &str, opts: &FetchOpts) -> Result<ExitCode> {
-    let started = Instant::now();
-    if !http_or_https_scheme(url) {
-        return Err(anyhow!("fetch 仅支持 http/https URL（拒绝: {url}）"));
-    }
-    let allow = allow_private_requested(opts.allow_private);
-    // SSRF 门先行（含 DNS 解析）：私网 URL 无论 scheme 默认在这里被拒（错误含「私网」）。
-    let (_host, _ip, is_priv) = gate_check(url, allow)?;
-    // 公网明文 http 一律拒（防降级 + 重定向中转 SSRF）；私网 http 仅在显式放行时允许
-    // （内网端点常见 http-only，allow_private 即「自担风险进内网」的完整语义）。
-    if url.trim_start().to_ascii_lowercase().starts_with("http://") && !(allow && is_priv) {
-        return Err(anyhow!(
-            "fetch 仅支持 https：公网明文 http 已禁用（防降级与重定向 SSRF 中转）。如确需内网 http 页面，请传 --allow-private 或设置 GSEARCH_FETCH_ALLOW_PRIVATE=1: {url}"
-        ));
-    }
+/// fetch/dl 共用客户端：UA + 总超时 + 重定向每跳 SSRF 门 + 可选显式代理。
+/// 门逻辑与单条/批量/并发数无关——每个 client 自带 Policy::custom，批量下每 URL 每跳照走。
+pub(crate) fn build_client(proxy: Option<&str>, allow: bool, timeout: Duration) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent(format!("gsearch/{}", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .timeout(timeout)
         // 9re(c)：每跳 host 都过私网门 + scheme 规则，防重定向绕过（替代旧 https_only 全局开关）。
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
@@ -183,10 +175,28 @@ pub async fn cmd_fetch(url: &str, opts: &FetchOpts) -> Result<ExitCode> {
                 _ => attempt.error("fetch 仅支持 https：明文 http 已禁用（重定向链同样禁止）"),
             }
         }));
-    if let Some(p) = &opts.proxy {
+    if let Some(p) = proxy {
         builder = builder.proxy(reqwest::Proxy::all(p).context("代理 URL 无效")?);
     }
-    let client = builder.build().context("构建 HTTP 客户端失败")?;
+    builder.build().context("构建 HTTP 客户端失败")
+}
+
+/// 单 URL 拉取 + 提取（不含输出）。批量与单条共用；每 URL 独立过 SSRF 门（含重定向每跳）。
+async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
+    if !http_or_https_scheme(url) {
+        return Err(anyhow!("fetch 仅支持 http/https URL（拒绝: {url}）"));
+    }
+    let allow = allow_private_requested(opts.allow_private);
+    // SSRF 门先行（含 DNS 解析）：私网 URL 无论 scheme 默认在这里被拒（错误含「私网」）。
+    let (_host, _ip, is_priv) = gate_check(url, allow)?;
+    // 公网明文 http 一律拒（防降级 + 重定向中转 SSRF）；私网 http 仅在显式放行时允许
+    // （内网端点常见 http-only，allow_private 即「自担风险进内网」的完整语义）。
+    if url.trim_start().to_ascii_lowercase().starts_with("http://") && !(allow && is_priv) {
+        return Err(anyhow!(
+            "fetch 仅支持 https：公网明文 http 已禁用（防降级与重定向 SSRF 中转）。如确需内网 http 页面，请传 --allow-private 或设置 GSEARCH_FETCH_ALLOW_PRIVATE=1: {url}"
+        ));
+    }
+    let client = build_client(opts.proxy.as_deref(), allow, Duration::from_secs(FETCH_TIMEOUT_SECS))?;
 
     let resp = client
         .get(url)
@@ -224,6 +234,24 @@ pub async fn cmd_fetch(url: &str, opts: &FetchOpts) -> Result<ExitCode> {
 
     let limit = read_max_chars();
     let mut fetched = process_html(url, &html, is_html, limit);
+    // --include：命中容器则用容器内 HTML 重新提取正文（title 仍取页面级）；未命中回退全文提取。
+    if let Some(include) = &opts.include {
+        fetched.include_hit = Some(false);
+        if is_html
+            && let Some(inner) = extract_with_include(&html, include)?
+        {
+            let raw = extract_text(&inner);
+            let (text, t, o) = cap_chars(&raw, limit);
+            fetched = Fetched {
+                url: fetched.url,
+                title: fetched.title,
+                text,
+                truncated: t,
+                omitted: o,
+                include_hit: Some(true),
+            };
+        }
+    }
     // 字节上限触发的截断：meta.truncated=true；omitted 仅作下界（实际丢多少未知，至少 FETCH_BODY_LIMIT 已读）
     if truncated {
         fetched.truncated = true;
@@ -231,32 +259,114 @@ pub async fn cmd_fetch(url: &str, opts: &FetchOpts) -> Result<ExitCode> {
         fetched.omitted = fetched.omitted.saturating_add(FETCH_BODY_LIMIT);
     }
 
-    if is_html && looks_like_js_shell(&fetched.text, &html) {
-        eprintln!("该页无服务端正文（JS 壳），需渲染：用 gsearch browse {url}");
-        return Ok(ExitCode::from(1));
+    // 元审计约束：--include 命中 = 用户明确知道要什么，跳过 JS 壳判定。
+    if fetched.include_hit != Some(true) && is_html && looks_like_js_shell(&fetched.text, &html) {
+        return Ok(FetchOne::JsShell);
+    }
+    Ok(FetchOne::Done(fetched))
+}
+
+/// `gsearch fetch <url>...`：GET → 轻量正文提取 → 人读 / --json 输出。
+/// 单 URL = 原行为；多 URL = batch 并发（上限 FETCH_CONCURRENCY、单条失败不阻塞、
+/// 退出码 0 全成功 / 1 部分失败 / 2 全失败，对齐 search batch）。
+/// 退出码：0 成功；1 JS 壳（需渲染）/ 私网门拒（由 main 统一打印，HTTP 错误经 anyhow → exit 1）。
+pub async fn cmd_fetch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> {
+    let started = Instant::now();
+    if let [url] = urls {
+        return match fetch_one(url, opts).await {
+            Ok(FetchOne::Done(fetched)) => {
+                if opts.json {
+                    println!("{}", fetched_json(&fetched));
+                } else {
+                    if fetched.truncated {
+                        eprintln!("注意：正文超上限已截断（省略 {} 字符；--json 输出在 meta 字段标注）", fetched.omitted);
+                    }
+                    println!("=== {} | {} ===\n{}", fetched.url, fetched.title, fetched.text);
+                }
+                tracing::debug!("fetch 完成: {url} ({}ms)", started.elapsed().as_millis());
+                Ok(ExitCode::SUCCESS)
+            }
+            Ok(FetchOne::JsShell) => {
+                eprintln!("该页无服务端正文（JS 壳），需渲染：用 gsearch browse {url}");
+                Ok(ExitCode::from(1))
+            }
+            Err(e) => Err(e),
+        };
+    }
+    cmd_fetch_batch(urls, opts).await
+}
+
+/// 批量：并发上限 5（防目标站/出口压力），buffered 保持输入序；每条独立过 SSRF 门（含重定向每跳）。
+async fn cmd_fetch_batch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> {
+    use futures::stream::{StreamExt, iter};
+    let fetched: Vec<(String, Result<FetchOne>)> = iter(urls.iter().cloned())
+        .map(|u| async move {
+            let r = fetch_one(&u, opts).await;
+            (u, r)
+        })
+        .buffered(FETCH_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut entries = Vec::with_capacity(fetched.len());
+    let mut ok_count = 0usize;
+    for (url, result) in &fetched {
+        match result {
+            Ok(FetchOne::Done(f)) => {
+                ok_count += 1;
+                let mut v = fetched_json(f);
+                v["status"] = serde_json::json!("ok");
+                entries.push(v);
+            }
+            Ok(FetchOne::JsShell) => entries.push(serde_json::json!({
+                "url": url,
+                "status": "error",
+                "message": format!("该页无服务端正文（JS 壳），需渲染：用 gsearch browse {url}"),
+            })),
+            Err(e) => {
+                let status = if e.to_string().contains("私网") { "private_blocked" } else { "error" };
+                entries.push(serde_json::json!({ "url": url, "status": status, "message": format!("{e:#}") }));
+            }
+        }
     }
 
+    let total = fetched.len();
     if opts.json {
-        // 与 read/browse 同契约：载荷 + meta{truncated, omitted, content_untrusted:true}
-        let v = serde_json::json!({
-            "url": fetched.url,
-            "title": fetched.title,
-            "text": fetched.text,
-            "meta": {
-                "truncated": fetched.truncated,
-                "omitted": fetched.omitted,
-                "content_untrusted": true,
-            },
-        });
-        println!("{v}");
+        // 对齐 search batch：裸数组、无外层信封，单条失败不阻塞数组整体。
+        println!("{}", serde_json::to_string_pretty(&entries)?);
     } else {
-        if fetched.truncated {
-            eprintln!("注意：正文超上限已截断（省略 {} 字符；--json 输出在 meta 字段标注）", fetched.omitted);
+        for (i, (url, result)) in fetched.iter().enumerate() {
+            match result {
+                Ok(FetchOne::Done(f)) => println!("=== [{i}/{total}] {} | {} ===\n{}", url, f.title, f.text),
+                Ok(FetchOne::JsShell) => println!(
+                    "=== [{i}/{total}] {url} ===\n出错: 该页无服务端正文（JS 壳），需渲染：用 gsearch browse {url}"
+                ),
+                Err(e) => println!("=== [{i}/{total}] {url} ===\n出错: {e:#}"),
+            }
         }
-        println!("=== {} | {} ===\n{}", fetched.url, fetched.title, fetched.text);
     }
-    tracing::debug!("fetch 完成: {url} ({}ms)", started.elapsed().as_millis());
-    Ok(ExitCode::SUCCESS)
+    eprintln!("batch 完成：{ok_count}/{total} 条成功");
+    let code = if ok_count == total { 0 } else if ok_count == 0 { 2 } else { 1 };
+    Ok(ExitCode::from(code))
+}
+
+/// 单条 JSON 载荷（url/title/text/meta{truncated, omitted, content_untrusted}）。
+/// meta.include_hit 仅在用过 --include 时出现——不带 flag 的老输出结构不变。
+fn fetched_json(f: &Fetched) -> serde_json::Value {
+    let mut meta = serde_json::json!({
+        "truncated": f.truncated,
+        "omitted": f.omitted,
+        "content_untrusted": true,
+    });
+    if let Some(hit) = f.include_hit {
+        meta["include_hit"] = serde_json::json!(hit);
+    }
+    serde_json::json!({
+        "url": f.url,
+        "title": f.title,
+        "text": f.text,
+        "meta": meta,
+    })
 }
 
 /// 提取产物（url 原样带回，方便 --json 消费方对账）。
@@ -266,6 +376,14 @@ struct Fetched {
     text: String,
     truncated: bool,
     omitted: usize,
+    /// --include 状态：None=未用 --include；Some(true)=selector 命中容器；Some(false)=未命中回退全文。
+    include_hit: Option<bool>,
+}
+
+/// 单 URL fetch 结果：Done = 正文已提取；JsShell = JS 壳需渲染（单条 exit 1 / 批量记 error）。
+enum FetchOne {
+    Done(Fetched),
+    JsShell,
 }
 
 /// 纯函数：html → 提取 + 截断（limit 注入，离线单测不碰配置）。
@@ -279,7 +397,7 @@ fn process_html(url: &str, html: &str, is_html: bool, limit: usize) -> Fetched {
         collapse_blank(html.to_string())
     };
     let (text, truncated, omitted) = cap_chars(&raw, limit);
-    Fetched { url: url.to_string(), title, text, truncated, omitted }
+    Fetched { url: url.to_string(), title, text, truncated, omitted, include_hit: None }
 }
 
 /// JS 壳判定：正文 < 500 字符 **且** html 含 SPA 挂载点标记（root/app/__next 等）。
@@ -391,6 +509,20 @@ fn extract_title(html: &str) -> String {
     decode_entities(html[body_from..body_from + end].trim())
 }
 
+/// --include：逗号分隔 selector 依序试（scraper 解析），返回首个命中元素的 inner_html；全未命中 → None。
+/// selector 语法错误 → Err：用户显式输入拼错了要报错，静默跳过会伪装成"未命中回退全文"。
+fn extract_with_include(html: &str, include: &str) -> Result<Option<String>> {
+    use scraper::{Html, Selector};
+    let doc = Html::parse_document(html);
+    for sel in include.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let selector = Selector::parse(sel).map_err(|e| anyhow!("CSS selector 无效: {sel:?} ({e})"))?;
+        if let Some(el) = doc.select(&selector).next() {
+            return Ok(Some(el.inner_html()));
+        }
+    }
+    Ok(None)
+}
+
 /// 常见命名实体 + 十/十六进制数字实体解码；未知实体原样保留（不破坏正文）。
 fn decode_entities(s: &str) -> String {
     if !s.contains('&') {
@@ -441,6 +573,21 @@ fn decode_entities(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// --include：命中容器取 inner_html；逗号分隔依序试；未命中 None；selector 语法错误 Err。
+    #[test]
+    fn extract_with_include_hits_and_falls_back() {
+        let html = "<html><head><title>T</title></head><body>\
+                    <nav>菜单 链接</nav><main><h1>正文标题</h1><p>第一段</p></main></body></html>";
+        // article 不存在 → 依序命中 main：只取容器内正文
+        let got = extract_with_include(html, "article,main").unwrap().unwrap();
+        assert!(got.contains("正文标题") && got.contains("第一段"), "got: {got}");
+        assert!(!got.contains("菜单"), "nav 内容不应混入: {got}");
+        // 全未命中 → None（调用方回退全文）
+        assert!(extract_with_include(html, "article,aside").unwrap().is_none());
+        // selector 语法错误 → Err（不伪装成"未命中"）
+        assert!(extract_with_include(html, "main[").is_err());
+    }
 
     /// extract_text：script/style 连内容删除、标签剥壳、块级换行、空白规整。
     #[test]

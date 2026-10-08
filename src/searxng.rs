@@ -105,10 +105,14 @@ fn parse(text: &str) -> Result<Vec<SearchResult>> {
     Ok(body
         .results
         .into_iter()
-        .map(|r| SearchResult {
-            title: r.title,
-            url: r.url,
-            snippet: r.content,
+        .map(|r| {
+            let domain_class = crate::util::domain_class(&r.url);
+            SearchResult {
+                title: r.title,
+                url: r.url,
+                snippet: r.content,
+                domain_class,
+            }
         })
         .collect())
 }
@@ -160,10 +164,13 @@ fn extract_articles(doc: &Html, article: &Selector, base_url: &str) -> Vec<Searc
             continue;
         };
         let snippet = art.select(&content).next().map(|c| text_of(&c)).unwrap_or_default();
+        let url = absolutize(a.value().attr("href").unwrap_or_default().trim(), base_url);
+        let domain_class = crate::util::domain_class(&url);
         out.push(SearchResult {
             title: text_of(&a),
-            url: absolutize(a.value().attr("href").unwrap_or_default().trim(), base_url),
+            url,
             snippet,
+            domain_class,
         });
     }
     out
@@ -176,10 +183,13 @@ fn extract_walk(doc: &Html, base_url: &str) -> Vec<SearchResult> {
     let mut pending = false; // 最近一条结果还没配到 snippet
     for el in doc.select(&walk) {
         if el.value().name() == "a" {
+            let url = absolutize(el.value().attr("href").unwrap_or_default().trim(), base_url);
+            let domain_class = crate::util::domain_class(&url);
             out.push(SearchResult {
                 title: text_of(&el),
-                url: absolutize(el.value().attr("href").unwrap_or_default().trim(), base_url),
+                url,
                 snippet: String::new(),
+                domain_class,
             });
             pending = true;
         } else if pending {
@@ -189,6 +199,49 @@ fn extract_walk(doc: &Html, base_url: &str) -> Vec<SearchResult> {
         }
     }
     out
+}
+
+/// ptb：查询级健康探测——`GET {base}/search?q=probe&format=json`。
+/// doctor 用它抓「TCP 活但查询零结果」盲区（引擎降级 / 出口 IP 信誉嫌疑）。
+/// UA 固定 gsearch/0.2.9：SearXNG 对 curl/reqwest 默认 UA 有超时假象（9-18 实证），先换 UA 再判死活。
+#[derive(Debug)]
+pub struct SearxngProbe {
+    pub http_status: u16,
+    pub results: usize,
+    pub unresponsive_engines: usize,
+}
+
+#[derive(Deserialize)]
+struct ProbeResponse {
+    #[serde(default)]
+    results: Vec<serde_json::Value>,
+    // 实测元素是 [engine, error] 数组对而非字符串——只数个数，不解构内容
+    #[serde(default, deserialize_with = "null_as_default")]
+    unresponsive_engines: Vec<serde_json::Value>,
+}
+
+/// 返回 Err = 请求失败或响应非 JSON（format=json 未启用 / 实例挂）。
+pub async fn probe(base_url: &str) -> Result<SearxngProbe, String> {
+    let url = format!("{}/search?q=probe&format=json", base_url.trim_end_matches('/'));
+    let resp = SHARED_CLIENT
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, concat!("gsearch/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|e| format!("{e}"))?;
+    let http_status = resp.status().as_u16();
+    let text = resp.text().await.map_err(|e| format!("HTTP {http_status} 读体失败: {e}"))?;
+    let body: ProbeResponse = serde_json::from_str(&text).map_err(|e| {
+        // 带响应头 120 字符：区分「format=json 未启用」与「风控/限流 HTML 挑战页」（后者 200 也可能）
+        let head: String = text.chars().take(120).collect();
+        format!("HTTP {http_status} 响应非 JSON: {e}；响应头: {head}")
+    })?;
+    Ok(SearxngProbe {
+        http_status,
+        results: body.results.len(),
+        unresponsive_engines: body.unresponsive_engines.len(),
+    })
 }
 
 #[cfg(test)]

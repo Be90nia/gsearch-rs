@@ -7,6 +7,9 @@ pub struct SearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
+    /// nw4：来源类型标注（URL host 启发式：docs/github/wikipedia/blog/forum/video/news/qa/other）。
+    /// 零网络零猜测——未命中一律 other。装配处统一走 util::domain_class。
+    pub domain_class: &'static str,
 }
 
 /// M14-1B：给 agent 用的 self-describing JSON 头部。`--json` 输出现在长这样：
@@ -16,19 +19,27 @@ pub struct SearchResult {
 /// 字段保持扁平、与 schema spec 一一对应；新增字段请追加到末尾（serde 顺序即 JSON key 顺序）。
 #[derive(Serialize, Clone, Debug)]
 pub struct MetaOutput {
+    #[serde(skip_serializing_if = "skip_compact_static")]
     pub tool: &'static str,
+    #[serde(skip_serializing_if = "skip_compact_static")]
     pub version: &'static str,
     /// 仅 search 命令填查询串；browse / dl 留空串。
     pub query: String,
+    #[serde(skip_serializing_if = "skip_compact_str")]
     /// `~/.gsearch/profiles/<name>/` 的末段名（未设 GSEARCH_PROFILE 时为 "default"）。
     pub profile: String,
+    #[serde(skip_serializing_if = "skip_compact_str")]
     /// 浏览器大类："Chrome" 或 "Edge"。
     pub browser_kind: String,
+    #[serde(skip_serializing_if = "skip_compact_str")]
     /// 浏览器可执行文件绝对路径。
     pub browser_path: String,
+    #[serde(skip_serializing_if = "skip_compact_opt")]
     /// 代理 URL；直连时为 None → JSON null。
     pub proxy: Option<String>,
+    #[serde(skip_serializing_if = "skip_compact_bool")]
     pub humanize: bool,
+    #[serde(skip_serializing_if = "skip_compact_usize")]
     pub limit: usize,
     /// 从启动到产出结果的总耗时（毫秒）。
     pub elapsed_ms: u128,
@@ -39,6 +50,35 @@ pub struct MetaOutput {
     pub provider: String,
     /// 时间过滤回显（--recency 的原始值）；未传时 None → JSON null（同 proxy 风格）。
     pub recency: Option<String>,
+}
+
+// 6dp：`--compact-meta` 压缩开关。skip 判定读进程级标志——serde 的 skip_serializing_if
+// 拿不到 self，全局 AtomicBool 是最小改动（构造方零改动、保留字段 JSON 顺序不变）。
+static COMPACT_META: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 6dp：设置 `--compact-meta` 生效值（flag && !debug，main 在派发前算好传入）。
+/// debug 日志开启强制全量——元审计硬约束（compact 与 stderr 静默同开 = 排障现场双失）。
+pub fn set_compact_meta(effective: bool) {
+    COMPACT_META.store(effective, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn compact_on() -> bool {
+    COMPACT_META.load(std::sync::atomic::Ordering::Relaxed)
+}
+fn skip_compact_static(_: &'static str) -> bool {
+    compact_on()
+}
+fn skip_compact_str(_: &String) -> bool {
+    compact_on()
+}
+fn skip_compact_opt(_: &Option<String>) -> bool {
+    compact_on()
+}
+fn skip_compact_bool(_: &bool) -> bool {
+    compact_on()
+}
+fn skip_compact_usize(_: &usize) -> bool {
+    compact_on()
 }
 
 /// M14-1B：`--json` 输出的统一信封，`results` 是真正的载荷（Vec 或 AdaptiveRead）。
@@ -54,6 +94,10 @@ pub enum RunStatus {
     Ok,
     CaptchaRequired,
     CaptchaTimeout,
+    /// zc6：SearXNG json+html 双空且 Google:443 预检不通——熔断快速失败。
+    /// 元审计硬约束：必须是这个值而非 error（基础设施降级 ≠ 查询无资料 ≠ 出错），
+    /// provider 保持 searxng，防 agent 把熔断误读为「该话题无资料」。
+    SearxngDegraded,
     #[default]
     Error,
 }
@@ -110,6 +154,7 @@ mod tests {
             title: "T".into(),
             url: "https://example.com/".into(),
             snippet: "S".into(),
+            domain_class: "other",
         }]
     }
 
@@ -197,6 +242,32 @@ mod tests {
         m.query = String::new();
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"query\":\"\""), "browse/dl query 应为空串: {s}");
+    }
+
+    /// zc6：熔断状态序列化 snake_case（元审计硬约束：searxng_degraded 而非 error）。
+    #[test]
+    fn searxng_degraded_serializes_snake_case() {
+        let env = OutputEnvelope::<Vec<SearchResult>> {
+            meta: sample_meta(),
+            run: RunStatusInfo {
+                status: RunStatus::SearxngDegraded,
+                captcha_solved: false,
+                message: "x".into(),
+            },
+            results: vec![],
+        };
+        let s = serde_json::to_string(&env).unwrap();
+        assert!(s.contains("\"status\":\"searxng_degraded\""), "{s}");
+    }
+
+    /// nw4：domain_class 追加在 SearchResult 末尾（serde 顺序 = key 顺序契约）。
+    #[test]
+    fn search_result_appends_domain_class_last() {
+        let s = serde_json::to_string(&sample_results()[0]).unwrap();
+        assert!(
+            s.ends_with(r#""domain_class":"other"}"#),
+            "domain_class 应为末键: {s}"
+        );
     }
 
     /// batch 契约（issue gsearch-rs-doh）：元素含 query/status/message/meta/results 五键，
