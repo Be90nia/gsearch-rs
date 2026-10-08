@@ -5,8 +5,9 @@
 //!
 //! 安全门（Important-1 / 2）：
 //! - 默认拒绝私网（loopback / RFC1918 / link-local / IPv6 ::1 + fc00::/7）；
-//!   放行通过 `--allow-private` 或 `GSEARCH_FETCH_ALLOW_PRIVATE=1`。
-//! - 重定向强制 https-only（builder.https_only(true)），禁止 https→http 降级与跨 scheme 转 SSRF。
+//!   放行通过 `--allow-private` 或 `GSEARCH_FETCH_ALLOW_PRIVATE=1`（=1 值语义）。
+//! - scheme 规则与私网门在重定向每跳由 Policy::custom 强制（9re，防重定向绕过）：
+//!   公网强制 https；私网 http 仅显式放行时允许（内网端点常见 http-only）。
 
 use std::net::{IpAddr, Ipv6Addr, ToSocketAddrs};
 use std::process::ExitCode;
@@ -87,11 +88,18 @@ fn is_ula_v6(v6: Ipv6Addr) -> bool {
     (first & 0xfe00) == 0xfc00
 }
 
-/// 私网门：URL → host → IP → 私网判定；放行 = allow_private 或 GSEARCH_FETCH_ALLOW_PRIVATE=1。
-fn gate_private(url: &str, allow_private: bool) -> Result<()> {
-    if allow_private || std::env::var_os("GSEARCH_FETCH_ALLOW_PRIVATE").is_some() {
-        return Ok(());
-    }
+/// 放行判定：--allow-private flag 或 GSEARCH_FETCH_ALLOW_PRIVATE=1。env 走值语义（仅 "1"/"true"
+/// 生效）——presence 语义会让 `=0`/空值静默开洞。
+fn allow_private_requested(flag: bool) -> bool {
+    flag
+        || std::env::var("GSEARCH_FETCH_ALLOW_PRIVATE")
+            .map(|v| v.trim() == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+/// 私网门判定核心：URL → host → IP → 私网判定。返回 (host, ip, 是否私网)。
+/// allow_private=true 时仍解析返回——调用方需要私网性决定是否放行内网明文 http。
+fn gate_check(url: &str, allow_private: bool) -> Result<(String, IpAddr, bool)> {
     let scheme_end = url.find("://").ok_or_else(|| anyhow!("URL 无 scheme: {url}"))?;
     let after_scheme = &url[scheme_end + 3..];
     // host 提取：IPv6 字面量（[...]）vs 主机名（首个 '/?#:' 截断）
@@ -107,12 +115,13 @@ fn gate_private(url: &str, allow_private: bool) -> Result<()> {
         &after_scheme[..host_end]
     };
     let ip = resolve_host(host)?;
-    if is_private_ip(ip) {
+    let private = is_private_ip(ip);
+    if private && !allow_private {
         return Err(anyhow!(
             "fetch 拒绝私网地址 {ip}（host={host}）。如确需内网，请传 --allow-private 或设置 GSEARCH_FETCH_ALLOW_PRIVATE=1"
         ));
     }
-    Ok(())
+    Ok((host.to_string(), ip, private))
 }
 
 /// 响应体累积（Important-3 字节上限）：把 chunk 接进 buf，超 limit 即截断到 limit 并报告 hit。
@@ -136,23 +145,44 @@ fn accumulate_chunk(mut buf: Vec<u8>, chunk: &[u8], limit: usize) -> (Vec<u8>, b
 /// 退出码：0 成功；1 JS 壳（需渲染）/ 私网门拒（由 main 统一打印，HTTP 错误经 anyhow → exit 1）。
 pub async fn cmd_fetch(url: &str, opts: &FetchOpts) -> Result<ExitCode> {
     let started = Instant::now();
-    // 明文 http 在下方 https_only(true) 会被 reqwest 以 builder error 拒掉——报错难懂，
-    // 前置拦截给出人话（含禁用理由）。
-    if url.trim_start().to_ascii_lowercase().starts_with("http://") {
-        return Err(anyhow!(
-            "fetch 仅支持 https：明文 http 已禁用（防降级与重定向 SSRF 中转）。如确需内网 http 页面，请用 gsearch browse（需浏览器）: {url}"
-        ));
-    }
     if !http_or_https_scheme(url) {
         return Err(anyhow!("fetch 仅支持 http/https URL（拒绝: {url}）"));
     }
-    gate_private(url, opts.allow_private)?;
+    let allow = allow_private_requested(opts.allow_private);
+    // SSRF 门先行（含 DNS 解析）：私网 URL 无论 scheme 默认在这里被拒（错误含「私网」）。
+    let (_host, _ip, is_priv) = gate_check(url, allow)?;
+    // 公网明文 http 一律拒（防降级 + 重定向中转 SSRF）；私网 http 仅在显式放行时允许
+    // （内网端点常见 http-only，allow_private 即「自担风险进内网」的完整语义）。
+    if url.trim_start().to_ascii_lowercase().starts_with("http://") && !(allow && is_priv) {
+        return Err(anyhow!(
+            "fetch 仅支持 https：公网明文 http 已禁用（防降级与重定向 SSRF 中转）。如确需内网 http 页面，请传 --allow-private 或设置 GSEARCH_FETCH_ALLOW_PRIVATE=1: {url}"
+        ));
+    }
     let mut builder = reqwest::Client::builder()
         .user_agent(format!("gsearch/{}", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
-        // Important-2：禁止 https→http 降级，阻止跨 scheme 重定向中转 SSRF
-        .https_only(true);
+        // 9re(c)：每跳 host 都过私网门 + scheme 规则，防重定向绕过（替代旧 https_only 全局开关）。
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                return attempt.stop();
+            }
+            let u = attempt.url();
+            // 无 host / 解析失败一律按私网处理（fail-closed）
+            let host_priv = u
+                .host_str()
+                .map(|h| resolve_host(h).map(is_private_ip).unwrap_or(true))
+                .unwrap_or(true);
+            if host_priv && !allow {
+                return attempt.error(
+                    "重定向目标命中私网门（SSRF 防护）；放行请加 --allow-private 或设置 GSEARCH_FETCH_ALLOW_PRIVATE=1",
+                );
+            }
+            match u.scheme() {
+                "https" => attempt.follow(),
+                "http" if allow && host_priv => attempt.follow(),
+                _ => attempt.error("fetch 仅支持 https：明文 http 已禁用（重定向链同样禁止）"),
+            }
+        }));
     if let Some(p) = &opts.proxy {
         builder = builder.proxy(reqwest::Proxy::all(p).context("代理 URL 无效")?);
     }
@@ -521,7 +551,7 @@ mod tests {
             "http://[fd00::1]/x",
             "http://[fe80::1]/x",
         ] {
-            let err = gate_private(bad, false).unwrap_err();
+            let err = gate_check(bad, false).unwrap_err();
             assert!(err.to_string().contains("拒绝"), "应拒绝 {bad}: {err}");
         }
         // 放行公网 IP 字面量（不发起请求，纯函数验证）
@@ -530,7 +560,7 @@ mod tests {
             "https://1.1.1.1/x",
             "https://93.184.216.34/x",
         ] {
-            gate_private(ok, false).expect(ok);
+            gate_check(ok, false).expect(ok);
         }
     }
 
@@ -543,7 +573,7 @@ mod tests {
             "http://169.254.169.254/latest/meta-data/",
             "http://[::1]/admin",
         ] {
-            gate_private(url, true).expect(url);
+            gate_check(url, true).expect(url);
         }
     }
 

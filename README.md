@@ -45,11 +45,11 @@ gsearch fetch https://internal --allow-private  # 放行私网（默认拒）
 ```
 
 - **无需浏览器**：纯 reqwest GET，秒取静态页（换机可用性兜底）。
-- **HTTPS only**：初始请求与重定向链都强制 https；`http://` URL 直接拒绝并给出明确提示（防降级 + 重定向中转 SSRF）。
-- **私网门（SSRF 默认拒）**：默认拒绝 loopback / RFC1918 / link-local / 云 metadata（169.254.169.254）/ IPv6 ULA + ::1。放行方式：`--allow-private` flag 或 `GSEARCH_FETCH_ALLOW_PRIVATE=1` 环境变量（agent 消费方一般不需要，主动开内网意味着自担风险）。
+- **HTTPS only（公网）**：公网 URL 初始请求与重定向链都强制 https，`http://` 直接拒绝并给出明确提示（防降级 + 重定向中转 SSRF）；`--allow-private`/env 放行私网时允许内网明文 http（内网端点常见 http-only）。
+- **私网门（SSRF 默认拒）**：默认拒绝 loopback / RFC1918 / link-local / 云 metadata（169.254.169.254）/ IPv6 ULA + ::1。放行方式：`--allow-private` flag 或 `GSEARCH_FETCH_ALLOW_PRIVATE=1` 环境变量（仅 `1`/`true` 生效；agent 消费方一般不需要，主动开内网意味着自担风险）。
 - **响应体硬上限 10MB**：超过即停下载，`meta.truncated=true`，`meta.omitted` 累计字符。
 - **JS 壳页**：剥标签后正文 < 500 字符 **且** html 含 SPA 挂载点（`id="root"/id="app"/__next`）→ 退出码 1 + stderr `该页无服务端正文（JS 壳），需渲染：用 gsearch browse <url>`。**注意**：退出码 1 在这里是"需换 browse"，不是"命令错误"——agent 应改用 browse 而非重试 fetch。
-- **跟随重定向**：≤10 跳，全部强制 https。
+- **跟随重定向**：≤10 跳，每跳 host 都过私网门 + https 规则（防重定向绕过）。
 - **fetch 输出 `content_untrusted: true`** 与 read/browse 同契约。
 
 ### 退出码（agent 消费必读，对照源码 main.rs/verify.rs）

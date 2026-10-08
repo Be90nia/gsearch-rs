@@ -139,8 +139,8 @@ enum Command {
         /// 输出结构化 JSON（默认人类可读 text）
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// 放行私网地址（loopback / RFC1918 / link-local / 云 metadata）。默认拒（SSRF 门）；
-        /// 也可通过 `GSEARCH_FETCH_ALLOW_PRIVATE=1` 环境变量放行。
+        /// 放行私网地址（loopback / RFC1918 / link-local / 云 metadata），同时允许内网明文 http。
+        /// 默认拒（SSRF 门）；也可通过 `GSEARCH_FETCH_ALLOW_PRIVATE=1` 环境变量放行。
         #[arg(long, default_value_t = false)]
         allow_private: bool,
     },
@@ -333,32 +333,39 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             }
         }
     };
-    if args.json {
-        let meta = gsearch::types::MetaOutput {
-            tool: "gsearch",
-            version: env!("CARGO_PKG_VERSION"),
-            query: query.clone(),
-            profile: gsearch::browser::profile_name_only(),
-            browser_kind: format!("{resolved_kind:?}"),
-            browser_path: browser_path.to_string_lossy().into_owned(),
-            proxy: proxy.clone(),
-            humanize: args.humanize,
-            limit: args.limit,
-            elapsed_ms: started.elapsed().as_millis(),
-            results_count: results.len(),
-            truncated: results.len() >= args.limit,
-            provider: provider.into(),
-            recency: recency.map(|r| r.as_str().into()),
-        };
-        let run = gsearch::types::RunStatusInfo {
-            status: gsearch::types::RunStatus::Ok,
-            captcha_solved,
-            message: if captcha_solved { "本次搜索经过了人工 CAPTCHA 验证".into() } else { String::new() },
-        };
-        let envelope = gsearch::types::OutputEnvelope { meta, run, results: &results };
-        gsearch::output::print_envelope_json(&envelope)?;
-    } else {
-        gsearch::output::print_text(&results);
+    // 0mf：--json + --read 时 read 产物并入单一 JSON 文档——envelope 延后装配，stdout 只出
+    // 一份可解析 JSON（旧行为 envelope 先打 + read raw 追加 = json.loads 崩）。
+    // b95：--headings-only 连 SERP 集都不进输出（text 模式同样跳过 print_text）。
+    let read_solo_json = args.json && args.read.is_some();
+    let headings_solo = args.read.is_some() && args.headings_only;
+    let meta = gsearch::types::MetaOutput {
+        tool: "gsearch",
+        version: env!("CARGO_PKG_VERSION"),
+        query: query.clone(),
+        profile: gsearch::browser::profile_name_only(),
+        browser_kind: format!("{resolved_kind:?}"),
+        browser_path: browser_path.to_string_lossy().into_owned(),
+        proxy: proxy.clone(),
+        humanize: args.humanize,
+        limit: args.limit,
+        elapsed_ms: started.elapsed().as_millis(),
+        results_count: results.len(),
+        truncated: results.len() >= args.limit,
+        provider: provider.into(),
+        recency: recency.map(|r| r.as_str().into()),
+    };
+    let run = gsearch::types::RunStatusInfo {
+        status: gsearch::types::RunStatus::Ok,
+        captcha_solved,
+        message: if captcha_solved { "本次搜索经过了人工 CAPTCHA 验证".into() } else { String::new() },
+    };
+    let envelope = gsearch::types::OutputEnvelope { meta, run, results: &results };
+    if !read_solo_json {
+        if args.json {
+            gsearch::output::print_envelope_json(&envelope)?;
+        } else if !headings_solo {
+            gsearch::output::print_text(&results);
+        }
     }
     // M4 后处理（PLAN §3.4）：clap ArgGroup \"post\" 保证 --open/--read/--dl 互斥；仅剩运行时分发。
     let post = async {
@@ -374,10 +381,26 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
                 headings_only: args.headings_only,
                 from: args.from.unwrap_or(0),
             };
-            if opts.full {
-                postproc::read_full(browser, &mut h_slot, &results, n).await?;
+            let content = if opts.full {
+                postproc::read_full(browser, &mut h_slot, &results, n, &opts).await?
             } else {
-                postproc::read(browser, &mut h_slot, &results, n, &opts).await?;
+                postproc::read(browser, &mut h_slot, &results, n, &opts).await?
+            };
+            if read_solo_json {
+                // 0mf：单一 JSON 文档 = envelope（meta/run/results）+ read 产物字段
+                let mut doc = serde_json::to_value(&envelope)?;
+                if let Some(obj) = doc.as_object_mut() {
+                    if opts.full {
+                        obj.insert("content_text".into(), serde_json::Value::String(content));
+                    } else {
+                        if opts.headings_only {
+                            // b95：headings-only 信封只放 read 产物，SERP 全集不进输出
+                            obj.insert("results".into(), serde_json::json!([]));
+                        }
+                        obj.insert("read".into(), serde_json::from_str(&content)?);
+                    }
+                }
+                println!("{doc}");
             }
         }
         if let Some(n) = args.dl {
@@ -393,6 +416,10 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     }
     if let Err(e) = post {
         eprintln!("postproc 失败: {e}");
+        // 0mf：延后装配的 envelope 在 read 失败时兜底补打——保住「SERP JSON 已出 stdout」的旧行为
+        if read_solo_json {
+            let _ = gsearch::output::print_envelope_json(&envelope);
+        }
     }
     if results.is_empty() {
         eprintln!("未找到结果");

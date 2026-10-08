@@ -205,9 +205,19 @@ pub(crate) fn render_read(
     omitted: usize,
 ) -> String {
     if json {
-        let mut v = match serde_json::to_value(read) {
-            Ok(v) => v,
-            Err(e) => return format!("{{\"error\": \"{e}\"}}"),
+        // b95：headings-only 的 JSON 只带标题数组——段落索引/char_count/摘要不进输出
+        // （「只要标题」反而更贵的根因：旧 json 分支从未看 headings_only，全量序列化 AdaptiveRead）。
+        let mut v = if headings_only {
+            serde_json::json!({
+                "url": read.url,
+                "title": read.title,
+                "headings": read.headings,
+            })
+        } else {
+            match serde_json::to_value(read) {
+                Ok(v) => v,
+                Err(e) => return format!("{{\"error\": \"{e}\"}}"),
+            }
         };
         if let Some(obj) = v.as_object_mut() {
             obj.insert(
@@ -263,27 +273,43 @@ pub async fn read(
     read.title = title;
 
     let out = render_read(&read, opts.json, opts.headings_only, opts.from, truncated, omitted);
-    println!("{out}");
+    // 0mf：--json 时不再直接打印（envelope 先打 + read JSON 追加 = 两段拼接破坏 json.loads），
+    // 串由 cmd_search 装配进单一 JSON 文档后输出；文本模式照旧。
+    if !opts.json {
+        println!("{out}");
+    }
     Ok(out)
 }
 
-/// `--read N --full` 兜底：纯 innerText 5000 字。
+/// `--read N --full` 兜底：纯 innerText 5000 字。--json（0mf）时静默返回正文串，由 cmd_search
+/// 装配进单一 JSON 文档；文本模式照旧打印 `=== url ===` 头。
 pub async fn read_full(
     browser: &mut Browser,
     h_slot: &mut Option<tokio::task::JoinHandle<()>>,
     results: &[SearchResult],
     n: usize,
+    opts: &ReadOpts,
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
     let (page, _) = open_page(browser, h_slot, url).await?;
-    read_full_inner(&page, url).await
+    let txt = read_full_text(&page).await?;
+    if !opts.json {
+        println!("=== {url} ===\n{txt}");
+    }
+    Ok(txt)
 }
 
 /// 共享 innerText 5000 字截断 + 打印。pub(crate)：general::cmd_browse --full 复用同一实现。
 pub(crate) async fn read_full_inner(page: &chromiumoxide::Page, url: &str) -> Result<String> {
+    let txt = read_full_text(page).await?;
+    println!("=== {url} ===\n{txt}");
+    Ok(txt)
+}
+
+/// innerText 5000 字截断（不打印）。read_full（--json 静默装配）/ read_full_inner（browse 打印）共用。
+pub(crate) async fn read_full_text(page: &chromiumoxide::Page) -> Result<String> {
     let txt = eval_string_retry(page, "document.body.innerText").await;
     let txt: String = txt.chars().take(READ_FULL_MAX_CHARS).collect();
-    println!("=== {url} ===\n{txt}");
     Ok(txt)
 }
 
@@ -706,7 +732,7 @@ mod live_tests {
         assert!(txt.contains("[摘要"), "default read missing [摘要]: {txt:?}");
         assert!(txt.contains("Example Domain"), "default read got: {txt:?}");
 
-        let txt = read_full(&mut browser, &mut h_slot, &results, 1).await.unwrap();
+        let txt = read_full(&mut browser, &mut h_slot, &results, 1, &ReadOpts::default()).await.unwrap();
         assert!(txt.contains("Example Domain"), "read_full got: {txt:?}");
 
         dl(&browser, &results, 1, None).await.unwrap();
