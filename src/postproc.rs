@@ -547,6 +547,7 @@ pub async fn dl(
     let path = dir.join(filename_from_url(url));
     std::fs::write(&path, &bytes).map_err(|e| anyhow!("写文件 {} 失败: {e}", path.display()))?;
     println!("已下载: {} ({} bytes)", path.display(), bytes.len());
+    crate::general::pdf_hint(&path);
     Ok(())
 }
 

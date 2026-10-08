@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 
+mod convert;
 mod fetch;
 mod general;
 mod postproc;
@@ -116,6 +117,10 @@ enum Command {
         /// 6dp：meta 压缩（仅 --json --full 信封生效；debug 日志强制全量）
         #[arg(long, default_value_t = false)]
         compact_meta: bool,
+        /// xih：正文以 markdown 输出（渲染后 HTML 转换，保表格/标题/链接；隐含全文模式，与 --headings-only 互斥）。
+        /// --json 时 content_text 字段换源为 markdown，meta.format="markdown" 标注。
+        #[arg(long, default_value_t = false, conflicts_with = "headings_only")]
+        markdown: bool,
         #[arg(long, value_enum, default_value_t = BrowserArg::Auto)]
         /// 选择浏览器（M11）
         browser: BrowserArg,
@@ -188,6 +193,10 @@ enum Command {
         /// 默认拒（SSRF 门）；也可通过 `GSEARCH_FETCH_ALLOW_PRIVATE=1` 环境变量放行。
         #[arg(long, default_value_t = false)]
         allow_private: bool,
+        /// xih：正文以 markdown 输出（保表格/标题/链接结构）。--json 时 text 字段换源，
+        /// meta.format="markdown" 标注；无 flag 输出逐字节不变。
+        #[arg(long, default_value_t = false)]
+        markdown: bool,
     },
 }
 #[derive(Args, Debug)]
@@ -293,13 +302,14 @@ async fn main() -> ExitCode {
     gsearch::types::set_compact_meta(compact_requested && !debug_logging);
     let result: Result<ExitCode> = match cli.cmd {
         Command::Search(args) => cmd_search(args, proxy.clone()).await,
-        Command::Browse { url, full, human, from, headings_only, compact_meta: _, browser, .. } => {
+        Command::Browse { url, full, human, from, headings_only, compact_meta: _, markdown, browser, .. } => {
             let opts = general::BrowseOpts {
                 full,
                 // 3gw：--json 已是默认，--human 才切人读
                 json: !human,
                 from: from.unwrap_or(0),
                 headings_only,
+                markdown,
                 browser: browser.into(),
                 proxy: proxy.clone(),
             };
@@ -314,8 +324,8 @@ async fn main() -> ExitCode {
         Command::Verify { url, human, timeout, urls_file, .. } => {
             gsearch::verify::cmd_verify(&url, !human, proxy.as_deref(), timeout, urls_file.as_deref())
         }
-        Command::Fetch { url, human, allow_private, include, .. } => {
-            fetch::cmd_fetch(&url, &fetch::FetchOpts { json: !human, proxy: proxy.clone(), allow_private, include }).await
+        Command::Fetch { url, human, allow_private, include, markdown, .. } => {
+            fetch::cmd_fetch(&url, &fetch::FetchOpts { json: !human, proxy: proxy.clone(), allow_private, include, markdown }).await
         }
     };
 

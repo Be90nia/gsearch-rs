@@ -35,6 +35,9 @@ pub struct BrowseOpts {
     pub json: bool,
     pub headings_only: bool,
     pub from: usize,
+    /// xih：正文以 markdown 输出（渲染后 HTML 转换，隐含全文模式）。--json 时 content_text
+    /// 字段换源为 markdown，meta.format="markdown" 标注；无 flag 输出逐字节不变。
+    pub markdown: bool,
     /// M11 浏览器选择；None = 自动检测
     pub browser: Option<BrowserKind>,
     /// M12 浏览器代理；None = 走直连
@@ -64,16 +67,24 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
         // uhp/j44：等语义定稿（marker 连续两次相同），避免 -32000 与风控页假 complete。
         let snap = postproc::wait_content_stable(&page, 50).await; // 50×200ms ≈ 10s
 
-        if is_captcha(&postproc::content_retry(&page).await) {
+        let html_probe = postproc::content_retry(&page).await;
+        if is_captcha(&html_probe) {
             return Err(anyhow!(
                 "{url} 遇 CAPTCHA：用 `gsearch login {url}` 开有头窗手工验证后重试"
             ));
         }
 
         // fve：--full 纯 innerText（READ_BODY_MAX_CHARS 50000 cap，截断照标）；
+        // xih：--markdown 隐含全文模式，源换渲染后 HTML→markdown（转换在截断前的完整 HTML 上做，
+        // md 产物再过同一字符上限——先截 HTML 会把表格腰斩）。
         // --json 对齐 0mf search 契约：信封（meta.truncated 标内容截断）+ content_text 单文档
-        if opts.full {
-            let (txt, truncated, omitted) = postproc::read_full_text(&page).await?;
+        if opts.full || opts.markdown {
+            let (txt, truncated, omitted) = if opts.markdown {
+                let (md, t, o) = postproc::cap_chars(&crate::convert::html_to_markdown(&html_probe)?, postproc::read_max_chars());
+                (md, t, o)
+            } else {
+                postproc::read_full_text(&page).await?
+            };
             if opts.json {
                 let (browser_path, resolved_kind) = crate::resolve_browser_meta(opts.browser);
                 let meta = gsearch::types::MetaOutput {
@@ -104,6 +115,9 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
                 })?;
                 if let Some(obj) = doc.as_object_mut() {
                     obj.insert("content_text".into(), serde_json::Value::String(txt));
+                    if opts.markdown {
+                        obj["meta"]["format"] = serde_json::json!("markdown");
+                    }
                 }
                 println!("{doc}");
             } else {
@@ -120,7 +134,7 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
             Some(s) => s.title.clone(),
             None => postproc::eval_string_retry(&page, "document.title").await,
         };
-        let html_full = postproc::content_retry(&page).await;
+        let html_full = html_probe;
         let (html, truncated, omitted) = postproc::cap_chars(&html_full, postproc::read_max_chars());
         let mut read = extract_adaptive(&html, None);
         read.url = url.to_string();
@@ -236,6 +250,7 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>, output_file: Option<&Path>
     if let Some(size) = dl_direct(url, proxy.as_deref(), &direct_path).await? {
         println!("mode: direct");
         println!("已下载: {} ({size} bytes)", direct_path.display());
+        pdf_hint(&direct_path);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -275,6 +290,7 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>, output_file: Option<&Path>
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 println!("mode: browser");
                 println!("已下载: {} ({size} bytes)", path.display());
+                pdf_hint(&path);
             }
             None => {
                 let bytes = postproc::fetch_in_page(&page, url).await?;
@@ -285,6 +301,7 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>, output_file: Option<&Path>
                 std::fs::write(&path, &bytes).with_context(|| format!("写文件失败: {}", path.display()))?;
                 println!("mode: browser");
                 println!("已下载: {} ({})", path.display(), bytes.len());
+                pdf_hint(&path);
             }
         }
         Ok(())
@@ -295,6 +312,13 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>, output_file: Option<&Path>
     }
     result?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// q34：二进制 PDF 落盘后的 stderr 提示（三条 dl 落盘路径共用；本地不解析文本，agent 用外部工具提取）。
+pub(crate) fn pdf_hint(path: &Path) {
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+        eprintln!("提示: 二进制 PDF 已保存（本地未解析文本）；agent 可用外部工具提取");
+    }
 }
 
 /// i9a：dl 输出目标消歧义。--output-file 显式文件；-o 末段带 '.' 视为文件路径；否则目录语义（README 不变）。

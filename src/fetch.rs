@@ -39,6 +39,9 @@ pub struct FetchOpts {
     /// 逗号分隔 CSS selector（如 "main,article"）：命中时取首个命中容器的正文并跳过 JS 壳判定；
     /// 未命中回退全文提取，--json 在 meta.include_hit=false 标注（用户明确知道要什么，壳判定不适用）。
     pub include: Option<String>,
+    /// xih：正文以 markdown 输出（表格/标题/链接保结构）。--json 下 text 字段换源为 markdown，
+    /// meta.format="markdown" 标注；无 flag 时逐字节不变。
+    pub markdown: bool,
 }
 
 /// scheme 前缀校验（大小写不敏感）。非 http(s) 一律拒（fetch 子命令的契约定位 = 互联网只读）。
@@ -181,6 +184,17 @@ pub(crate) fn build_client(proxy: Option<&str>, allow: bool, timeout: Duration) 
     builder.build().context("构建 HTTP 客户端失败")
 }
 
+/// q34：Content-Type 判 PDF（含参数形态 `application/pdf; charset=binary`，大小写不敏感）。
+/// 纯函数离线单测覆盖；fetch 侧据此拒抓，指引走 dl。
+fn is_pdf_content_type(ct: &str) -> bool {
+    // 剥参数段后精确匹配 mime 主类型，避免子串误伤（application/pdf+xml 之类复合类型不判 PDF）
+    ct.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("application/pdf")
+}
+
 /// 单 URL 拉取 + 提取（不含输出）。批量与单条共用；每 URL 独立过 SSRF 门（含重定向每跳）。
 async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
     if !http_or_https_scheme(url) {
@@ -208,11 +222,20 @@ async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
         // 验收契约：非零退出 + 错误信息含状态码（error 经 main 统一打印，退出码 1）
         return Err(anyhow!("HTTP {status}: {url}"));
     }
-    let is_html = resp
+    let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.to_ascii_lowercase().contains("html"))
+        .map(|ct| ct.to_ascii_lowercase());
+    // q34：application/pdf 不剥标签直接转文本 = 乱码——显式报错指引 dl 落盘 + 外部工具提取。
+    if content_type.as_deref().is_some_and(is_pdf_content_type) {
+        return Err(anyhow!(
+            "PDF 二进制内容，fetch 不做本地解析；用 gsearch dl {url} 落盘后由外部工具提取文本"
+        ));
+    }
+    let is_html = content_type
+        .as_deref()
+        .map(|ct| ct.contains("html"))
         .unwrap_or(false);
 
     // Important-3：bytes_stream 边读边累加，超过 FETCH_BODY_LIMIT 立即停下载（OOM/zip-bomb 同治）。
@@ -234,13 +257,26 @@ async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
 
     let limit = read_max_chars();
     let mut fetched = process_html(url, &html, is_html, limit);
+    // xih：--markdown 在剥标签前的原始 HTML 上转换（保表格/标题/链接结构），text 字段换源；
+    // 非 HTML（text/plain / JSON / md 源文）本就是文本，原样保留。
+    if opts.markdown && is_html {
+        let (md, t, o) = cap_chars(&crate::convert::html_to_markdown(&html)?, limit);
+        fetched.text = md;
+        fetched.truncated = t;
+        fetched.omitted = o;
+        fetched.markdown = true;
+    }
     // --include：命中容器则用容器内 HTML 重新提取正文（title 仍取页面级）；未命中回退全文提取。
     if let Some(include) = &opts.include {
         fetched.include_hit = Some(false);
         if is_html
             && let Some(inner) = extract_with_include(&html, include)?
         {
-            let raw = extract_text(&inner);
+            let raw = if opts.markdown {
+                crate::convert::html_to_markdown(&inner)?
+            } else {
+                extract_text(&inner)
+            };
             let (text, t, o) = cap_chars(&raw, limit);
             fetched = Fetched {
                 url: fetched.url,
@@ -249,6 +285,7 @@ async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
                 truncated: t,
                 omitted: o,
                 include_hit: Some(true),
+                markdown: opts.markdown,
             };
         }
     }
@@ -363,6 +400,9 @@ fn fetched_json(f: &Fetched) -> serde_json::Value {
     if let Some(hit) = f.include_hit {
         meta["include_hit"] = serde_json::json!(hit);
     }
+    if f.markdown {
+        meta["format"] = serde_json::json!("markdown");
+    }
     serde_json::json!({
         "url": f.url,
         "title": f.title,
@@ -380,6 +420,8 @@ struct Fetched {
     omitted: usize,
     /// --include 状态：None=未用 --include；Some(true)=selector 命中容器；Some(false)=未命中回退全文。
     include_hit: Option<bool>,
+    /// xih：text 字段是否已是 markdown（--json 据此写 meta.format）。
+    markdown: bool,
 }
 
 /// 单 URL fetch 结果：Done = 正文已提取；JsShell = JS 壳需渲染（单条 exit 1 / 批量记 error）。
@@ -399,7 +441,7 @@ fn process_html(url: &str, html: &str, is_html: bool, limit: usize) -> Fetched {
         collapse_blank(html.to_string())
     };
     let (text, truncated, omitted) = cap_chars(&raw, limit);
-    Fetched { url: url.to_string(), title, text, truncated, omitted, include_hit: None }
+    Fetched { url: url.to_string(), title, text, truncated, omitted, include_hit: None, markdown: false }
 }
 
 /// JS 壳判定：正文 < 500 字符 **且** html 含 SPA 挂载点标记（root/app/__next 等）。
@@ -759,6 +801,17 @@ mod tests {
         assert!(http_or_https_scheme("http://example.com"));
         assert!(http_or_https_scheme("HTTPS://example.com"));  // 大小写不敏感
         assert!(http_or_https_scheme("  https://example.com"));  // 前导空白允许
+    }
+
+    /// q34：Content-Type 判 PDF——裸类型/带参数命中，复合类型与 html 不误伤。
+    #[test]
+    fn pdf_content_type_detection() {
+        assert!(is_pdf_content_type("application/pdf"));
+        assert!(is_pdf_content_type("application/pdf; charset=binary"));
+        assert!(is_pdf_content_type("APPLICATION/PDF")); // 大小写不敏感（fetch_one 已 to_lowercase，双保险）
+        assert!(!is_pdf_content_type("text/html; charset=utf-8"));
+        assert!(!is_pdf_content_type("application/pdf+xml")); // 复合类型不判
+        assert!(!is_pdf_content_type("text/plain"));
     }
 
     /// Important-3：响应体硬上限——多次 chunk 累积到 limit 立即停下载。

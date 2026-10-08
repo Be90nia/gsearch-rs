@@ -67,6 +67,15 @@ IP 可达时回退 Google 直爬；**若回退也零结果，信封 `run.status`
 
 `browse` 支持 `--full`（渲染后 innerText 全文，与 `search --read --full` 契约对称；与 `--headings-only` 互斥）。人读模式 `browse --human` / `search ... --read 1 --human` 输出旧文本格式。
 
+#### --markdown（fetch / browse；read 尚未支持）
+
+`fetch <url> --markdown` / `browse <url> --markdown`：正文以 **markdown** 输出——表格保留管道表格（不拍平）、标题保留层级（ATC `#`/`##`）、链接保留 `[text](href)` 可追溯。转换在本地完成（htmd，turndown.js 同规则）。
+
+- `fetch --markdown --json`：`text` 字段换源为 markdown 产物，`meta.format: "markdown"` 标注；无 flag 输出逐字节不变（默认仍是剥标签纯文本）
+- `browse --markdown`：渲染后 HTML → markdown（隐含全文模式，与 `--headings-only` 互斥）；`--json` 时 `content_text` 字段换源为 markdown，`meta.format: "markdown"` 标注
+- 非 HTML 源（text/plain / JSON / .md 源文）不转换，原文保留
+- **`search --read N`（含 shell `read`）暂不支持 `--markdown`**——read 输出走 AdaptiveRead 结构化装配（属 search 输出路径），后续补
+
 ### fetch（纯 HTTP GET 取正文，无需 Chrome）
 
 ```
@@ -75,6 +84,7 @@ gsearch fetch https://example.com --human       # 人读文本
 gsearch fetch https://internal --allow-private  # 放行私网（默认拒）
 gsearch fetch URL1 URL2 ...                     # 批量并发（≤5 并发，单条失败不阻塞）
 gsearch fetch https://spa-site --include "main,article"  # 只提取命中容器正文
+gsearch fetch https://docs-site/page --markdown # 正文 markdown（表格/标题/链接保结构）
 ```
 
 - **批量**：多位置参数并发抓取，默认 JSON 裸数组（元素含 `url/title/text/meta/status`，单条失败 `status=private_blocked|error` 不阻塞其他）；退出码 `0` 全成功 / `1` 部分失败 / `2` 全失败；每条 URL 独立过私网门
@@ -86,6 +96,7 @@ gsearch fetch https://spa-site --include "main,article"  # 只提取命中容器
 - **响应体硬上限 10MB**：超过即停下载，`meta.truncated=true`，`meta.omitted` 累计字符。
 - **JS 壳页**：剥标签后正文 < 500 字符 **且** html 含 SPA 挂载点（`id="root"/id="app"/__next`）→ 退出码 1 + stderr `该页无服务端正文（JS 壳），需渲染：用 gsearch browse <url>`。**注意**：退出码 1 在这里是"需换 browse"，不是"命令错误"——agent 应改用 browse 而非重试 fetch。
 - **跟随重定向**：≤10 跳，每跳 host 都过私网门 + https 规则（防重定向绕过）。
+- **PDF 拒抓**：`Content-Type: application/pdf` 直接报错（不做本地 PDF 解析）并指引 `gsearch dl <url>` 落盘后用外部工具提取文本——剥标签路径对二进制 PDF 只会产出乱码。
 - **fetch 输出 `content_untrusted: true`** 与 read/browse 同契约。
 
 ### 退出码（agent 消费必读，对照源码 main.rs/verify.rs）
@@ -107,6 +118,7 @@ search 遇 CAPTCHA 超时不走退出码 3 的 stderr 文案，而是输出 `sta
 ```
 gsearch browse https://example.com              # 渲染后正文 AdaptiveRead JSON + URL/标题
 gsearch browse https://example.com --full       # innerText 全文（50000 字 cap）
+gsearch browse https://example.com --markdown   # 渲染后 HTML → markdown（隐含全文模式）
 gsearch browse https://example.com --human      # 人读文本模式
 gsearch login  https://github.com               # 弹有头窗人工登录；关窗 = 完成，cookie 落 profile
 gsearch dl    https://.../file.pdf              # 带 profile 登录态真下载（Chrome 原生下载流）
@@ -119,7 +131,8 @@ gsearch dl    https://.../file.pdf -o a.bin --output-file b.bin  # -o 含扩展�
 - **dl**：先 reqwest HEAD 预检分流——纯静态直链（无 Set-Cookie 且非 HTML）直接流式下载（输出 `mode: direct`，不启动 Chrome），有登录墙嫌疑才走 Chrome 老路径（`mode: browser`）；
   CDP `Browser.setDownloadBehavior` 走 Chrome 原生下载（登录态、重定向、大文件均支持）；
   渲染型 URL（普通网页不触发下载）自动回退页内 fetch 落盘（同源 cookie），默认存当前目录；
-  `-o` 末段含 `.` 按文件处理，纯目录名按目录处理，`--output-file` 恒为文件语义
+  `-o` 末段含 `.` 按文件处理，纯目录名按目录处理，`--output-file` 恒为文件语义；
+  落盘 `.pdf` 时 stderr 一行提示（本地不解析文本，agent 用外部工具提取；三条下载路径均提示）
 
 ### shell（交互模式，可选）
 
@@ -142,7 +155,7 @@ gsearch> <Ctrl+D>          # EOF 优雅退出，Chrome 自动关
 
 可用命令：`search <query> [--limit N]` / `click <N>`（或 `open <N>`）/ `read` / `dl [N]` / `browse <url>` /
 `login <url>` / `back` / `status` / `help` / `exit` / `quit`。
-EOF（Ctrl+D / Ctrl+Z+Enter）才真正退出；单条命令出错只打印 `error:` 不退出 shell。
+`exit` / `quit` / EOF（Ctrl+D / Ctrl+Z+Enter）都会优雅退出（rc=0，Chrome 自动关）；单条命令出错只打印 `error:` 不退出 shell。
 
 ### Profile
 

@@ -61,7 +61,7 @@ pub struct ShellCtx {
     pub human_solved: Arc<AtomicBool>,
 }
 /// 起一次 headless Chrome，进入 `gsearch> ` REPL；EOF / Ctrl+D 走 graceful 关闭。
-/// exit/quit 走二次确认（提示用户 EOF），状态机不增。
+/// exit / quit 直接退出（8i3：banner/help/实际行为三者一致），rc=0。
 pub async fn run_shell() -> Result<ExitCode> {
     let (browser, handler) = browser::launch(true).await.context("启动 Chrome 失败")?;
     let handler_task = Some(browser::spawn_handler(handler));
@@ -105,6 +105,10 @@ pub async fn run_shell() -> Result<ExitCode> {
         let Some(cmd) = parts.next() else {
             continue;
         };
+        // 8i3：quit/exit 真退出（graceful 关 Chrome 后 rc=0）；EOF（read_line=0）同样 break。
+        if cmd == "exit" || cmd == "quit" {
+            break;
+        }
         let args: Vec<&str> = parts.collect();
         if let Err(e) = dispatch(cmd, &args, &mut ctx).await {
             eprintln!("error: {e}");
@@ -124,12 +128,6 @@ async fn dispatch(cmd: &str, args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     match cmd {
         "help" | "?" => {
             print_help();
-            Ok(())
-        }
-        "exit" | "quit" => {
-            // 真正退出走 EOF（read_line 返回 0 → 主循环 break）。这里只提示，
-            // 不引入"特殊返回值中断主循环"的状态扩张。
-            println!("退出请输入 EOF（Ctrl+D / Ctrl+Z+Enter）");
             Ok(())
         }
         "search" => cmd_search(args, ctx).await,
@@ -157,7 +155,7 @@ fn print_help() {
          login <url>                  有头窗登录\n\
          back / status                后退 / / 当前 URL + 标题\n\
          help                         帮助\n\
-         exit / quit                  提示退出；EOF / Ctrl+D 真退出"
+         exit / quit                  退出（rc=0；EOF / Ctrl+D 同效）"
     );
 }
 async fn cmd_search(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
@@ -420,6 +418,7 @@ async fn dl_in_page(page: &Page, url: &str, output: Option<&Path>) -> Result<()>
     let path = dir.join(filename_from_url(&final_url));
     std::fs::write(&path, &bytes).with_context(|| format!("写文件失败: {}", path.display()))?;
     println!("已下载: {} ({} bytes)", path.display(), bytes.len());
+    crate::general::pdf_hint(&path);
     Ok(())
 }
 
