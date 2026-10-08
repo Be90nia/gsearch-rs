@@ -118,6 +118,10 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
                     if opts.markdown {
                         obj["meta"]["format"] = serde_json::json!("markdown");
                     }
+                    // dsg：omitted 与 read 路径同语义（被截字符数；>0 才占键，缺席=未截断）
+                    if omitted > 0 {
+                        obj["meta"]["omitted"] = serde_json::json!(omitted);
+                    }
                 }
                 println!("{doc}");
             } else {
