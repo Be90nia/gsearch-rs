@@ -5,7 +5,8 @@
 //! 自动发现路径只读已存在的文件，不主动创建。
 //!
 //! 优先级（各键独立）：环境变量 > 配置文件 > 默认值。
-//! 格式错误：显式指定的路径报错（用户点名要它）；自动发现的仅 warn 后忽略。
+//! 格式错误：显式指定的路径报错（用户点名要它）；自动发现的仅 warn 后忽略
+//! （vw2：同步登记 `parse_failure()` 供 doctor 显式 FAIL，不再伪装成「未配置」）。
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -28,6 +29,21 @@ pub struct GsearchConfig {
 
 static CONFIG: OnceLock<GsearchConfig> = OnceLock::new();
 static EXPLICIT: OnceLock<PathBuf> = OnceLock::new();
+/// vw2：自动发现配置的解析失败详情（load() 惰性初始化时恰好只 set 一次）。
+static PARSE_FAILURE: OnceLock<ParseFailure> = OnceLock::new();
+
+/// 自动发现的配置文件「存在但解析失败」的详情（区别于文件不存在的静默默认）。
+#[derive(Debug, Clone)]
+pub struct ParseFailure {
+    pub path: PathBuf,
+    /// serde 错误摘要（人可读，进 stderr WARN 与 doctor message）。
+    pub error: String,
+}
+
+/// doctor 用：自动发现的配置文件解析失败详情；None = 无文件 / 解析成功 / 显式 --config（硬报错路径）。
+pub fn parse_failure() -> Option<&'static ParseFailure> {
+    PARSE_FAILURE.get()
+}
 
 /// main 用：记录显式路径并立即加载校验（文件不存在/格式错 → 启动即报错，不静默落到默认）。
 pub fn set_explicit_and_load(path: PathBuf) -> Result<()> {
@@ -78,10 +94,25 @@ fn load_from_disk() -> Result<GsearchConfig> {
         }
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("读取配置失败: {}", path.display()))?;
-        cfg = serde_json::from_str(&raw)
-            .with_context(|| format!("配置格式错误（应为 JSON 对象，键 profile/chrome/searxng_url）: {}", path.display()))?;
-        tracing::debug!("已加载配置: {}", path.display());
-        break;
+        match serde_json::from_str::<GsearchConfig>(&raw) {
+            Ok(c) => {
+                cfg = c;
+                tracing::debug!("已加载配置: {}", path.display());
+                break;
+            }
+            Err(e) if explicit => {
+                return Err(e).with_context(|| {
+                    format!("配置格式错误（应为 JSON 对象，键 profile/chrome/searxng_url）: {}", path.display())
+                });
+            }
+            // vw2：解析失败 ≠ 文件不存在——显式 WARN + 登记 doctor FAIL，然后按无配置回退默认。
+            // 停在本文件上不往后找（与旧「找到文件即停」语义一致）。
+            Err(e) => {
+                eprintln!("WARN: 配置文件存在但解析失败，已忽略: {} ({})", path.display(), e);
+                let _ = PARSE_FAILURE.set(ParseFailure { path: path.clone(), error: e.to_string() });
+                break;
+            }
+        }
     }
     // M16：searxng_url 的 env 覆盖在磁盘配置之后统一做（env > 文件 > None）
     merge_searxng_env(&mut cfg, std::env::var("GSEARCH_SEARXNG_URL").ok());

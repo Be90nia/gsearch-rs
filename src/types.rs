@@ -7,6 +7,10 @@ pub struct SearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
+    /// dd1：来源内部相关性分透传（SearXNG JSON results[].score）；无分来源（Google HTML、
+    /// SearXNG HTML 降级）缺席该键，agent 按键存在性判断可否按分筛序。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
     /// nw4：来源类型标注（URL host 启发式：docs/github/wikipedia/blog/forum/video/news/qa/other）。
     /// 零网络零猜测——未命中一律 other。装配处统一走 util::domain_class。
     pub domain_class: &'static str,
@@ -43,8 +47,8 @@ pub struct MetaOutput {
     pub limit: usize,
     /// 从启动到产出结果的总耗时（毫秒）。
     pub elapsed_ms: u128,
-    pub results_count: usize,
-    /// 是否被 `--limit` 截断。search 命令：达到 limit 且最后一页满则 true。
+    /// 是否被 `--limit` 截断；false = 正常态，键缺席（8lp 空值缺席=正常）。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
     /// M16：本次搜索来源："searxng"（配了 SearXNG 且成功）或 "google"（直爬 / 回退 / browse / dl）。
     pub provider: String,
@@ -103,12 +107,15 @@ pub enum RunStatus {
 }
 
 /// M15 扩展：人类可读的状态文本，Agent 可直接喂回 LLM。
+/// 8lp：happy-path 空值缺席——captcha_solved=false、message="" 是正常态，不占键。
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct RunStatusInfo {
     pub status: RunStatus,
     /// 本次是否经过人工 CAPTCHA 验证（仅 Ok 时有信息量）。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub captcha_solved: bool,
     /// 人类可读提示。CaptchaRequired 时含“弹窗请用户验证 + 已等 N 秒/120 秒”。
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub message: String,
 }
 
@@ -126,7 +133,8 @@ pub struct OutputEnvelope<T: Serialize> {
 pub struct BatchEntry {
     pub query: String,
     pub status: RunStatus,
-    /// status=error 时的人类可读原因；ok 时空串。
+    /// status=error 时的人类可读原因；ok 时空串 → 键缺席（8lp）。
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub message: String,
     pub meta: MetaOutput,
     pub results: Vec<SearchResult>,
@@ -154,7 +162,8 @@ pub struct BatchMetaV2 {
 pub struct BatchEntryV2 {
     pub query: String,
     pub status: RunStatus,
-    /// status=error 时的人类可读原因；ok 时空串（与 BatchEntry 同语义）。
+    /// status=error 时的人类可读原因；ok 时空串 → 键缺席（与 BatchEntry 同语义，8lp）。
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub message: String,
     pub results: Vec<SearchResult>,
 }
@@ -181,6 +190,7 @@ mod tests {
             title: "T".into(),
             url: "https://example.com/".into(),
             snippet: "S".into(),
+            score: None,
             domain_class: "other",
         }]
     }
@@ -197,7 +207,6 @@ mod tests {
             humanize: false,
             limit: 10,
             elapsed_ms: 1234,
-            results_count: 1,
             truncated: false,
             provider: "google".into(),
             recency: None,
@@ -297,8 +306,9 @@ mod tests {
         );
     }
 
-    /// batch 契约（issue gsearch-rs-doh）：元素含 query/status/message/meta/results 五键，
+    /// batch 契约（issue gsearch-rs-doh）：元素含 query/status/meta/results 键，
     /// status 序列化小写 snake_case；error 条目 results 为空数组且 message 带原因。
+    /// 8lp：ok 条目 message 空串 → 键缺席（缺席=正常）。
     #[test]
     fn batch_entry_serializes_contract_keys() {
         let mut m = sample_meta();
@@ -312,9 +322,10 @@ mod tests {
             results: sample_results(),
         };
         let v: serde_json::Value = serde_json::to_value(&ok).unwrap();
-        for k in ["query", "status", "message", "meta", "results"] {
+        for k in ["query", "status", "meta", "results"] {
             assert!(v.get(k).is_some(), "缺少键 {k}");
         }
+        assert!(v.get("message").is_none(), "ok 条目 message 空串应缺席: {v}");
         assert_eq!(v["status"], "ok");
         assert_eq!(v["meta"]["provider"], "searxng");
         assert_eq!(v["meta"]["query"], "rust async");
@@ -330,6 +341,28 @@ mod tests {
         assert_eq!(v["status"], "error");
         assert_eq!(v["message"], "SearXNG 查询失败");
         assert_eq!(v["results"].as_array().unwrap().len(), 0);
+    }
+
+    /// 8lp：空值缺席=正常——run.captcha_solved=false / run.message="" / meta.truncated=false
+    /// 不占键；dd1：score=Some 时透传且 domain_class 仍是末键（nw4 契约不破）。
+    #[test]
+    fn null_value_absence_and_score_passthrough() {
+        let env = OutputEnvelope::<Vec<SearchResult>> {
+            meta: sample_meta(),
+            run: RunStatusInfo::default(),
+            results: vec![],
+        };
+        let s = serde_json::to_string(&env).unwrap();
+        assert!(!s.contains("captcha_solved"), "captcha_solved=false 应缺席: {s}");
+        assert!(!s.contains("\"message\""), "message=\"\" 应缺席: {s}");
+        assert!(!s.contains("\"truncated\""), "truncated=false 应缺席: {s}");
+        assert!(!s.contains("\"results_count\""), "results_count 已从 meta 移除: {s}");
+
+        let mut r = sample_results().remove(0);
+        r.score = Some(1.5);
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"score\":1.5"), "score 应透传: {s}");
+        assert!(s.ends_with(r#""domain_class":"other"}"#), "domain_class 应仍是末键: {s}");
     }
 
     /// nx4 契约：v2 信封顶层 meta{n_total,n_ok,n_fail,elapsed_ms} 只出一层；
@@ -361,12 +394,12 @@ mod tests {
         assert_eq!(m["elapsed_ms"], 88);
         let arr = v["results"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
-        for e in arr {
-            for k in ["query", "status", "message", "results"] {
-                assert!(e.get(k).is_some(), "缺少键 {k}");
-            }
-            assert!(e.get("meta").is_none(), "v2 元素不应带 meta: {e}");
+        // 8lp：ok 条目 message 空串缺席，error 条目才有 message 键
+        for (i, k) in [(0usize, "query"), (0, "status"), (0, "results"), (1, "message")] {
+            assert!(arr[i].get(k).is_some(), "元素 {i} 缺少键 {k}");
         }
+        assert!(arr[0].get("message").is_none(), "v2 ok 条目 message 空串应缺席: {}", arr[0]);
+        assert!(arr[0].get("meta").is_none(), "v2 元素不应带 meta: {}", arr[0]);
         assert_eq!(arr[0]["status"], "ok");
         assert_eq!(arr[1]["status"], "error");
     }

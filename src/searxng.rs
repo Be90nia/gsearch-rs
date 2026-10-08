@@ -43,6 +43,9 @@ struct SearxngResult {
     url: String,
     #[serde(default, deserialize_with = "null_as_default")]
     content: String,
+    /// dd1：SearXNG 内部相关性分；部分引擎无分为 null → serde Option 原生收 None。
+    #[serde(default)]
+    score: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -111,6 +114,7 @@ fn parse(text: &str) -> Result<Vec<SearchResult>> {
                 title: r.title,
                 url: r.url,
                 snippet: r.content,
+                score: r.score,
                 domain_class,
             }
         })
@@ -170,6 +174,7 @@ fn extract_articles(doc: &Html, article: &Selector, base_url: &str) -> Vec<Searc
             title: text_of(&a),
             url,
             snippet,
+            score: None,
             domain_class,
         });
     }
@@ -189,6 +194,7 @@ fn extract_walk(doc: &Html, base_url: &str) -> Vec<SearchResult> {
                 title: text_of(&el),
                 url,
                 snippet: String::new(),
+                score: None,
                 domain_class,
             });
             pending = true;

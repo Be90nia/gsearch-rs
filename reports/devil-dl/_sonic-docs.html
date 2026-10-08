@@ -1,0 +1,462 @@
+=== https://docs.rs/sonic-rs/latest/sonic_rs/ | sonic_rs - Rust ===
+sonic_rs - Rust
+Docs.rs
+sonic-rs-0.5.10
+sonic-rs 0.5.10
+Permalink
+Docs.rs crate page
+Apache-2.0
+11 September 2026
+Links
+Repository
+crates.io
+Source
+Owners
+liuq19
+shenyj3
+github:cloudwego:volo-team
+Dependencies
+ahash ^0.8
+normal
+bumpalo ^3.19
+normal
+bytes ^1.10
+normal
+cfg-if ^1.0
+normal
+faststr ^0.2
+normal
+itoa ^1.0
+normal
+ref-cast ^1.0
+normal
+serde ^1.0
+normal
+simdutf8 ^0.1
+normal
+sonic-number ^0.1
+normal
+sonic-simd ^0.1
+normal
+thiserror ^2.0
+normal
+zmij ^1.0
+normal
+bytes ^1.4
+dev
+chrono ^0.4
+dev
+encoding_rs ^0.8
+dev
+paste ^1.0
+dev
+serde_bytes ^0.11
+dev
+serde_derive ^1.0
+dev
+serde_json ^1.0
+dev
+Versions
+71.73%
+of the crate is documented
+Platform
+x86_64-unknown-linux-gnu
+Feature flags
+docs.rs
+About docs.rs
+Badges
+Builds
+Metadata
+Shorthand URLs
+Download
+Rustdoc JSON
+Build queue
+Privacy policy
+Rust
+Rust website
+The Book
+Standard Library API Reference
+Rust by Example
+The Cargo Guide
+Clippy Documentation
+Skip to main content
+Crate sonic_rs
+sonic_ rs 0.5.10
+All Items
+Sections
+sonic-rs
+Requirements/Notes
+Quick to use sonic-rs
+Features
+Benchmark
+Usage
+FAQs
+Acknowledgement
+Contributing
+Crate Items
+Modules
+Macros
+Structs
+Enums
+Traits
+Functions
+Type Aliases
+Derive Macros
+Crate sonic_ rs Copy item path
+Source
+Expand description
+§ sonic-rs
+English | 中文
+A fast Rust JSON library based on SIMD. It has some references to other open-source libraries like sonic_cpp , serde_json , sonic , simdjson , rust-std and more.
+For Golang users to use sonic_rs , please see for_Golang_user.md
+For users to migrate from serde_json to sonic_rs , can see serdejson_compatibility
+§ Requirements/Notes
+Faster in x86_64 or aarch64, other architecture is fallback and maybe very slower.
+Requires Rust nightly version Support Stable Rust now.
+Please add the compile options -C target-cpu=native
+Should enable sanitize feature to avoid false-positive if you are using LLVM-sanitizer in your program. Don’t enable this feature in production, since it will cause 30% performance loss in serialize.
+§ Quick to use sonic-rs
+To ensure that SIMD instruction is used in sonic-rs, you need to add rustflags -C target-cpu=native and compile on the host machine. For example, Rust flags can be configured in Cargo config .
+Add sonic-rs in Cargo.toml
+[dependencies]
+sonic-rs = "0.3"
+§ Features
+Serde into Rust struct as serde_json and serde .
+Parse/Serialize JSON for untyped sonic_rs::Value , which can be mutable.
+Get specific fields from a JSON with the blazing performance.
+Use JSON as a lazy array or object iterator with the blazing performance.
+Support LazyValue , Number and RawNumber (just like Golang’s JsonNumber ) in default.
+The floating parsing precision is as Rust std in default.
+§ Benchmark
+The main optimization in sonic-rs is the use of SIMD. However, we do not use the two-stage SIMD algorithms from simd-json . We primarily use SIMD in the following scenarios:
+parsing/serialize long JSON strings
+parsing the fraction of float number
+Getting a specific elem or field from JSON
+Skipping white spaces when parsing JSON
+More details about optimization can be found in performance.md .
+Benchmarks environment:
+Architecture: x86_64
+Model name: Intel(R) Xeon(R) Platinum 8260 CPU @ 2.40GHz
+AArch64 benchmark data can be found in benchmark_aarch64.md .
+Benchmarks:
+Deserialize Struct: Deserialize the JSON into Rust struct. The defined struct and testdata is from json-benchmark
+Deseirlize Untyped: Deseialize the JSON into an untyped document
+The serialize benchmarks work oppositely.
+All deserialized benchmarks enabled UTF-8 validation and enabled float_roundtrip in serde-json to get sufficient precision as Rust std.
+§ Deserialize Struct
+The benchmark will parse JSON into a Rust struct, and there are no unknown fields in JSON text. All fields are parsed into struct fields in the JSON.
+Sonic-rs is faster than simd-json because simd-json (Rust) first parses the JSON into a tape , then parses the tape into a Rust struct. Sonic-rs directly parses the JSON into a Rust struct, and there are no temporary data structures. The flamegraph is profiled in the citm_catalog case.
+cargo bench --bench deserialize_struct -- --quiet
+twitter/sonic_rs::from_slice_unchecked
+time: [ 694.74 µs 707.83 µs 723.19 µs]
+twitter/sonic_rs::from_slice
+time: [ 796.44 µs 827.74 µs 861.30 µs]
+twitter/simd_json::from_slice
+time: [ 1.0615 ms 1.0872 ms 1.1153 ms]
+twitter/serde_json::from_slice
+time: [ 2.2659 ms 2.2895 ms 2.3167 ms]
+twitter/serde_json::from_str
+time: [ 1.3504 ms 1.3842 ms 1.4246 ms]
+citm_catalog/sonic_rs::from_slice_unchecked
+time: [ 1.2271 ms 1.2467 ms 1.2711 ms]
+citm_catalog/sonic_rs::from_slice
+time: [ 1.3344 ms 1.3671 ms 1.4050 ms]
+citm_catalog/simd_json::from_slice
+time: [ 2.0648 ms 2.0970 ms 2.1352 ms]
+citm_catalog/serde_json::from_slice
+time: [ 2.9391 ms 2.9870 ms 3.0481 ms]
+citm_catalog/serde_json::from_str
+time: [ 2.5736 ms 2.6079 ms 2.6518 ms]
+canada/sonic_rs::from_slice_unchecked
+time: [ 3.7779 ms 3.8059 ms 3.8368 ms]
+canada/sonic_rs::from_slice
+time: [ 3.9676 ms 4.0212 ms 4.0906 ms]
+canada/simd_json::from_slice
+time: [ 7.9582 ms 8.0932 ms 8.2541 ms]
+canada/serde_json::from_slice
+time: [ 9.2184 ms 9.3560 ms 9.5299 ms]
+canada/serde_json::from_str
+time: [ 9.0383 ms 9.2563 ms 9.5048 ms]
+§ Deserialize Untyped
+The benchmark will parse JSON into a document. Sonic-rs seems faster for several reasons:
+There are also no temporary data structures in sonic-rs, as detailed above.
+Sonic-rs uses a memory arena for the whole document, resulting in fewer memory allocations, better cache-friendliness, and mutability.
+The JSON object in sonic_rs::Value is an array. Sonic-rs does not build a hashmap.
+cargo bench --bench deserialize_value -- --quiet
+twitter/sonic_rs_dom::from_slice
+time: [ 550.95 µs 556.10 µs 562.89 µs]
+twitter/sonic_rs_dom::from_slice_unchecked
+time: [ 525.97 µs 530.26 µs 536.06 µs]
+twitter/serde_json::from_slice
+time: [ 3.7599 ms 3.8009 ms 3.8513 ms]
+twitter/serde_json::from_str
+time: [ 2.8618 ms 2.8960 ms 2.9396 ms]
+twitter/simd_json::slice_to_owned_value
+time: [ 1.7302 ms 1.7557 ms 1.7881 ms]
+twitter/simd_json::slice_to_borrowed_value
+time: [ 1.1870 ms 1.1951 ms 1.2039 ms]
+canada/sonic_rs_dom::from_slice
+time: [ 4.9060 ms 4.9568 ms 5.0213 ms]
+canada/sonic_rs_dom::from_slice_unchecked
+time: [ 4.7858 ms 4.8728 ms 4.9803 ms]
+canada/serde_json::from_slice
+time: [ 16.689 ms 16.980 ms 17.335 ms]
+canada/serde_json::from_str
+time: [ 16.398 ms 16.640 ms 16.932 ms]
+canada/simd_json::slice_to_owned_value
+time: [ 12.627 ms 12.846 ms 13.070 ms]
+canada/simd_json::slice_to_borrowed_value
+time: [ 12.030 ms 12.164 ms 12.323 ms]
+citm_catalog/sonic_rs_dom::from_slice
+time: [ 1.6657 ms 1.6981 ms 1.7341 ms]
+citm_catalog/sonic_rs_dom::from_slice_unchecked
+time: [ 1.5109 ms 1.5253 ms 1.5424 ms]
+citm_catalog/serde_json::from_slice
+time: [ 8.1618 ms 8.2566 ms 8.3653 ms]
+citm_catalog/serde_json::from_str
+time: [ 7.8652 ms 8.0706 ms 8.3074 ms]
+citm_catalog/simd_json::slice_to_owned_value
+time: [ 3.9834 ms 4.0325 ms 4.0956 ms]
+citm_catalog/simd_json::slice_to_borrowed_value
+time: [ 3.3196 ms 3.3433 ms 3.3689 ms]
+§ Serialize Untyped
+cargo bench --bench serialize_value -- --quiet
+We serialize the document into a string. In the following benchmarks, sonic-rs appears faster for the twitter JSON. The twitter JSON contains many long JSON strings, which fit well with sonic-rs’s SIMD optimization.
+twitter/sonic_rs::to_string
+time: [ 380.90 µs 390.00 µs 400.38 µs]
+twitter/serde_json::to_string
+time: [ 788.98 µs 797.34 µs 807.69 µs]
+twitter/simd_json::to_string
+time: [ 965.66 µs 981.14 µs 998.08 µs]
+citm_catalog/sonic_rs::to_string
+time: [ 805.85 µs 821.99 µs 841.06 µs]
+citm_catalog/serde_json::to_string
+time: [ 1.8299 ms 1.8880 ms 1.9498 ms]
+citm_catalog/simd_json::to_string
+time: [ 1.7356 ms 1.7636 ms 1.7972 ms]
+canada/sonic_rs::to_string
+time: [ 6.5808 ms 6.7082 ms 6.8570 ms]
+canada/serde_json::to_string
+time: [ 6.4800 ms 6.5747 ms 6.6893 ms]
+canada/simd_json::to_string
+time: [ 7.3751 ms 7.5690 ms 7.7944 ms]
+§ Serialize Struct
+cargo bench --bench serialize_struct -- --quiet
+The explanation is as mentioned above.
+twitter/sonic_rs::to_string
+time: [ 434.03 µs 448.25 µs 463.97 µs]
+twitter/simd_json::to_string
+time: [ 506.21 µs 515.54 µs 526.35 µs]
+twitter/serde_json::to_string
+time: [ 719.70 µs 739.97 µs 762.69 µs]
+canada/sonic_rs::to_string
+time: [ 4.6701 ms 4.7481 ms 4.8404 ms]
+canada/simd_json::to_string
+time: [ 5.8072 ms 5.8793 ms 5.9625 ms]
+canada/serde_json::to_string
+time: [ 4.5708 ms 4.6281 ms 4.6967 ms]
+citm_catalog/sonic_rs::to_string
+time: [ 624.86 µs 629.54 µs 634.57 µs]
+citm_catalog/simd_json::to_string
+time: [ 624.10 µs 633.55 µs 644.78 µs]
+citm_catalog/serde_json::to_string
+time: [ 802.10 µs 814.15 µs 828.10 µs]
+§ Get from JSON
+cargo bench --bench get_from -- --quiet
+The benchmark is getting a specific field from the twitter.json .
+sonic-rs::get_unchecked_from_str: without validate
+sonic-rs::get_from_str: with validate
+gjson::get_from_str: without validate
+Sonic-rs utilize SIMD to quickly skip unnecessary fields in the unchecked case, thus enhancing the performance.
+twitter/sonic-rs::get_unchecked_from_str
+time: [ 75.671 µs 76.766 µs 77.894 µs]
+twitter/sonic-rs::get_from_str
+time: [ 430.45 µs 434.62 µs 439.43 µs]
+twitter/gjson::get_from_str
+time: [ 359.61 µs 363.14 µs 367.19 µs]
+§ Usage
+§ Serde into Rust Type
+Directly use the Deserialize or Serialize trait.
+use sonic_rs::{Deserialize, Serialize};
+// sonic-rs re-exported them from serde
+// or use serde::{Deserialize, Serialize};
+#[derive(Serialize, Deserialize)]
+struct Person {
+name: String,
+age: u8,
+phones: Vec<String>,
+}
+fn main() {
+let data = r#"{
+"name": "Xiaoming",
+"age": 18,
+"phones": [
+"+123456"
+]
+}"#;
+let p: Person = sonic_rs::from_str(data).unwrap();
+assert_eq!(p.age, 18);
+assert_eq!(p.name, "Xiaoming");
+let out = sonic_rs::to_string_pretty(&p).unwrap();
+assert_eq!(out, data);
+}
+§ Get a field from JSON
+Get a specific field from a JSON with the pointer path. The return is a LazyValue , which is a wrapper of a raw valid JSON slice.
+We provide the get and get_unchecked apis. get_unchecked apis should be used in valid JSON, otherwise it may return unexpected result.
+use sonic_rs::JsonValueTrait;
+use sonic_rs::{get, get_unchecked, pointer};
+fn main() {
+let path = pointer!["a", "b", "c", 1];
+let json = r#"
+{"u": 123, "a": {"b" : {"c": [null, "found"]}}}
+"#;
+let target = unsafe { get_unchecked(json, &path).unwrap() };
+assert_eq!(target.as_raw_str(), r#""found""#);
+assert_eq!(target.as_str().unwrap(), "found");
+let target = get(json, &path);
+assert_eq!(target.as_str().unwrap(), "found");
+assert_eq!(target.unwrap().as_raw_str(), r#""found""#);
+let path = pointer!["a", "b", "c", "d"];
+let json = r#"
+{"u": 123, "a": {"b" : {"c": [null, "found"]}}}
+"#;
+// not found from json
+let target = get(json, &path);
+assert!(target.is_err());
+}
+§ Parse and Serialize into untyped Value
+Parse a JSON into a sonic_rs::Value .
+use sonic_rs::{from_str, json};
+use sonic_rs::JsonValueMutTrait;
+use sonic_rs::{pointer, JsonValueTrait, Value};
+fn main() {
+let json = r#"{
+"name": "Xiaoming",
+"obj": {},
+"arr": [],
+"age": 18,
+"address": {
+"city": "Beijing"
+},
+"phones": [
+"+123456"
+]
+}"#;
+let mut root: Value = from_str(json).unwrap();
+// get key from value
+let age = root.get("age").as_i64();
+assert_eq!(age.unwrap_or_default(), 18);
+// get by index
+let first = root["phones"][0].as_str().unwrap();
+assert_eq!(first, "+123456");
+// get by pointer
+let phones = root.pointer(&pointer!["phones", 0]);
+assert_eq!(phones.as_str().unwrap(), "+123456");
+// convert to mutable object
+let obj = root.as_object_mut().unwrap();
+obj.insert(&"inserted", true);
+assert!(obj.contains_key(&"inserted"));
+let mut object = json!({ "A": 65, "B": 66, "C": 67 });
+*object.get_mut("A").unwrap() = json!({
+"code": 123,
+"success": false,
+"payload": {}
+});
+let mut val = json!(["A", "B", "C"]);
+*val.get_mut(2).unwrap() = json!("D");
+// serialize
+assert_eq!(serde_json::to_string(&val).unwrap(), r#"["A","B","D"]"#);
+}
+§ JSON Iterator
+Parse an object or array JSON into a lazy iterator.
+use bytes::Bytes;
+use faststr::FastStr;
+use sonic_rs::JsonValueTrait;
+use sonic_rs::{to_array_iter, to_object_iter_unchecked};
+fn main() {
+let json = Bytes::from(r#"[1, 2, 3, 4, 5, 6]"#);
+let iter = to_array_iter(&json);
+for (i, v) in iter.enumerate() {
+assert_eq!(i + 1, v.as_u64().unwrap() as usize);
+}
+let json = Bytes::from(r#"[1, 2, 3, 4, 5, 6"#);
+let iter = to_array_iter(&json);
+for elem in iter {
+// do something for each elem
+// deal with errors when invalid json
+if elem.is_err() {
+assert_eq!(
+elem.err().unwrap().to_string(),
+"Expected this character to be either a ',' or a ']' while parsing at line 1 column 17"
+);
+}
+}
+let json = FastStr::from(r#"{"a": null, "b":[1, 2, 3]}"#);
+let iter = unsafe { to_object_iter_unchecked(&json) };
+for ret in iter {
+// deal with errors
+if ret.is_err() {
+println!("{}", ret.unwrap_err());
+return;
+}
+let (k, v) = ret.unwrap();
+if k == "a" {
+assert!(v.is_null());
+} else if k == "b" {
+let iter = to_array_iter(v.as_raw_str());
+for (i, v) in iter.enumerate() {
+assert_eq!(i + 1, v.as_u64().unwrap() as usize);
+}
+}
+}
+}
+§ JSON LazyValue & Number & RawNumber
+If we need to parse a JSON value as a raw string, we can use LazyValue .
+If we need to parse a JSON number into an untyped type, we can use Number .
+If we need to parse a JSON number without loss of precision , we can use RawNumber . It likes encoding/json.Number in Golang, and can also be parsed from a JSON string.
+Detailed examples can be found in raw_value.rs and json_number.rs .
+§ Error handle
+Sonic’s errors are followed as serde-json and have a display around the error position, examples in handle_error.rs .
+§ FAQs
+§ About UTF-8
+By default, sonic-rs enable the UTF-8 validation, except for xx_unchecked APIs.
+§ About floating point precision
+By default, sonic-rs uses floating point precision consistent with the Rust standard library, and there is no need to add an extra float_roundtrip feature like serde-json to ensure floating point precision.
+If you want to achieve lossless precision when parsing floating-point numbers, such as Golang encoding/json.Number and serde-json arbitrary_precision , you can use sonic_rs::RawNumber .
+§ Acknowledgement
+Thanks the following open-source libraries. sonic-rs has some references to other open-source libraries like sonic_cpp , serde_json , sonic , simdjson , yyjson , rust-std and so on.
+We rewrote many SIMD algorithms from sonic-cpp/sonic/simdjson/yyjson for performance. We reused the de/ser codes and modified necessary parts from serde_json to make high compatibility with serde . We reused part codes about floating parsing from rust-std to make it more accurate.
+Referenced papers:
+Parsing Gigabytes of JSON per Second
+JSONSki: streaming semi-structured data with bit-parallel fast-forwarding
+§ Contributing
+Please read CONTRIBUTING.md for information on contributing to sonic-rs.
+Modules §
+error Errors. format Formtter for JSON serialization. lazyvalue A lazy type to representing a unparsed raw JSON text for lazy operators. parser prelude Imports the various traits about JSON. use sonic_rs::prelude::* to make the
+various traits and methods imported if you need. reader serde Serde between JSON text and Rust data structure. value A dynamic type to representing any valid JSON value. writer Extend trait from io::Write for JSON serializing.
+Macros §
+array Construct a sonic_rs::value::Array from a JSON array literal. json Construct a sonic_rs::Value from a JSON literal. object Construct a sonic_rs::value::Object from a JSON object literal. pointer Represents a json pointer path.
+Structs §
+Array Array represents a JSON array. Its APIs are likes Array<Value> . Array Json Iter A lazied iterator for JSON array text. It will parse the JSON when iterating. Deserializer A structure that deserializes JSON into Rust values. Error This type represents all possible errors that can occur when serializing or
+deserializing JSON data. FastStr FastStr is a string type that try to avoid the cost of clone. Lazy Array Lazy Object Lazy Value LazyValue wrappers a unparsed raw JSON text. It is borrowed from the origin JSON text. MapAccess Number Represents a JSON number, whether integer or floating point. Object Represents the JSON object. The inner implement is a key-value array. Its order is as same as
+origin JSON. Object Json Iter A lazied iterator for JSON object text. It will parse the JSON when iterating. Owned Lazy Value OwnedLazyValue wrappers a unparsed raw JSON text. It is owned and support Get, Set Pointer Tree PointerTree is designed for get_many and
+get_many_unchecked . RawNumber Represents a JSON number with arbitrary precision, the underlying representation of a string,
+like as Golang json.Number . Read JSON input source that reads from a string/bytes-like JSON input. SeqAccess Serializer A structure for serializing Rust values into JSON. Stream Deserializer An iterator that deserializes a json stream into multiple T values. Value Represents any valid JSON value.
+Enums §
+Json Type JsonType is an enum that represents the type of a JSON value. Pointer Node Represents a node in a json pointer path. Value Ref ValueRef is a immutable reference helper for Value .
+Traits §
+Deserialize A data structure that can be deserialized from any data format supported
+by Serde. Index An indexing trait for JSON. Json Container Trait A trait for all JSON object or array values. Used by Value . Json Input A trait for string/bytes-like types that can be parsed into JSON. Json Number Trait Number trait for both Number and RawNumber . Json Value MutTrait A trait for all mutable JSON values. Used by mutable Value . Json Value Trait A trait for all JSON values. Used by Value and LazyValue . Serialize A data structure that can be serialized into any data format supported
+by Serde.
+Functions §
+from_ reader Deserialize an instance of type T from a Reader from_ slice Deserialize an instance of type T from bytes of JSON text.
+If user can guarantee the JSON is valid UTF-8, recommend to use from_slice_unchecked instead. from_ slice_ unchecked ⚠ Deserialize an instance of type T from bytes of JSON text. from_ str Deserialize an instance of type T from a string of JSON text. from_ value Interpret a sonic_rs::Value as an instance of type T . get Gets a field from a path . And return it as a Result<LazyValue> . get_ by_ schema get_by_schema returns new Value from the given schema and json data get_ from_ bytes Gets a field from a path . And return it as a Result<LazyValue> . get_ from_ bytes_ unchecked ⚠ Gets a field from a path . And return it as a Result<LazyValue> . get_ from_ faststr Gets a field from a path . And return it as a Result<LazyValue> . get_ from_ faststr_ unchecked ⚠ Gets a field from a path . And return it as a Result<LazyValue> . get_ from_ slice Gets a field from a path . And return it as a Result<LazyValue> . get_ from_ slice_ unchecked ⚠ Gets a field from a path . And return it as a Result<LazyValue> . get_ from_ str Gets a field from a path . And return it as a Result<LazyValue> . get_ from_ str_ unchecked ⚠ Gets a field from a path . And return it as a Result<LazyValue> . get_ many get_many returns multiple fields from the PointerTree . get_ many_ unchecked ⚠ get_many returns multiple fields from the PointerTree . get_ unchecked ⚠ Gets a field from a path . And return it as a Result<LazyValue> . to_ array_ iter Traverse the JSON array text through a lazy iterator. The JSON parsing will doing when
+iterating. to_ array_ iter_ unchecked ⚠ Traverse the JSON text through a lazy object iterator. The JSON parsing will doing when
+iterating. to_ lazyvalue Serialize the given data structure as a OwnedLazyValue of JSON. to_ object_ iter Traverse the JSON object text through a lazy iterator. The JSON parsing will doing when
+iterating. to_ object_ iter_ unchecked ⚠ Traverse the JSON text through a lazy object iterator. The JSON parsing will doing when
+iterating. to_ string Serialize the given data structure as a String of JSON. to_ string_ pretty Serialize the given data structure as a pretty-printed String of JSON. to_ value Convert a T into sonic_rs::Value which can represent any valid JSON data. to_vec Serialize the given data structure as a JSON byte vector. to_ vec_ pretty Serialize the given data structure as a pretty-printed JSON byte vector. to_ writer Serialize the given data structure as JSON into the I/O stream. to_ writer_ pretty Serialize the given data structure as pretty-printed JSON into the I/O
+stream.
+Type Aliases §
+Json Pointer Represents a json pointer path. It can be created by [ pointer! ] macro. Result Alias for a Result with the error type sonic_rs::Error .
+Derive Macros §
+Deserialize Serialize

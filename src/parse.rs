@@ -36,6 +36,7 @@ pub fn parse_serp(html: &str) -> Vec<SearchResult> {
                 title: text_of(&title_el),
                 url,
                 snippet: String::new(),
+                score: None,
                 domain_class,
             });
             pending.push(results.len() - 1);

@@ -1,4 +1,5 @@
 pub mod browser;
+pub mod build;
 pub mod config;
 pub mod skeleton;
 pub mod output;

@@ -321,7 +321,8 @@ async fn cmd_fetch_batch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> 
             Ok(FetchOne::JsShell) => entries.push(serde_json::json!({
                 "url": url,
                 "status": "error",
-                "message": format!("该页无服务端正文（JS 壳），需渲染：用 gsearch browse {url}"),
+                // 8lp②：元素 url 键已携带地址，message 不再重复整段 URL
+                "message": "该页无服务端正文（JS 壳），需渲染：用 gsearch browse",
             })),
             Err(e) => {
                 let status = if e.to_string().contains("私网") { "private_blocked" } else { "error" };
@@ -333,7 +334,8 @@ async fn cmd_fetch_batch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> 
     let total = fetched.len();
     if opts.json {
         // 对齐 search batch：裸数组、无外层信封，单条失败不阻塞数组整体。
-        println!("{}", serde_json::to_string_pretty(&entries)?);
+        // 8lp：compact 单行——输出契约面向 agent 消费。
+        println!("{}", serde_json::to_string(&entries)?);
     } else {
         for (i, (url, result)) in fetched.iter().enumerate() {
             match result {
@@ -515,7 +517,10 @@ fn extract_with_include(html: &str, include: &str) -> Result<Option<String>> {
     use scraper::{Html, Selector};
     let doc = Html::parse_document(html);
     for sel in include.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let selector = Selector::parse(sel).map_err(|e| anyhow!("CSS selector 无效: {sel:?} ({e})"))?;
+        // day：scraper 的 Display 泄漏内部变体名（EmptySelector/Please report...），映射成用户可操作的文案
+        let selector = Selector::parse(sel).map_err(|_| {
+            anyhow!("CSS selector 无效: {sel:?}（语法错误，应为合法 CSS 选择器如 \"#main, article\"）")
+        })?;
         if let Some(el) = doc.select(&selector).next() {
             return Ok(Some(el.inner_html()));
         }

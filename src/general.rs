@@ -88,7 +88,6 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
                     humanize: false,
                     limit: 0,
                     elapsed_ms: started.elapsed().as_millis(),
-                    results_count: 0,
                     truncated,
                     provider: "google".into(),
                     recency: None,
@@ -127,7 +126,7 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
         read.url = url.to_string();
         read.title = title;
 
-        let out = postproc::render_read(&read, opts.json, opts.headings_only, opts.from, truncated, omitted);
+        let out = postproc::render_read(&read, opts.json, opts.headings_only, opts.from, truncated, omitted, false);
         println!("{out}");
         browser_opt = Some(browser);
         Ok(())

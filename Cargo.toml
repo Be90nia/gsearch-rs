@@ -29,6 +29,11 @@ futures = "0.3"
 # start_paused（tokio 虚拟时钟）仅测试启用；release 构建不含 dev-deps，二进制不受影响。
 tokio = { version = "1", features = ["test-util"] }
 
+# q01 版本烧录：build.rs 编译期注入 VERGEN_GIT_DESCRIBE/GIT_SHA（--version 行）。
+# vergen 9+ 平台拆分后选 gitcl（走 git CLI，维护最活跃）；仅描述符+sha 两项，构建增量成本可忽略。
+[build-dependencies]
+vergen-gitcl = "10"
+
 # M18 CI：Release profile 优化（Linux x86_64 release 二进制 16.4MB 撞 15MB 阈值）。
 # LTO=fat 比 thin 多压 1-2MB（chromiumoxide_cdp 全 CDP 类型最大受益），build 慢 ~30s 可接受。
 # strip=true 移除调试符号。codegen-units=1 让 LTO 跨单元。

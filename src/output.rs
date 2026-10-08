@@ -4,8 +4,15 @@ use anyhow::Result;
 
 use crate::types::{BatchEntry, BatchEnvelopeV2, OutputEnvelope, SearchResult};
 
-/// snippet 截断长度（按字符不按字节，中文摘要不会截出乱码）
+/// snippet 截断长度（按字符不按字节，中文摘要不会截出乱码）。
+/// 3gw：JSON 路径同样默认 160（此前人读 160/JSON 不截的倒挂已翻转），
+/// `--snippet-len` 可调，cli 值经 main 装配层用 `truncate_snippet` 落到结果上。
 const SNIPPET_MAX_CHARS: usize = 160;
+
+/// snippet 按字符截断（cw8/3gw：SERP snippet 占 JSON 载荷大头，默认 160 封顶）。
+pub fn truncate_snippet(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
 
 /// 默认输出：`N. 标题\n   url\n   snippet 前 160 字`
 /// M5：剥 title/url/snippet 里的 ANSI ESC 序列——日志/输出被彩色化（trace / 服务端标记
@@ -14,7 +21,7 @@ pub fn print_text(results: &[SearchResult]) {
     for (i, r) in results.iter().enumerate() {
         let title = strip_ansi(&r.title);
         let url = strip_ansi(&r.url);
-        let snippet: String = strip_ansi(&r.snippet).chars().take(SNIPPET_MAX_CHARS).collect();
+        let snippet = truncate_snippet(&strip_ansi(&r.snippet), SNIPPET_MAX_CHARS);
         // nw4：标题行尾 [class] 来源标注（与 --json domain_class 同源），AI/人一眼挑权威源
         println!("{}. {} [{}]\n   {}\n   {}\n", i + 1, title, r.domain_class, url, snippet);
     }
@@ -53,21 +60,23 @@ pub(crate) fn strip_ansi(s: &str) -> String {
 
 /// M14-1B：`--json` 输出 `{meta, results}` 信封，agent 解析友好。
 /// 泛型让 search 数组 / browse AdaptiveRead 共用同一序列化路径。
+/// 3gw：compact 是默认态（人不再是一等消费者）；pretty 人读模式也不加——缩进对
+/// LLM token 是纯税，JSON 语义与缩进无关。
 pub fn print_envelope_json<T: serde::Serialize>(envelope: &OutputEnvelope<T>) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(envelope)?);
+    println!("{}", serde_json::to_string(envelope)?);
     Ok(())
 }
 
-/// batch 多查询（issue gsearch-rs-doh）：`--json` 输出裸 BatchEntry 数组
+/// batch 多查询（issue gsearch-rs-doh）：输出裸 BatchEntry 数组
 /// （无外层信封——每条元素自带 meta/status，单条失败不阻塞数组整体）。
 pub fn print_batch_json(entries: &[BatchEntry]) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(entries)?);
+    println!("{}", serde_json::to_string(entries)?);
     Ok(())
 }
 
 /// nx4：`--envelope v2` batch 信封——顶层 meta 批统计一次，元素不带 14 字段 meta。
 pub fn print_batch_envelope_v2(envelope: &BatchEnvelopeV2) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(envelope)?);
+    println!("{}", serde_json::to_string(envelope)?);
     Ok(())
 }
 

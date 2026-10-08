@@ -1,0 +1,4 @@
+SearXNG http://192.168.89.249:8888 查询失败（查询无结果，HTML 结果页亦无结果），已回退 Google 直爬
+2026-10-08T09:58:10.258355Z  INFO 使用浏览器: Chrome -> C:\Program Files\Google\Chrome\Application\chrome.exe
+error: 加载 https://www.google.com/search?q=rust%20async%20block_on&start=0 失败: net::ERR_CONNECTION_TIMED_OUT
+（用 --verbose debug 查详细）

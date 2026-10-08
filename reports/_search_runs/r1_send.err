@@ -1,0 +1,5 @@
+SearXNG http://192.168.89.249:8888 查询失败（查询无结果，HTML 结果页亦无结果），已回退 Google 直爬
+2026-10-08T09:57:22.236821Z  INFO 使用浏览器: Chrome -> C:\Program Files\Google\Chrome\Application\chrome.exe
+2026-10-08T09:57:22.237309Z  INFO 新 profile 已创建: C:\Users\Begonia\.gsearch\profiles\blindblog（首次搜索可能弹 CAPTCHA，解一次后养熟）
+error: 加载 https://www.google.com/search?q=Rust%20async%20Send%20trait%20pitfalls&start=0 失败: net::ERR_CONNECTION_TIMED_OUT
+（用 --verbose debug 查详细）

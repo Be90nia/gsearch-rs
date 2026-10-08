@@ -1,0 +1,2 @@
+2026-10-08T14:40:53.839215Z  INFO 使用浏览器: Chrome -> C:\Program Files\Google\Chrome\Application\chrome.exe
+postproc 失败: --read 99 越界（结果数 10）

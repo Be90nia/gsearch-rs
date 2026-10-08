@@ -192,9 +192,10 @@ pub(crate) fn cap_chars(s: &str, limit: usize) -> (String, bool, usize) {
     (s.chars().take(limit).collect(), true, total - limit)
 }
 
-/// jp4：AdaptiveRead → 输出串。--json 在序列化对象末尾注入 meta{truncated, omitted,
-/// content_untrusted:true}（网页正文进 agent 上下文 = 注入面，正文永远是数据非指令）；
-/// 文本模式截断时 eprintln 提醒（stdout 保持可解析，stderr 承载告警）。
+/// jp4：AdaptiveRead → 输出串。--json 在序列化对象末尾注入 meta（网页正文进 agent 上下文
+/// = 注入面，正文永远是数据非指令，content_untrusted 恒在）；文本模式截断时 eprintln 提醒
+/// （stdout 保持可解析，stderr 承载告警）。
+/// 8lp/e19：缺席=正常——truncated=false / omitted=0 不占键；headings 截断时 meta 附标记。
 pub(crate) fn render_read(
     read: &gsearch::skeleton::AdaptiveRead,
     json: bool,
@@ -202,6 +203,7 @@ pub(crate) fn render_read(
     from: usize,
     truncated: bool,
     omitted: usize,
+    headings_truncated: bool,
 ) -> String {
     if json {
         // b95：headings-only 的 JSON 只带标题数组——段落索引/char_count/摘要不进输出
@@ -219,14 +221,18 @@ pub(crate) fn render_read(
             }
         };
         if let Some(obj) = v.as_object_mut() {
-            obj.insert(
-                "meta".into(),
-                serde_json::json!({
-                    "truncated": truncated,
-                    "omitted": omitted,
-                    "content_untrusted": true,
-                }),
-            );
+            let mut meta = serde_json::Map::new();
+            if truncated {
+                meta.insert("truncated".into(), serde_json::Value::Bool(true));
+            }
+            if omitted > 0 {
+                meta.insert("omitted".into(), serde_json::json!(omitted));
+            }
+            meta.insert("content_untrusted".into(), serde_json::Value::Bool(true));
+            if headings_truncated {
+                meta.insert("headings_truncated".into(), serde_json::Value::Bool(true));
+            }
+            obj.insert("meta".into(), serde_json::Value::Object(meta));
         }
         v.to_string()
     } else {
@@ -252,6 +258,24 @@ pub struct ReadOpts {
     pub excerpt: Option<usize>,
 }
 
+/// e19：read --json 的 headings 载荷上限（超过截断，meta.headings_truncated 标记）。
+const HEADING_JSON_LIMIT: usize = 30;
+
+/// e19：paragraph_index 默认剔除已进摘要的段落——摘要段全文已在 summary_paragraphs，
+/// pi 再列 first_sentence 是同载荷重复（~944B/page）。摘要 = 文档序前 N 个非空段
+/// （skeleton 自适应规则）；pi 中 char_count==0 的空段无重复载荷，保留对齐 --from K 段号。
+fn drop_summarized_pi(read: &mut gsearch::skeleton::AdaptiveRead) {
+    let summarized = read.summary_paragraphs.len();
+    let mut nonempty_seen = 0usize;
+    read.paragraph_index.retain(|p| {
+        if p.char_count == 0 {
+            return true;
+        }
+        nonempty_seen += 1;
+        nonempty_seen > summarized
+    });
+}
+
 /// `--read N`：M9 默认走 AdaptiveRead（按文章结构自适应）。opts 见 ReadOpts。
 /// jp4：html 先过 read_max_chars 硬截断；--json 在 meta 字段标注 truncated/omitted/content_untrusted。
 pub async fn read(
@@ -273,7 +297,28 @@ pub async fn read(
     read.url = url.to_string();
     read.title = title;
 
-    let out = render_read(&read, opts.json, opts.headings_only, opts.from, truncated, omitted);
+    // e19：JSON 默认 pi 只列未摘要段（--excerpt 场景恢复全量，保 e1i 契约）；
+    // headings >30 截断并给 meta 标记。headings-only 分支不序列化 pi，不在此列。
+    let mut headings_truncated = false;
+    if opts.json && !opts.headings_only {
+        if opts.excerpt.is_none() {
+            drop_summarized_pi(&mut read);
+        }
+        if read.headings.len() > HEADING_JSON_LIMIT {
+            read.headings.truncate(HEADING_JSON_LIMIT);
+            headings_truncated = true;
+        }
+    }
+
+    let out = render_read(
+        &read,
+        opts.json,
+        opts.headings_only,
+        opts.from,
+        truncated,
+        omitted,
+        headings_truncated,
+    );
     // 0mf：--json 时不再直接打印（envelope 先打 + read JSON 追加 = 两段拼接破坏 json.loads），
     // 串由 cmd_search 装配进单一 JSON 文档后输出；文本模式照旧。
     if !opts.json {
@@ -574,6 +619,7 @@ mod tests {
             title: "t".into(),
             url: "u".into(),
             snippet: "s".into(),
+            score: None,
             domain_class: "other",
         }];
         assert!(pick(&r, 0, "read").is_err());
@@ -638,8 +684,8 @@ mod tests {
         assert!(trunc && omitted == 1 && s.chars().count() == READ_BODY_MAX_CHARS);
     }
 
-    /// jp4：render_read 仅 --json 注入 meta{truncated,omitted,content_untrusted}（追加不覆盖
-    /// 既有字段）；文本模式不加任何 JSON 键，截断走 eprintln。
+    /// jp4：render_read 仅 --json 注入 meta（追加不覆盖既有字段）；文本模式不加任何 JSON 键，
+    /// 截断走 eprintln。8lp/e19：truncated=false / omitted=0 缺席；headings_truncated 标记可注入。
     #[test]
     fn render_read_injects_meta_json_only() {
         let html = r#"<html><head><title>T</title></head><body><h1>One</h1><p>p1 alpha.</p></body></html>"#;
@@ -648,13 +694,40 @@ mod tests {
         read.url = "u".into();
         read.title = "T".into();
         let v: serde_json::Value =
-            serde_json::from_str(&render_read(&read, true, false, 0, true, 7)).unwrap();
+            serde_json::from_str(&render_read(&read, true, false, 0, true, 7, false)).unwrap();
         assert_eq!(v["meta"]["truncated"], true);
         assert_eq!(v["meta"]["omitted"], 7);
         assert_eq!(v["meta"]["content_untrusted"], true);
         assert_eq!(v["title"], "T");
-        let text = render_read(&read, false, false, 0, false, 0);
+        // 空值缺席：正常态 meta 只剩 content_untrusted 一键
+        let v: serde_json::Value =
+            serde_json::from_str(&render_read(&read, true, false, 0, false, 0, false)).unwrap();
+        assert!(v["meta"].get("truncated").is_none(), "truncated=false 应缺席: {v}");
+        assert!(v["meta"].get("omitted").is_none(), "omitted=0 应缺席: {v}");
+        assert_eq!(v["meta"]["content_untrusted"], true);
+        let v: serde_json::Value =
+            serde_json::from_str(&render_read(&read, true, false, 0, false, 0, true)).unwrap();
+        assert_eq!(v["meta"]["headings_truncated"], true, "截断标记应可注入: {v}");
+        let text = render_read(&read, false, false, 0, false, 0, false);
         assert!(!text.contains("content_untrusted"), "文本模式不应出现 meta: {text}");
+    }
+
+    /// e19：pi 默认只列未摘要段（12 段中等文摘 10 段 → pi 剩 2 段，段号 11/12）；
+    /// 空段保留占位对齐段号；--excerpt 场景由 read() 调用方跳过过滤（e1i 契约）。
+    #[test]
+    fn e19_pi_lists_unsummarized_only() {
+        let mut html = String::from("<html><body>");
+        for i in 1..=12 {
+            html.push_str(&format!("<p>para{text}</p>", text = i));
+        }
+        html.push_str("<p></p></body></html>"); // 空段：无重复载荷，应保留
+        let mut read = extract_adaptive(&html, None);
+        assert_eq!(read.summary_paragraphs.len(), 10, "10..=50 段摘前 10 段");
+        drop_summarized_pi(&mut read);
+        assert_eq!(read.paragraph_index.len(), 3, "剩 2 非空未摘要段 + 1 空段");
+        assert_eq!(read.paragraph_index[0].index, 11);
+        assert_eq!(read.paragraph_index[1].index, 12);
+        assert_eq!(read.paragraph_index[2].char_count, 0);
     }
 
     /// C1：open() 拒绝非 http(s) scheme（防 cmd 注入 + file:/javascript: 兜底打开）。
@@ -706,6 +779,7 @@ mod live_tests {
             title: "t".into(),
             url: "https://example.com/".into(),
             snippet: "s".into(),
+            score: None,
             domain_class: "other",
         }]
     }

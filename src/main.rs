@@ -35,7 +35,7 @@ fn enable_utf8_console() {}
 #[derive(Parser, Debug)]
 #[command(
     name = "gsearch",
-    version,
+    version = gsearch::build::version_line(),
     about = "Google 搜索 + 通用浏览器代理 CLI（真 Chrome + 持久 profile）"
 )]
 struct Cli {
@@ -103,7 +103,11 @@ enum Command {
         /// fve：纯 innerText 全文（50000 cap）；与 --headings-only 互斥
         #[arg(long, default_value_t = false, group = "browse_mode")]
         full: bool,
+        /// 3gw：输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
         #[arg(long, default_value_t = false)]
+        human: bool,
+        /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
+        #[arg(long, hide = true, default_value_t = false)]
         json: bool,
         #[arg(long)]
         from: Option<usize>,
@@ -139,8 +143,11 @@ enum Command {
     Shell,
     /// 检测浏览器 / profile / 网络连通性 / 出口 IP / SearXNG 健康度（M11 doctor + ptb 探测）
     Doctor {
-        /// 2i1：输出结构化 JSON（{checks, elapsed_ms, fail_count, warn_count}；默认人类可读）
+        /// 3gw：输出默认 JSON（AI-first 契约）；此 flag 切回人读检查表。
         #[arg(long, default_value_t = false)]
+        human: bool,
+        /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
+        #[arg(long, hide = true, default_value_t = false)]
         json: bool,
     },
     /// HEADless URL 健康检查：HEAD/GET + redirect 链 + SSL + 延迟（M14-1A，无需 Chrome）
@@ -149,8 +156,11 @@ enum Command {
         /// 不设 required=true 以放行 --urls-file；零值由 required_unless_present 拒绝。
         #[arg(required_unless_present = "urls_file", num_args = 1..)]
         url: Vec<String>,
-        /// 输出结构化 JSON（默认人类可读 text）
+        /// 3gw：输出默认 JSON（AI-first 契约）；此 flag 切回人读表格。
         #[arg(long, default_value_t = false)]
+        human: bool,
+        /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
+        #[arg(long, hide = true, default_value_t = false)]
         json: bool,
         /// 单条探测总预算秒数（含 redirect；issue gsearch-rs-7qx：CDN 抖动端点可调高）
         #[arg(long, default_value_t = gsearch::verify::VERIFY_TIMEOUT_SECS)]
@@ -168,8 +178,11 @@ enum Command {
         /// 未命中回退全文提取，--json 在 meta.include_hit=false 标注。
         #[arg(long)]
         include: Option<String>,
-        /// 输出结构化 JSON（默认人类可读 text）
+        /// 3gw：输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
         #[arg(long, default_value_t = false)]
+        human: bool,
+        /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
+        #[arg(long, hide = true, default_value_t = false)]
         json: bool,
         /// 放行私网地址（loopback / RFC1918 / link-local / 云 metadata），同时允许内网明文 http。
         /// 默认拒（SSRF 门）；也可通过 `GSEARCH_FETCH_ALLOW_PRIVATE=1` 环境变量放行。
@@ -183,14 +196,16 @@ struct SearchArgs {
     /// 多查询 = batch 模式（并发 searxng、单条失败不阻塞、禁浏览器回退——浏览器单例不可并发）。
     #[arg(required = true, num_args = 1..)]
     query: Vec<String>,
-    #[arg(long, default_value_t = 10)]
+    /// cxa：1..=100——SearXNG 单查最多 10 页×10 条，更大的值只会翻页白耗时（实测 10000→18s）
+    #[arg(long, default_value_t = 10, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=100))]
     limit: usize,
     /// 时间过滤：只看 day/week/month/year 内的结果。SearXNG 加 time_range，Google SERP 加 tbs=qdr。
     /// `site:` 等查询语法原样透传，无专属参数。
     #[arg(long, value_enum)]
     recency: Option<RecencyArg>,
     /// `--open / --read / --dl` 互斥：每次只能指定一个；不可同时传。
-    #[arg(long, group = "post")]
+    /// l6o：1..——`--read 0` 曾被 Some(0) 当真值白起完整浏览器读阶段。
+    #[arg(long, group = "post", value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..))]
     read: Option<usize>,
     #[arg(long, group = "post")]
     dl: Option<usize>,
@@ -202,9 +217,15 @@ struct SearchArgs {
     humanize: bool,
     #[arg(long, default_value_t = false)]
     full: bool,
-    /// `--read N` 输出 AdaptiveRead 结构化 JSON
+    /// 3gw：输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
     #[arg(long, default_value_t = false)]
+    human: bool,
+    /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
+    #[arg(long, hide = true, default_value_t = false)]
     json: bool,
+    /// cw8：JSON 结果 snippet 截断长度（按字符）；默认 160。
+    #[arg(long, default_value_t = 160, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=100000))]
+    snippet_len: usize,
     /// `--read N --from K`：摘要段从第 K 段开始（1-based；默认 0 = 从首段）
     #[arg(long)]
     from: Option<usize>,
@@ -219,8 +240,8 @@ struct SearchArgs {
     /// 默认裸数组（存量 agent 零破坏）。单查询模式忽略此 flag。
     #[arg(long, value_enum)]
     envelope: Option<EnvelopeArg>,
-    /// 6dp：meta 压缩到 6 字段（query/results_count/truncated/provider/elapsed_ms/recency）。
-    /// 默认关（14 字段全量）；--verbose debug 或 GSEARCH_LOG=debug 时强制全量（排障现场保留）。
+    /// 6dp：meta 压缩到少量字段（query/truncated/provider/elapsed_ms/recency）。
+    /// 默认关（13 字段全量）；--verbose debug 或 GSEARCH_LOG=debug 时强制全量（排障现场保留）。
     #[arg(long, default_value_t = false)]
     compact_meta: bool,
     /// `--dl N -o DIR`：把下载文件落到 DIR 下（按 URL 末段命名）；DIR 缺省落 CWD。M13 修复两处不一致。
@@ -272,10 +293,11 @@ async fn main() -> ExitCode {
     gsearch::types::set_compact_meta(compact_requested && !debug_logging);
     let result: Result<ExitCode> = match cli.cmd {
         Command::Search(args) => cmd_search(args, proxy.clone()).await,
-        Command::Browse { url, full, json, from, headings_only, compact_meta: _, browser } => {
+        Command::Browse { url, full, human, from, headings_only, compact_meta: _, browser, .. } => {
             let opts = general::BrowseOpts {
                 full,
-                json,
+                // 3gw：--json 已是默认，--human 才切人读
+                json: !human,
                 from: from.unwrap_or(0),
                 headings_only,
                 browser: browser.into(),
@@ -288,12 +310,12 @@ async fn main() -> ExitCode {
             general::cmd_dl(&url, output.as_deref(), output_file.as_deref(), browser.into(), proxy.clone()).await
         }
         Command::Shell => shell::run_shell().await,
-        Command::Doctor { json } => cmd_doctor(json).await,
-        Command::Verify { url, json, timeout, urls_file } => {
-            gsearch::verify::cmd_verify(&url, json, proxy.as_deref(), timeout, urls_file.as_deref())
+        Command::Doctor { human, .. } => cmd_doctor(!human).await,
+        Command::Verify { url, human, timeout, urls_file, .. } => {
+            gsearch::verify::cmd_verify(&url, !human, proxy.as_deref(), timeout, urls_file.as_deref())
         }
-        Command::Fetch { url, json, allow_private, include } => {
-            fetch::cmd_fetch(&url, &fetch::FetchOpts { json, proxy: proxy.clone(), allow_private, include }).await
+        Command::Fetch { url, human, allow_private, include, .. } => {
+            fetch::cmd_fetch(&url, &fetch::FetchOpts { json: !human, proxy: proxy.clone(), allow_private, include }).await
         }
     };
 
@@ -327,18 +349,23 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
     let mut h_slot: Option<tokio::task::JoinHandle<()>> = None;
     let cfg = gsearch::search::SearchConfig { query: query.clone(), limit: args.limit, recency };
+    // 3gw：JSON 默认，--human 切人读
+    let json_mode = !args.human;
     // zc6：SearXNG 单次尝试四态——Results 直接用；CircuitBroken 熔断早退；
     // NotConfigured/FallbackGoogle 走原 Google 链（IP 正常时行为与旧版一致）。
     let searxng = gsearch::search::try_searxng(&cfg).await;
     if matches!(searxng, gsearch::search::SearxngAttempt::CircuitBroken) {
-        if args.json {
+        if json_mode {
             // stderr 诊断行已由 try_searxng 打（豁免未来任何静默策略）
             emit_searxng_degraded_json(&query, &args, &browser_path, &resolved_kind, proxy.clone(), recency, started.elapsed().as_millis());
         }
         // 人读模式 stdout 不打假结果；退出码 2 = 无结果语义族
         return Ok(ExitCode::from(2));
     }
-    let (results, captcha_solved, provider) = match searxng {
+    // yq6：记下主源失败——若 Google 回退也空，run.status 统一打 searxng_degraded
+    //（此前该分支 exit 2 且信封无状态标记，agent 无从区分「没资料」与「源降级」）。
+    let searxng_fell_back = matches!(searxng, gsearch::search::SearxngAttempt::FallbackGoogle);
+    let (mut results, captcha_solved, provider) = match searxng {
         gsearch::search::SearxngAttempt::Results(
             gsearch::search::SearchOutcome::Results { results, captcha_solved, provider },
         ) => (results, captcha_solved, provider),
@@ -393,7 +420,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             }
             gsearch::search::SearchOutcome::CaptchaTimeout => {
                 // 输出 captcha_timeout JSON（Agent 看到 status 字段就知道等人解超时）
-                if args.json {
+                if json_mode {
                     emit_captcha_timeout_json(&query, &args, &browser_path, &resolved_kind, proxy.clone(), recency, started.elapsed().as_millis());
                 } else {
                     eprintln!("error: CAPTCHA 亲解超时（{}s）；profile 已养熟，再次执行会跳过 CAPTCHA",
@@ -405,10 +432,16 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         }
         }
     };
+    // cw8/3gw：SERP snippet 默认 160 字符封顶（人读渲染本就 160，JSON 不再例外），--snippet-len 可调
+    for r in &mut results {
+        r.snippet = gsearch::output::truncate_snippet(&r.snippet, args.snippet_len);
+    }
+    // yq6：主源降级且回退也空——如实证状态，防 agent 把基础设施问题当「话题无资料」
+    let degraded = results.is_empty() && searxng_fell_back;
     // 0mf：--json + --read 时 read 产物并入单一 JSON 文档——envelope 延后装配，stdout 只出
     // 一份可解析 JSON（旧行为 envelope 先打 + read raw 追加 = json.loads 崩）。
     // b95：--headings-only 连 SERP 集都不进输出（text 模式同样跳过 print_text）。
-    let read_solo_json = args.json && args.read.is_some();
+    let read_solo_json = json_mode && args.read.is_some();
     let headings_solo = args.read.is_some() && args.headings_only;
     let meta = gsearch::types::MetaOutput {
         tool: "gsearch",
@@ -421,19 +454,29 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         humanize: args.humanize,
         limit: args.limit,
         elapsed_ms: started.elapsed().as_millis(),
-        results_count: results.len(),
         truncated: results.len() >= args.limit,
         provider: provider.into(),
         recency: recency.map(|r| r.as_str().into()),
     };
     let run = gsearch::types::RunStatusInfo {
-        status: gsearch::types::RunStatus::Ok,
+        // yq6：searxng 主源失败且回退也空 → 与熔断同款 degraded 标记（零结果 ≠ Ok）
+        status: if degraded {
+            gsearch::types::RunStatus::SearxngDegraded
+        } else {
+            gsearch::types::RunStatus::Ok
+        },
         captcha_solved,
-        message: if captcha_solved { "本次搜索经过了人工 CAPTCHA 验证".into() } else { String::new() },
+        message: if captcha_solved {
+            "本次搜索经过了人工 CAPTCHA 验证".into()
+        } else if degraded {
+            gsearch::search::SEARXNG_CIRCUIT_MSG.into()
+        } else {
+            String::new()
+        },
     };
     let envelope = gsearch::types::OutputEnvelope { meta, run, results: &results };
     if !read_solo_json {
-        if args.json {
+        if json_mode {
             gsearch::output::print_envelope_json(&envelope)?;
         } else if !headings_solo {
             gsearch::output::print_text(&results);
@@ -449,7 +492,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             let browser = ensure_search_browser(&mut browser_opt, &mut h_slot, browser_kind, proxy.clone()).await?;
             let opts = postproc::ReadOpts {
                 full: args.full,
-                json: args.json,
+                json: json_mode,
                 headings_only: args.headings_only,
                 from: args.from.unwrap_or(0),
                 excerpt: args.excerpt,
@@ -489,9 +532,18 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     }
     if let Err(e) = post {
         eprintln!("postproc 失败: {e}");
-        // 0mf：延后装配的 envelope 在 read 失败时兜底补打——保住「SERP JSON 已出 stdout」的旧行为
         if read_solo_json {
-            let _ = gsearch::output::print_envelope_json(&envelope);
+            // w9y：read 失败必须结构化可见——补打信封并顶层挂 read_error，
+            // agent 不再把「SERP 正常 + 读失败」误读为全成功。
+            let mut doc = serde_json::to_value(&envelope)?;
+            if let Some(obj) = doc.as_object_mut() {
+                obj.insert("read_error".into(), serde_json::Value::String(format!("{e:#}")));
+            }
+            println!("{doc}");
+        }
+        if args.read.is_some() {
+            // w9y：显式请求的读失败不再静默 exit 0
+            return Ok(ExitCode::from(1));
         }
     }
     if results.is_empty() {
@@ -529,6 +581,8 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
             "batch 多查询暂不支持 --read/--dl/--open（batch 无浏览器参与）；请对单查询使用"
         ));
     }
+    // 3gw：JSON 默认，--human 切人读
+    let json_mode = !args.human;
     let started = std::time::Instant::now();
     let (browser_path, resolved_kind) = resolve_browser_meta(browser_arg_to_kind(args.browser));
     let recency = args.recency.map(gsearch::search::Recency::from);
@@ -538,7 +592,7 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
     let entries: Vec<gsearch::types::BatchEntry> = outcomes
         .into_iter()
         .map(|(query, outcome)| {
-            let (status, message, results) = match outcome {
+            let (status, message, mut results) = match outcome {
                 Ok(gsearch::search::SearchOutcome::Results { results, .. }) => {
                     (gsearch::types::RunStatus::Ok, String::new(), results)
                 }
@@ -550,6 +604,10 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
                 ),
                 Err(reason) => (gsearch::types::RunStatus::Error, reason, vec![]),
             };
+            // cw8/3gw：snippet 封顶与单查询同规则
+            for r in &mut results {
+                r.snippet = gsearch::output::truncate_snippet(&r.snippet, args.snippet_len);
+            }
             let meta = gsearch::types::MetaOutput {
                 tool: "gsearch",
                 version: env!("CARGO_PKG_VERSION"),
@@ -562,7 +620,6 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
                 humanize: args.humanize,
                 limit: args.limit,
                 elapsed_ms,
-                results_count: results.len(),
                 truncated: results.len() >= args.limit,
                 provider: "searxng".into(),
                 recency: recency.map(|r| r.as_str().into()),
@@ -576,7 +633,7 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
             }
         })
         .collect();
-    if args.json {
+    if json_mode {
         if args.envelope == Some(EnvelopeArg::V2) {
             // nx4：v2 信封——批统计一次，元素丢 14 字段 meta（opt-in，默认裸数组不变）
             let n_ok = entries
@@ -673,7 +730,6 @@ fn emit_captcha_timeout_json(
         humanize: args.humanize,
         limit: args.limit,
         elapsed_ms,
-        results_count: 0,
         truncated: false,
         // CAPTCHA 超时只发生在 Google 直爬路径（searxng 不撞码）
         provider: "google".into(),
@@ -712,7 +768,6 @@ fn emit_searxng_degraded_json(
         humanize: args.humanize,
         limit: args.limit,
         elapsed_ms,
-        results_count: 0,
         truncated: false,
         // 熔断时结果确实来自 SearXNG 链路（provider 照实标注，非 google）
         provider: "searxng".into(),
@@ -738,8 +793,9 @@ fn browser_arg_to_kind(arg: BrowserArg) -> Option<gsearch::browser::BrowserKind>
 
 /// doctor 总耗时 <3s；不启动 Chrome。每项输出 `[OK] 描述 + 路径 / [WARN] ... / [FAIL] ...`。
 /// 全部 OK 退出 0；任意 FAIL 退出 1；仅 WARN 退出 0。
-/// 2i1：--json 输出 {checks:[{name,status,message}], elapsed_ms, fail_count, warn_count}
-/// （status 语义 ok/warn/fail/skip；exit 规则不变）。人读模式文本与旧版逐字节一致（除新增项）。
+/// 2i1：--json 输出 {checks:[{name,status,message,value?}], elapsed_ms, fail_count, warn_count}
+/// （status 语义 ok/warn/fail/skip；exit 规则不变；8lp③：ok 值类检查 message 缺席、数据进 value）。
+/// 人读模式文本与旧版逐字节一致（除新增项）。
 #[derive(serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DoctorStatus {
@@ -753,7 +809,12 @@ enum DoctorStatus {
 struct DoctorCheck {
     name: &'static str,
     status: DoctorStatus,
+    /// 8lp③：ok 的值类检查留空串（序列化缺席）；warn/fail/skip 的行动指引散文保留
+    #[serde(skip_serializing_if = "String::is_empty")]
     message: String,
+    /// 8lp③：值类检查的数据载荷（路径/IP/目标/profile）；纯散文检查为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -772,13 +833,30 @@ fn record_check(
     name: &'static str,
     status: DoctorStatus,
     message: String,
+    value: Option<String>,
 ) {
     match status {
         DoctorStatus::Fail => *fail += 1,
         DoctorStatus::Warn => *warn += 1,
         _ => {}
     }
-    checks.push(DoctorCheck { name, status, message });
+    checks.push(DoctorCheck { name, status, message, value });
+}
+
+/// 8lp③：人读分支从 value 拼回旧散文（格式与旧版逐字节一致）；散文检查原样透出。
+fn human_line(c: &DoctorCheck) -> String {
+    if !c.message.is_empty() {
+        return c.message.clone();
+    }
+    let v = c.value.as_deref().unwrap_or_default();
+    match c.name {
+        "chrome" => format!("Chrome: {v}"),
+        "edge" => format!("Edge:   {v}"),
+        "exit_ip" => format!("出口 IP: {v}"),
+        "network" => format!("网络连通 ({v})"),
+        "profile_source" => format!("profile 来自配置文件: {v}"),
+        _ => v.to_owned(),
+    }
 }
 
 async fn cmd_doctor(json: bool) -> Result<ExitCode> {
@@ -788,118 +866,167 @@ async fn cmd_doctor(json: bool) -> Result<ExitCode> {
     let mut warn = 0;
 
     // 1) Chrome 可用（走 find_specific，与 launch 一致：含 %LOCALAPPDATA% 用户级安装路径）
-    let (st, msg) = match gsearch::browser::find_specific(gsearch::browser::BrowserKind::Chrome) {
-        Some((p, _)) => (DoctorStatus::Ok, format!("Chrome: {}", p.display())),
-        None => (
-            DoctorStatus::Fail,
-            "Chrome 不可用（chrome.exe 未找到；含默认路径与用户级 %LOCALAPPDATA%）".to_string(),
-        ),
-    };
-    record_check(&mut checks, &mut fail, &mut warn, "chrome", st, msg);
+    let (st, msg, val) =
+        match gsearch::browser::find_specific(gsearch::browser::BrowserKind::Chrome) {
+            // 8lp③：值类检查——路径进 value，人读由 human_line 拼回
+            Some((p, _)) => (DoctorStatus::Ok, String::new(), Some(p.display().to_string())),
+            None => (
+                DoctorStatus::Fail,
+                "Chrome 不可用（chrome.exe 未找到；含默认路径与用户级 %LOCALAPPDATA%）".to_string(),
+                None,
+            ),
+        };
+    record_check(&mut checks, &mut fail, &mut warn, "chrome", st, msg, val);
 
     // 2) Edge 可用
-    let (st, msg) = match gsearch::browser::find_specific(gsearch::browser::BrowserKind::Edge) {
-        Some((p, _)) => (DoctorStatus::Ok, format!("Edge:   {}", p.display())),
-        None => (
-            DoctorStatus::Warn,
-            "Edge 不可用（msedge.exe 未找到；仅 Chrome 可跑）".to_string(),
-        ),
-    };
-    record_check(&mut checks, &mut fail, &mut warn, "edge", st, msg);
+    let (st, msg, val) =
+        match gsearch::browser::find_specific(gsearch::browser::BrowserKind::Edge) {
+            Some((p, _)) => (DoctorStatus::Ok, String::new(), Some(p.display().to_string())),
+            None => (
+                DoctorStatus::Warn,
+                "Edge 不可用（msedge.exe 未找到；仅 Chrome 可跑）".to_string(),
+                None,
+            ),
+        };
+    record_check(&mut checks, &mut fail, &mut warn, "edge", st, msg, val);
 
     // 3) profile 可写
-    let (st, msg) = match gsearch::browser::profile_dir() {
+    let (st, msg, val) = match gsearch::browser::profile_dir() {
         Ok(dir) => match test_profile_writable(&dir) {
-            Ok(()) => (DoctorStatus::Ok, format!("profile 可写: {}", dir.display())),
+            Ok(()) => (DoctorStatus::Ok, format!("profile 可写: {}", dir.display()), None),
             Err(e) => (
                 DoctorStatus::Fail,
                 format!("profile 不可写: {} ({e})", dir.display()),
+                None,
             ),
         },
-        Err(e) => (DoctorStatus::Fail, format!("profile 解析失败: {e}")),
+        Err(e) => (DoctorStatus::Fail, format!("profile 解析失败: {e}"), None),
     };
-    record_check(&mut checks, &mut fail, &mut warn, "profile_writable", st, msg);
+    record_check(&mut checks, &mut fail, &mut warn, "profile_writable", st, msg, val);
 
     // 4) 出口 IP（明文 HTTP GET 80 端口，3s 超时；失败降 WARN）
-    let (st, msg) = match tokio::time::timeout(
+    let (st, msg, val) = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         fetch_public_ip(),
     )
     .await
     {
-        Ok(Ok(ip)) => (DoctorStatus::Ok, format!("出口 IP: {ip}")),
+        // 8lp③：值类检查——IP 进 value
+        Ok(Ok(ip)) => (DoctorStatus::Ok, String::new(), Some(ip.to_string())),
         Ok(Err(e)) => (
             DoctorStatus::Warn,
             format!("出口 IP 不可达（撞码调试辅助；改用代理/VPN 后重试）: {e}"),
+            None,
         ),
-        Err(_) => (DoctorStatus::Warn, "出口 IP 检测超时（2s）".to_string()),
+        Err(_) => (DoctorStatus::Warn, "出口 IP 检测超时（2s）".to_string(), None),
     };
-    record_check(&mut checks, &mut fail, &mut warn, "exit_ip", st, msg);
+    record_check(&mut checks, &mut fail, &mut warn, "exit_ip", st, msg, val);
 
     // 5) 网络连通（TCP connect google.com:443，2s 超时）
-    let (st, msg) = match tokio::time::timeout(
+    let (st, msg, val) = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tokio::net::TcpStream::connect(("www.google.com", 443)),
     )
     .await
     {
-        Ok(Ok(_)) => (DoctorStatus::Ok, "网络连通 (www.google.com:443)".to_string()),
-        Ok(Err(e)) => (DoctorStatus::Fail, format!("网络不可达 (www.google.com:443): {e}")),
-        Err(_) => (DoctorStatus::Fail, "网络连接超时 (www.google.com:443)".to_string()),
+        // 8lp③：值类检查——目标进 value
+        Ok(Ok(_)) => (
+            DoctorStatus::Ok,
+            String::new(),
+            Some("www.google.com:443".to_string()),
+        ),
+        Ok(Err(e)) => (
+            DoctorStatus::Fail,
+            format!("网络不可达 (www.google.com:443): {e}"),
+            None,
+        ),
+        Err(_) => (
+            DoctorStatus::Fail,
+            "网络连接超时 (www.google.com:443)".to_string(),
+            None,
+        ),
     };
-    record_check(&mut checks, &mut fail, &mut warn, "network", st, msg);
+    record_check(&mut checks, &mut fail, &mut warn, "network", st, msg, val);
 
     // 6) 生效 profile 来源检查（env > 配置文件 > default）
-    let (st, msg) = if let Ok(v) = std::env::var("GSEARCH_PROFILE")
+    let (st, msg, val) = if let Ok(v) = std::env::var("GSEARCH_PROFILE")
         && !v.trim().is_empty()
     {
         let p = std::path::PathBuf::from(v.trim());
         if p.exists() {
-            (DoctorStatus::Ok, format!("GSEARCH_PROFILE 已设置且存在: {}", p.display()))
+            // env 来源的散文带「已验证存在」语义且人读 label 与 config 来源不同，保留散文
+            (
+                DoctorStatus::Ok,
+                format!("GSEARCH_PROFILE 已设置且存在: {}", p.display()),
+                None,
+            )
         } else {
             (
                 DoctorStatus::Warn,
                 format!("GSEARCH_PROFILE 已设置但路径不存在: {}（gsearch 会自动创建）", p.display()),
+                None,
             )
         }
     } else if let Some(p) = gsearch::config::load().profile.clone() {
-        (DoctorStatus::Ok, format!("profile 来自配置文件: {p}"))
+        // 8lp③：T-10 实锤「profile 来自配置文件: X」复述语义——name+value 足矣
+        (DoctorStatus::Ok, String::new(), Some(p))
     } else {
-        (DoctorStatus::Ok, "GSEARCH_PROFILE 未设置（默认 ~/.gsearch/profiles/default/）".to_string())
+        (
+            DoctorStatus::Ok,
+            "GSEARCH_PROFILE 未设置（默认 ~/.gsearch/profiles/default/）".to_string(),
+            None,
+        )
     };
-    record_check(&mut checks, &mut fail, &mut warn, "profile_source", st, msg);
+    record_check(&mut checks, &mut fail, &mut warn, "profile_source", st, msg, val);
 
     // 7) SearXNG 健康度（ptb）：查询级探测抓「端点活但零结果」盲区——doctor 只查 TCP 查不出
-    match gsearch::config::load().searxng_url.clone() {
-        None => record_check(
-            &mut checks,
-            &mut fail,
-            &mut warn,
-            "searxng",
-            DoctorStatus::Skip,
-            "SearXNG: 未配置（GSEARCH_SEARXNG_URL / gsearch.json searxng_url），跳过".to_string(),
-        ),
-        Some(base) => {
-            let (st, msg) = match gsearch::searxng::probe(&base).await {
-                Ok(p) if p.results > 0 => (
-                    DoctorStatus::Ok,
-                    format!(
-                        "SearXNG: HTTP {}, results={}, unresponsive_engines={} ({base})",
-                        p.http_status, p.results, p.unresponsive_engines
+    let (st, msg, val) = if let Some(f) = gsearch::config::parse_failure() {
+        // vw2：配置解析失败时 searxng_url 必然丢失，SKIP「未配置」是谎报——显式 FAIL（rc=1 走既有 fail 汇总）
+        (
+            DoctorStatus::Fail,
+            format!(
+                "配置文件存在但解析失败（已忽略，回退默认）: {} ({})",
+                f.path.display(),
+                f.error
+            ),
+            None,
+        )
+    } else {
+        match gsearch::config::load().searxng_url.clone() {
+            None => (
+                DoctorStatus::Skip,
+                "SearXNG: 未配置（GSEARCH_SEARXNG_URL / gsearch.json searxng_url），跳过".to_string(),
+                None,
+            ),
+            Some(base) => {
+                let (st, msg, val) = match gsearch::searxng::probe(&base).await {
+                    Ok(p) if p.results > 0 => (
+                        DoctorStatus::Ok,
+                        format!(
+                            "SearXNG: HTTP {}, results={}, unresponsive_engines={} ({base})",
+                            p.http_status, p.results, p.unresponsive_engines
+                        ),
+                        None,
                     ),
-                ),
-                Ok(p) => (
-                    DoctorStatus::Warn,
-                    format!(
-                        "SearXNG 可达但零结果（引擎降级/IP 信誉嫌疑）：HTTP {}, results=0, unresponsive_engines={} ({base})",
-                        p.http_status, p.unresponsive_engines
+                    Ok(p) => (
+                        DoctorStatus::Warn,
+                        format!(
+                            "SearXNG 可达但零结果（引擎降级/IP 信誉嫌疑）：HTTP {}, results=0, unresponsive_engines={} ({base})",
+                            p.http_status, p.unresponsive_engines
+                        ),
+                        None,
                     ),
-                ),
-                Err(e) => (DoctorStatus::Warn, format!("SearXNG 探测失败: {e} ({base})")),
-            };
-            record_check(&mut checks, &mut fail, &mut warn, "searxng", st, msg);
+                    Err(e) => (
+                        DoctorStatus::Warn,
+                        format!("SearXNG 探测失败: {e} ({base})"),
+                        None,
+                    ),
+                };
+                (st, msg, val)
+            }
         }
-    }
+    };
+    record_check(&mut checks, &mut fail, &mut warn, "searxng", st, msg, val);
 
     let elapsed_ms = started.elapsed().as_millis();
     if json {
@@ -909,7 +1036,8 @@ async fn cmd_doctor(json: bool) -> Result<ExitCode> {
             fail_count: fail,
             warn_count: warn,
         };
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        // 8lp：JSON 面向 agent 消费，compact 单行省 token
+        println!("{}", serde_json::to_string(&out)?);
     } else {
         println!("gsearch doctor");
         for c in &checks {
@@ -919,7 +1047,7 @@ async fn cmd_doctor(json: bool) -> Result<ExitCode> {
                 DoctorStatus::Fail => "[FAIL]",
                 DoctorStatus::Skip => "[SKIP]",
             };
-            println!("{tag} {}", c.message);
+            println!("{tag} {}", human_line(c));
         }
         if fail > 0 {
             println!("\n[{fail} 项 FAIL] 检查上面建议。（耗时 {elapsed_ms}ms）");
@@ -1051,28 +1179,64 @@ mod tests {
         assert!(compact_meta);
     }
 
-    /// 2i1：doctor --json flag 可解析、默认关。
+    /// 2i1→3gw：doctor 默认 JSON 输出；--human 切人读；--json 存量兼容（noop）。
     #[test]
     fn doctor_json_flag_parses() {
-        let cli = Cli::try_parse_from(["gsearch", "doctor", "--json"]).unwrap();
-        let Command::Doctor { json } = cli.cmd else { panic!("expected doctor") };
-        assert!(json);
         let cli = Cli::try_parse_from(["gsearch", "doctor"]).unwrap();
-        let Command::Doctor { json } = cli.cmd else { panic!("expected doctor") };
+        let Command::Doctor { json, human } = cli.cmd else { panic!("expected doctor") };
+        assert!(!human, "默认 JSON（human=false）");
         assert!(!json);
+        let cli = Cli::try_parse_from(["gsearch", "doctor", "--human"]).unwrap();
+        let Command::Doctor { human, .. } = cli.cmd else { panic!("expected doctor") };
+        assert!(human);
+        // 存量脚本 --json 仍可解析，且不改变默认 JSON 行为
+        let cli = Cli::try_parse_from(["gsearch", "doctor", "--json"]).unwrap();
+        let Command::Doctor { json, human } = cli.cmd else { panic!("expected doctor") };
+        assert!(json);
+        assert!(!human);
     }
 
-    /// M14-1A：verify 子命令 + --json flag 正常解析。
+    /// M14-1A→3gw：verify 子命令解析；默认 JSON、--human 切人读、--json 存量 noop。
     #[test]
     fn verify_subcommand_parses_with_json_flag() {
         let cli = Cli::try_parse_from(["gsearch", "verify", "https://example.com", "--json"]).unwrap();
-        let Command::Verify { url, json, .. } = cli.cmd else { panic!("expected verify") };
+        let Command::Verify { url, json, human, .. } = cli.cmd else { panic!("expected verify") };
         assert_eq!(url, vec!["https://example.com"]);
         assert!(json);
-        // 不带 flag 默认 text
+        assert!(!human, "--json 存量兼容：仍是 JSON 输出");
+        // 默认（不带 flag）也是 JSON
         let cli = Cli::try_parse_from(["gsearch", "verify", "https://example.com"]).unwrap();
-        let Command::Verify { json, .. } = cli.cmd else { panic!("expected verify") };
-        assert!(!json);
+        let Command::Verify { human, .. } = cli.cmd else { panic!("expected verify") };
+        assert!(!human);
+        // --human 才切人读
+        let cli = Cli::try_parse_from(["gsearch", "verify", "https://example.com", "--human"]).unwrap();
+        let Command::Verify { human, .. } = cli.cmd else { panic!("expected verify") };
+        assert!(human);
+    }
+
+    /// 3gw 主案：search 默认 JSON（human=false）、--human 翻转、--json 存量 noop、snippet 默认 160；
+    /// cxa/l6o：--limit 1..=100、--read 1.. 越界值 clap 阶段拒绝。
+    #[test]
+    fn ai_first_flip_defaults_and_value_ranges() {
+        let cli = Cli::try_parse_from(["gsearch", "search", "x"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert!(!args.human, "默认 JSON 输出");
+        assert!(!args.json);
+        let cli = Cli::try_parse_from(["gsearch", "search", "x", "--human"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert!(args.human);
+        // 存量 --json 解析接受、行为 noop（默认已是 JSON）
+        let cli = Cli::try_parse_from(["gsearch", "search", "x", "--json"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert!(args.json && !args.human);
+        assert_eq!(args.snippet_len, 160, "snippet cap 默认 160");
+        // cxa：--limit 越界拒绝（0 与 >100）
+        assert!(Cli::try_parse_from(["gsearch", "search", "x", "--limit", "0"]).is_err());
+        assert!(Cli::try_parse_from(["gsearch", "search", "x", "--limit", "101"]).is_err());
+        assert!(Cli::try_parse_from(["gsearch", "search", "x", "--limit", "100"]).is_ok());
+        // l6o：--read 0 拒绝（不再白起浏览器）
+        assert!(Cli::try_parse_from(["gsearch", "search", "x", "--read", "0"]).is_err());
+        assert!(Cli::try_parse_from(["gsearch", "search", "x", "--read", "1"]).is_ok());
     }
 
     /// --recency：day/week/month/year 枚举解析、缺省 None（URL 不得带过滤）、非法值拒绝。

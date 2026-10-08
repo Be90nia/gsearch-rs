@@ -46,7 +46,7 @@ pub fn cmd_verify(
         );
     }
     match targets.as_slice() {
-        // 单 URL：行为/输出与旧版一致（向后兼容闸）
+        // 单 URL：退出码与人读输出与旧版一致；JSON 增加 verdict 分类（6a6/ih1，与批量元素同构）
         [one] => {
             let probe = probe_url(one, proxy, timeout)?;
             match probe.transport {
@@ -101,15 +101,78 @@ impl Probe {
     fn probe_tag(&self) -> Option<&'static str> {
         self.get_fallback.then_some("get-fallback")
     }
+
+    /// 6a6：失败简述（ok=None）。http_error 带状态码；传输层失败带类别 + curl exit
+    /// （与单条 stderr 分类行同文案，中文 Windows 下不透传 GBK stderr）。
+    fn error_detail(&self) -> Option<String> {
+        match self.verdict {
+            0 => None,
+            2 => Some(format!("HTTP {}", self.report.status)),
+            _ => self
+                .transport
+                .map(|(kind, code)| format!("{kind} (curl exit {code})")),
+        }
+    }
+
+    /// ih1：ssl_valid 的输出值。仅 https 有 TLS 参与 → Some(验证结果)；
+    /// http（无握手）与其余传输失败 → None（JSON 整键缺席 / 人读 n/a），不再谎报。
+    /// 成功路径按最终 URL 的 scheme 判定（重定向后落在 http 也算无 TLS）。
+    fn ssl_output(&self) -> Option<bool> {
+        match self.transport {
+            Some(_) => (self.verdict == 3).then_some(false),
+            None => scheme_is_https(&self.report.final_url).then_some(true),
+        }
+    }
 }
 
-/// JSON 元素 = VerifyReport 平铺 + 可选 probe 标注。
+/// URL 是否 https（大小写不敏感）；无 scheme 按 curl 默认视为 http。
+fn scheme_is_https(url: &str) -> bool {
+    url.trim_start().to_ascii_lowercase().starts_with("https://")
+}
+
+/// 6a6：verdict 数值 → 分类名（与单条退出码 0/2/3/4/5 一一对应）。
+fn verdict_name(v: u8) -> &'static str {
+    match v {
+        0 => "ok",
+        2 => "http_error",
+        3 => "ssl_error",
+        4 => "dns_error",
+        5 => "timeout",
+        _ => "other",
+    }
+}
+
+/// verify 的 JSON 输出元素。显式字段复刻 VerifyReport 的键序（status/final_url/redirect_chain/
+/// ssl_valid/latency_ms，旧消费者按序可读），其后追加 verdict 分类（6a6）与可选标注。
+/// 不走 `#[serde(flatten)]`——flatten 经 serde_json::Map 会按字典序重排键。
 #[derive(Serialize)]
 struct ProbeJson<'a> {
-    #[serde(flatten)]
-    report: &'a VerifyReport,
+    status: u16,
+    final_url: &'a str,
+    redirect_chain: &'a [String],
+    /// ih1：http 目标整键缺席（Option=None），不再谎报 true。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssl_valid: Option<bool>,
+    latency_ms: u64,
+    /// 错误分类：ok/http_error/ssl_error/dns_error/timeout/other。
+    verdict: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     probe: Option<&'static str>,
+}
+
+fn probe_json(p: &Probe) -> ProbeJson<'_> {
+    ProbeJson {
+        status: p.report.status,
+        final_url: &p.report.final_url,
+        redirect_chain: &p.report.redirect_chain,
+        ssl_valid: p.ssl_output(),
+        latency_ms: p.report.latency_ms,
+        verdict: verdict_name(p.verdict),
+        error_detail: p.error_detail(),
+        probe: p.probe_tag(),
+    }
 }
 
 /// HEAD 探测被 403/405 拒 → GET（Range: bytes=0-0）重测一次再判定：
@@ -137,7 +200,8 @@ fn probe_url(url: &str, proxy: Option<&str>, timeout: u64) -> Result<Probe> {
                 status: 0,
                 final_url: url.to_owned(),
                 redirect_chain: Vec::new(),
-                // 未拿到任何 HTTP 响应，TLS 状态无从谈起：按 false 上报（SSL 路径同旧值）
+                // 结构体字段只存旧缺省；输出侧 ssl_valid 由 Probe::ssl_output() 派生（ih1：
+                // 仅 SSL 失败显示 false，DNS/超时与 TLS 无关显示 n/a）
                 ssl_valid: false,
                 latency_ms: started.elapsed().as_millis() as u64,
             },
@@ -159,7 +223,7 @@ fn probe_url(url: &str, proxy: Option<&str>, timeout: u64) -> Result<Probe> {
             status,
             final_url,
             redirect_chain: chain,
-            // https：握手+证书已由 curl/Schannel 验证通过；http：无握手即无异常。
+            // 结构体字段存旧缺省 true；输出侧由 Probe::ssl_output() 按最终 URL scheme 判定（ih1）
             ssl_valid: true,
             latency_ms: started.elapsed().as_millis() as u64,
         },
@@ -180,86 +244,83 @@ fn transport_kind(verdict: u8) -> &'static str {
     }
 }
 
-/// 单 URL 传输层失败：仅 SSL 失败出 ssl_valid=false 的报告，其余只出 stderr 分类行。
+/// 单 URL 传输层失败：JSON 一律出结构化分类行（6a6，单条/批量同构）；
+/// 人读仅 SSL 失败出报告（旧行为），其余只出 stderr 分类行。
 fn transport_exit(probe: &Probe, kind: &'static str, curl_code: i32, json: bool) -> ExitCode {
-    if probe.verdict == 3 {
-        print_report(&probe.report, json);
+    if json {
+        print_json(&probe_json(probe));
+    } else if probe.verdict == 3 {
+        print_report(&probe.report, probe.ssl_output());
     }
     eprintln!("verify {kind} (curl exit {curl_code})");
     ExitCode::from(probe.verdict)
 }
 
 fn print_probe(p: &Probe, json: bool) {
-    if !json {
-        print_report(&p.report, false);
-        if let Some(tag) = p.probe_tag() {
-            println!("probe:       {tag}");
-        }
+    if json {
+        print_json(&probe_json(p));
         return;
     }
-    match p.probe_tag() {
-        // 无标注：直接序列化报告，与旧 VerifyReport 输出逐字节一致
-        // （flatten 走 serde_json::Map 会按字典序重排字段，旧结构不能走这条路）
-        None => print_json(&p.report),
-        Some(tag) => print_json(&ProbeJson {
-            report: &p.report,
-            probe: Some(tag),
-        }),
+    print_report(&p.report, p.ssl_output());
+    if let Some(tag) = p.probe_tag() {
+        println!("probe:       {tag}");
     }
 }
 
-/// 批量输出：--json 为报告数组（元素含可选 probe 标注）；人读为对比表。
+/// 批量输出：--json 为报告数组（元素含 verdict 分类）；人读为对比表（含分类列，6a6）。
 fn print_batch(urls: &[String], probes: &[Probe], json: bool) {
     if json {
-        let rows: Vec<ProbeJson> = probes
-            .iter()
-            .map(|p| ProbeJson {
-                report: &p.report,
-                probe: p.probe_tag(),
-            })
-            .collect();
+        let rows: Vec<ProbeJson> = probes.iter().map(probe_json).collect();
         print_json(&rows);
         return;
     }
     let w = urls.iter().map(String::len).max().unwrap_or(3).max(3);
     println!(
-        "{:<w$}  {:>6}  {:>5}  {:>10}",
-        "url", "status", "ssl", "latency_ms",
+        "{:<w$}  {:>6}  {:>5}  {:>11}  {:>10}",
+        "url", "status", "ssl", "verdict", "latency_ms",
         w = w
     );
     for (u, p) in urls.iter().zip(probes) {
         println!(
-            "{:<w$}  {:>6}  {:>5}  {:>10}",
+            "{:<w$}  {:>6}  {:>5}  {:>11}  {:>10}",
             u,
             p.report.status,
-            p.report.ssl_valid,
+            ssl_cell(p.ssl_output()),
+            verdict_name(p.verdict),
             p.report.latency_ms,
             w = w
         );
     }
 }
 
+/// ih1：ssl 列单元格——None = http 无 TLS 参与，显示 n/a。
+fn ssl_cell(ssl: Option<bool>) -> &'static str {
+    match ssl {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "n/a",
+    }
+}
+
+/// 8lp：JSON 走 compact 单行——输出契约面向 agent 消费，pretty 纯耗 token。
 fn print_json<T: Serialize>(v: &T) {
-    match serde_json::to_string_pretty(v) {
+    match serde_json::to_string(v) {
         Ok(s) => println!("{s}"),
         Err(e) => eprintln!("JSON 序列化失败: {e}"),
     }
 }
 
-fn print_report(r: &VerifyReport, json: bool) {
-    if json {
-        print_json(r);
+fn print_report(r: &VerifyReport, ssl: Option<bool>) {
+    println!("status:      {}", r.status);
+    println!("final_url:   {}", r.final_url);
+    if r.redirect_chain.is_empty() {
+        println!("redirects:   0");
     } else {
-        println!("status:      {}", r.status);
-        println!("final_url:   {}", r.final_url);
-        if r.redirect_chain.is_empty() {
-            println!("redirects:   0");
-        } else {
-            println!("redirects:   {}", r.redirect_chain.join(" -> "));
-        }
-        println!("ssl_valid:   {}", r.ssl_valid);
-        println!("latency_ms:  {}", r.latency_ms);
+        println!("redirects:   {}", r.redirect_chain.join(" -> "));
     }
+    // ih1：http 目标无 TLS 参与 → n/a，不继承结构体缺省值谎报
+    println!("ssl_valid:   {}", ssl.map(|b| b.to_string()).unwrap_or_else(|| "n/a".into()));
+    println!("latency_ms:  {}", r.latency_ms);
 }
 
 fn curl_args(url: &str, proxy: Option<&str>, timeout: u64, head: bool) -> Vec<String> {
@@ -513,12 +574,75 @@ content-type: text/html\r\n\
     #[test]
     fn probe_json_marks_get_fallback() {
         let p = probe_fixture(true);
-        let out = ProbeJson {
-            report: &p.report,
-            probe: p.probe_tag(),
-        };
-        let s = serde_json::to_string(&out).unwrap();
+        let s = serde_json::to_string(&probe_json(&p)).unwrap();
         assert!(s.contains(r#""probe":"get-fallback""#));
         assert!(s.contains(r#""status":200"#));
+    }
+
+    /// 6a6：分类名与单条退出码语义一一对应。
+    #[test]
+    fn verdict_names_match_exit_code_semantics() {
+        assert_eq!(verdict_name(0), "ok");
+        assert_eq!(verdict_name(2), "http_error");
+        assert_eq!(verdict_name(3), "ssl_error");
+        assert_eq!(verdict_name(4), "dns_error");
+        assert_eq!(verdict_name(5), "timeout");
+        assert_eq!(verdict_name(1), "other");
+    }
+
+    /// 6a6：ok 无 error_detail；404 → HTTP 状态码简述；传输层失败 → 类别 + curl exit。
+    #[test]
+    fn error_detail_classifies_failures() {
+        let mut p = probe_fixture(false);
+        assert_eq!(p.error_detail(), None);
+
+        p.verdict = 2;
+        p.report.status = 404;
+        assert_eq!(p.error_detail().as_deref(), Some("HTTP 404"));
+
+        let mut p = probe_fixture(false);
+        p.verdict = 4;
+        p.transport = Some(("DNS 失败", 6));
+        assert_eq!(p.error_detail().as_deref(), Some("DNS 失败 (curl exit 6)"));
+    }
+
+    /// ih1：ssl_valid 输出值按 scheme/失败类别派生——https 成功 true、http n/a、
+    /// SSL 失败 false、DNS 失败不谎报 false。
+    #[test]
+    fn ssl_output_never_lies_for_http() {
+        let mut p = probe_fixture(false);
+        assert_eq!(p.ssl_output(), Some(true));
+
+        p.report.final_url = "http://x/".into();
+        assert_eq!(p.ssl_output(), None);
+
+        let mut p = probe_fixture(false);
+        p.verdict = 4;
+        p.transport = Some(("DNS 失败", 6));
+        assert_eq!(p.ssl_output(), None);
+
+        p.verdict = 3;
+        p.transport = Some(("SSL 失败", 60));
+        assert_eq!(p.ssl_output(), Some(false));
+
+        assert!(scheme_is_https("HTTPS://X/"));
+        assert!(!scheme_is_https("http://x/"));
+        assert!(!scheme_is_https("x/"));
+    }
+
+    /// ih1/6a6：JSON 元素——http 目标 ssl_valid 整键缺席，verdict 分类在场。
+    #[test]
+    fn probe_json_omits_ssl_valid_for_http() {
+        let mut p = probe_fixture(false);
+        p.report.final_url = "http://x/".into();
+        let s = serde_json::to_string(&probe_json(&p)).unwrap();
+        assert!(!s.contains("ssl_valid"));
+        assert!(s.contains(r#""verdict":"ok""#));
+
+        p.verdict = 4;
+        p.transport = Some(("DNS 失败", 6));
+        let s = serde_json::to_string(&probe_json(&p)).unwrap();
+        assert!(s.contains(r#""verdict":"dns_error""#));
+        assert!(s.contains(r#""error_detail""#));
     }
 }
