@@ -9,6 +9,8 @@
 
 use anyhow::Result;
 use htmd::HtmlToMarkdown;
+use scraper::{ElementRef, Html, Node as HtmlNode, Selector};
+use scraper::node::Text as HtmlText;
 
 /// 与 fetch::extract_text 同语义：script/style/noscript/template 连内容跳过。
 /// turndown 默认剥 script/style，noscript/template 显式补齐（html5ever 会把其内容当文本泄漏）。
@@ -16,7 +18,83 @@ pub(crate) fn html_to_markdown(html: &str) -> Result<String> {
     let converter = HtmlToMarkdown::builder()
         .skip_tags(vec!["script", "style", "noscript", "template"])
         .build();
-    Ok(converter.convert(html)?)
+    Ok(converter.convert(&sanitize_pre_blocks(html))?)
+}
+
+/// pre>code 保真化（盲测七 0bh）：rustdoc 类文档页的 code 块内含 span 高亮 / a 链接 /
+/// div where 等结构，htmd 的 span 行尾修剪会折叠换行（#[derive] 与 struct 合行）、
+/// a 转成 markdown 链接语法（代码块内注入链接）、div 块级边界注入伪影空行——三处
+/// 静默变异，meta.truncated 标志不覆盖。此处把每个 pre 内 code 的子树重写为单
+/// Text 节点（textContent + 块级元素前边界换行），保留 pre>code 容器与 class
+/// （语言标注与 fenced 路径走 htmd 原生逻辑不变）。纯文本 code 块经此路径文本
+/// 不变，输出逐字节等价。
+fn sanitize_pre_blocks(html: &str) -> String {
+    let mut doc = Html::parse_document(html);
+    let sel = Selector::parse("pre code").expect("静态选择器必然合法");
+    let rewrites: Vec<_> = doc
+        .select(&sel)
+        .map(|code| (code.id(), faithful_code_text(&code)))
+        .collect();
+    if rewrites.is_empty() {
+        return html.to_string();
+    }
+    for (id, text) in rewrites {
+        let child_ids: Vec<_> = doc
+            .tree
+            .get(id)
+            .expect("node id 来自同一棵树")
+            .children()
+            .map(|c| c.id())
+            .collect();
+        for cid in child_ids {
+            if let Some(mut n) = doc.tree.get_mut(cid) {
+                n.detach();
+            }
+        }
+        if let Some(mut code) = doc.tree.get_mut(id) {
+            code.append(HtmlNode::Text(HtmlText { text: text.into() }));
+        }
+    }
+    doc.html()
+}
+
+/// code 子树的保真文本：Text 原样（HTML 源码换行保留）；块级子元素（div.where 等）
+/// 前补一个换行（末尾已有换行则不重复，防伪影空行）；br 视为换行；行内元素
+///（span/a/em）仅透传内容。turndown 上游语义即 textContent（T2：code block 规则）。
+fn faithful_code_text(code: &ElementRef) -> String {
+    let mut out = String::new();
+    // 显式栈 DFS 保持文档序（fetch::tree_text 同风格，ego_tree 类型全程推断）
+    let mut stack: Vec<_> = code.children().rev().collect();
+    while let Some(node) = stack.pop() {
+        match node.value() {
+            HtmlNode::Text(t) => out.push_str(t),
+            HtmlNode::Element(el) => {
+                let name = el.name();
+                if name == "br" {
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    continue;
+                }
+                if is_block_level(name) && !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                stack.extend(node.children().rev());
+            }
+            _ => {}
+        }
+    }
+    out
+
+}
+
+/// fenced 内容保真场景下的块级元素集合（div.where 是 docs.rs 签名块的实测形态，
+/// 其余为常见围栏内块级标签兜底；行内 span/a 不在列——加边界反而制造换行伪影）。
+fn is_block_level(name: &str) -> bool {
+    matches!(
+        name,
+        "div" | "p" | "li" | "tr" | "blockquote" | "section" | "article" | "details" | "summary"
+    )
 }
 
 #[cfg(test)]
@@ -77,5 +155,52 @@ mod tests {
         assert!(!md.contains("color:red"), "style 泄漏: {md:?}");
         assert!(!md.contains("var a"), "script 泄漏: {md:?}");
         assert!(!md.contains("无 JS 提示"), "noscript 泄漏: {md:?}");
+    }
+
+    /// 盲测七 0bh 回归一：fenced 块内换行保留——rustdoc span 高亮携带的行尾换行
+    /// 不得被折叠（#[derive(...)] 与 struct 必须分行）。
+    #[test]
+    fn fenced_block_keeps_newlines() {
+        let html = r#"<pre><code><span class="attr">#[derive(Deserialize, Debug)]
+</span><span class="kw">struct </span>User {
+    fingerprint: String,
+}</code></pre>"#;
+        let md = html_to_markdown(html).unwrap();
+        assert!(
+            md.contains("#[derive(Deserialize, Debug)]\nstruct User {"),
+            "derive 与 struct 合行 = 换行折叠: {md:?}"
+        );
+    }
+
+    /// 盲测七 0bh 回归二：fenced 块内 a 链接只留文本，不注入 markdown 链接语法；
+    /// div.where 块级前边界换行、且 where 前无伪影空行。
+    #[test]
+    fn fenced_block_strips_link_syntax_and_where_gap() {
+        let html = r#"<pre><code>pub fn f(s: &amp;<a class="primitive" href="https://doc.rust-lang.org/std/primitive.str.html">str</a>) -&gt; <a class="type" href="type.Result.html">Result</a>&lt;T&gt;<div class="where">where
+    T: <a class="trait" href="de/trait.D.html">Deserialize</a>&lt;'a&gt;,</div></code></pre>"#;
+        let md = html_to_markdown(html).unwrap();
+        assert!(!md.contains("]("), "链接语法注入: {md:?}");
+        assert!(md.contains("&str"), "链接文本丢失: {md:?}");
+        assert!(md.contains("<T>\nwhere\n"), "where 前边界缺失: {md:?}");
+        assert!(!md.contains("<T>\n\nwhere"), "伪影空行: {md:?}");
+    }
+
+    /// 盲测七 0bh 回归三：ASCII 撇号 U+0027 逐字保真，不偷换弯引号。
+    #[test]
+    fn fenced_block_keeps_ascii_apostrophe() {
+        let html = "<pre><code>let s = 'it&#39;s fine';</code></pre>";
+        let md = html_to_markdown(html).unwrap();
+        assert!(md.contains("it's fine"), "撇号变异: {md:?}");
+        assert!(!md.contains('\u{2019}'), "弯引号混入: {md:?}");
+    }
+
+    /// 防回退：纯文本 code 块（GitHub md 渲染形态）语言标注与内容不变——
+    /// sanitize 路径对纯文本必须是透传等价。
+    #[test]
+    fn plain_code_block_language_annotation_unchanged() {
+        let html = "<pre><code class=\"language-rust\">fn main() {}</code></pre>";
+        let md = html_to_markdown(html).unwrap();
+        assert!(md.contains("```rust"), "语言标注丢失: {md:?}");
+        assert!(md.contains("fn main() {}"), "内容丢失: {md:?}");
     }
 }

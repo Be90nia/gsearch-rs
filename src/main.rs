@@ -90,7 +90,7 @@ impl From<RecencyArg> for gsearch::search::Recency {
     }
 }
 
-/// nx4：--envelope 的 CLI 枚举。v2 = batch --json 输出顶层 {meta,results}（批统计一次）。
+/// --envelope 的 CLI 枚举。v2 = batch --json 输出顶层 {meta,results}（批统计一次）。
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum EnvelopeArg {
     V2,
@@ -98,15 +98,15 @@ enum EnvelopeArg {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Google 搜索（M2 实现；M9 `--read N` 默认 AdaptiveRead）
+    /// Google 搜索（`--read N` 默认 AdaptiveRead）
     Search(SearchArgs),
-    /// 任意 URL → 渲染后页面正文（M1 主验收点；M9 默认 AdaptiveRead）
+    /// 任意 URL → 渲染后页面正文（默认 AdaptiveRead）
     Browse {
         url: String,
-        /// fve：纯 innerText 全文（50000 cap）；与 --headings-only 互斥
+        /// 纯 innerText 全文（50000 cap）；与 --headings-only 互斥
         #[arg(long, default_value_t = false, group = "browse_mode")]
         full: bool,
-        /// 3gw：输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
+        /// 输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
         #[arg(long, default_value_t = false)]
         human: bool,
         /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
@@ -116,33 +116,33 @@ enum Command {
         from: Option<usize>,
         #[arg(long, default_value_t = false, group = "browse_mode")]
         headings_only: bool,
-        /// 6dp：meta 压缩（仅 --json --full 信封生效；debug 日志强制全量）
+        /// meta 压缩（仅 --json --full 信封生效；debug 日志强制全量）
         #[arg(long, default_value_t = false)]
         compact_meta: bool,
-        /// xih：正文以 markdown 输出（渲染后 HTML 转换，隐含全文模式，与 --headings-only 互斥）。
+        /// 正文以 markdown 输出（渲染后 HTML 转换，隐含全文模式，与 --headings-only 互斥）。
         /// --json 时 content_text 字段换源为 markdown，meta.format="markdown" 标注。
         #[arg(long, default_value_t = false, conflicts_with = "headings_only")]
         markdown: bool,
-        /// n76：正文字符预算（HTML/innerText/markdown 上限；超限截断并在 meta.truncated 如实标注）。
+        /// 正文字符预算（HTML/innerText/markdown 上限；超限截断并在 meta.truncated 如实标注）。
         #[arg(long, default_value_t = 50_000, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=10_000_000))]
         max_chars: usize,
-        /// pkp：放行私网地址（loopback / RFC1918 / link-local / 云 metadata），语义与 fetch 对齐。
+        /// 放行私网地址（loopback / RFC1918 / link-local / 云 metadata），语义与 fetch 对齐。
         /// 默认拒（SSRF 门）：browse 的 URL 可能来自 LLM 输出（搜索结果/页面内容间接注入），
         /// 私网地址默认不渲染；非 http/https scheme（file:///javascript:/data: 等）一律拒绝，无 flag 可绕。
         #[arg(long, default_value_t = false)]
         allow_private: bool,
         #[arg(long, value_enum, default_value_t = BrowserArg::Auto)]
-        /// 选择浏览器（M11）
+        /// 选择浏览器
         browser: BrowserArg,
     },
     /// 有头窗人工登录，cookie 落 profile
     Login {
         url: String,
         #[arg(long, value_enum, default_value_t = BrowserArg::Auto)]
-        /// 选择浏览器（M11）
+        /// 选择浏览器
         browser: BrowserArg,
     },
-    /// 带 profile 登录态下载（M6）。-o 末段带扩展名 = 落该文件；纯目录名 = 目录语义（README 不变）。
+    /// 带 profile 登录态下载。-o 末段带扩展名 = 落该文件；纯目录名 = 目录语义（README 不变）。
     Dl {
         url: String,
         #[arg(short, long)]
@@ -151,40 +151,40 @@ enum Command {
         #[arg(long)]
         output_file: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = BrowserArg::Auto)]
-        /// 选择浏览器（M11）
+        /// 选择浏览器
         browser: BrowserArg,
     },
-    /// 交互式 shell：起一次 Chrome 会话复用（M7 追加里程碑）
+    /// 交互式 shell：起一次 Chrome 会话复用
     Shell,
-    /// 检测浏览器 / profile / 网络连通性 / 出口 IP / SearXNG 健康度（M11 doctor + ptb 探测）
+    /// 检测浏览器 / profile / 网络连通性 / 出口 IP / SearXNG 健康度
     Doctor {
-        /// 3gw：输出默认 JSON（AI-first 契约）；此 flag 切回人读检查表。
+        /// 输出默认 JSON（AI-first 契约）；此 flag 切回人读检查表。
         #[arg(long, default_value_t = false)]
         human: bool,
         /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
         #[arg(long, hide = true, default_value_t = false)]
         json: bool,
     },
-    /// HEADless URL 健康检查：HEAD/GET + redirect 链 + SSL + 延迟（M14-1A，无需 Chrome）
+    /// HEADless URL 健康检查：HEAD/GET + redirect 链 + SSL + 延迟（无需 Chrome）
     Verify {
-        /// 单 URL = 原行为；多 URL 或 --urls-file = 批量对比表（issue gsearch-rs-e58）。
+        /// 单 URL = 原行为；多 URL 或 --urls-file = 批量对比表。
         /// 不设 required=true 以放行 --urls-file；零值由 required_unless_present 拒绝。
         #[arg(required_unless_present = "urls_file", num_args = 1..)]
         url: Vec<String>,
-        /// 3gw：输出默认 JSON（AI-first 契约）；此 flag 切回人读表格。
+        /// 输出默认 JSON（AI-first 契约）；此 flag 切回人读表格。
         #[arg(long, default_value_t = false)]
         human: bool,
         /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
         #[arg(long, hide = true, default_value_t = false)]
         json: bool,
-        /// 单条探测总预算秒数（含 redirect；issue gsearch-rs-7qx：CDN 抖动端点可调高）
+        /// 单条探测总预算秒数（含 redirect；CDN 抖动端点可调高）
         #[arg(long, default_value_t = gsearch::verify::VERIFY_TIMEOUT_SECS)]
         timeout: u64,
         /// 批量：逐行读 URL 的文件（空行忽略），与位置参数互斥
         #[arg(long, conflicts_with = "url")]
         urls_file: Option<std::path::PathBuf>,
     },
-    /// 纯 HTTP GET 取网页正文（issue gsearch-rs-fetch，无需 Chrome；JS 壳页会提示用 browse）。
+    /// 纯 HTTP GET 取网页正文（无需 Chrome；JS 壳页会提示用 browse）。
     /// 单 URL = 原行为；多 URL = batch 并发（上限 5、单条失败不阻塞，退出码 0 全成功 / 1 部分失败 / 2 全失败）。
     Fetch {
         #[arg(required = true, num_args = 1..)]
@@ -193,7 +193,7 @@ enum Command {
         /// 未命中回退全文提取，--json 在 meta.include_hit=false 标注。
         #[arg(long)]
         include: Option<String>,
-        /// 3gw：输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
+        /// 输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
         #[arg(long, default_value_t = false)]
         human: bool,
         /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
@@ -203,29 +203,29 @@ enum Command {
         /// 默认拒（SSRF 门）；也可通过 `GSEARCH_FETCH_ALLOW_PRIVATE=1` 环境变量放行。
         #[arg(long, default_value_t = false)]
         allow_private: bool,
-        /// xih：正文以 markdown 输出（保表格/标题/链接结构）。--json 时 text 字段换源，
+        /// 正文以 markdown 输出（保表格/标题/链接结构）。--json 时 text 字段换源，
         /// meta.format="markdown" 标注；无 flag 输出逐字节不变。
         #[arg(long, default_value_t = false)]
         markdown: bool,
-        /// n76：正文字符预算（text 字段上限；超限截断并在 meta.truncated 如实标注）。
+        /// 正文字符预算（text 字段上限；超限截断并在 meta.truncated 如实标注）。
         #[arg(long, default_value_t = 50_000, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=10_000_000))]
         max_chars: usize,
     },
-    /// 启发式相似页搜索（e7c）：URL → title 关键词派生查询，SearXNG 单查 + 词重合/同域重排。
+    /// 启发式相似页搜索：URL → title 关键词派生查询，SearXNG 单查 + 词重合/同域重排。
     /// 派生查询而非 exa 神经 findSimilar（README 预期管理）。
     Similar {
         /// 参照页 URL（提取 host 与 path 末段关键词；纯域名退化 site: 查询）
         url: String,
         #[arg(long, default_value_t = 3, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=100))]
         limit: usize,
-        /// 3gw：输出默认 JSON（AI-first 契约）；此 flag 切人读文本。
+        /// 输出默认 JSON（AI-first 契约）；此 flag 切人读文本。
         #[arg(long, default_value_t = false)]
         human: bool,
         /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
         #[arg(long, hide = true, default_value_t = false)]
         json: bool,
     },
-    /// 查 GitHub latest release 与本地版本比对（745）；只给指引，不做自替换
+    /// 查 GitHub latest release 与本地版本比对；只给指引，不做自替换
     Update,
 }
 #[derive(Args, Debug)]
@@ -234,7 +234,7 @@ struct SearchArgs {
     /// 多查询 = batch 模式（并发 searxng、单条失败不阻塞、禁浏览器回退——浏览器单例不可并发）。
     #[arg(required = true, num_args = 1..)]
     query: Vec<String>,
-    /// cxa：1..=100——SearXNG 单查最多 10 页×10 条，更大的值只会翻页白耗时（实测 10000→18s）
+    /// 1..=100——SearXNG 单查最多 10 页×10 条，更大的值只会翻页白耗时（实测 10000→18s）
     #[arg(long, default_value_t = 10, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=100))]
     limit: usize,
     /// 时间过滤：只看 day/week/month/year 内的结果。SearXNG 加 time_range，Google SERP 加 tbs=qdr。
@@ -242,7 +242,7 @@ struct SearchArgs {
     #[arg(long, value_enum)]
     recency: Option<RecencyArg>,
     /// `--open / --read / --dl` 互斥：每次只能指定一个；不可同时传。
-    /// l6o：1..——`--read 0` 曾被 Some(0) 当真值白起完整浏览器读阶段。
+    /// 1..——`--read 0` 曾被 Some(0) 当真值白起完整浏览器读阶段。
     #[arg(long, group = "post", value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..))]
     read: Option<usize>,
     #[arg(long, group = "post")]
@@ -259,13 +259,13 @@ struct SearchArgs {
     no_humanize: bool,
     #[arg(long, default_value_t = false)]
     full: bool,
-    /// 3gw：输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
+    /// 输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
     #[arg(long, default_value_t = false)]
     human: bool,
     /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
     #[arg(long, hide = true, default_value_t = false)]
     json: bool,
-    /// cw8：JSON 结果 snippet 截断长度（按字符）；默认 160。
+    /// JSON 结果 snippet 截断长度（按字符）；默认 160。
     #[arg(long, default_value_t = 160, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=100000))]
     snippet_len: usize,
     /// `--read N --from K`：摘要段从第 K 段开始（1-based；默认 0 = 从首段）
@@ -274,23 +274,23 @@ struct SearchArgs {
     /// `--read N --headings-only`：只输出目录（最省 token fast path）
     #[arg(long, default_value_t = false)]
     headings_only: bool,
-    /// e1i：`--read N --excerpt N`——paragraph_index 每项附该段前 N 字符实际文本（--json 生效，
+    /// `--read N --excerpt N`——paragraph_index 每项附该段前 N 字符实际文本（--json 生效，
     /// 受 read_max_chars 总 cap 约束）。与 --full/--headings-only 互斥；默认不启用（输出逐键不变）。
     #[arg(long, conflicts_with_all = ["full", "headings_only"])]
     excerpt: Option<usize>,
-    /// nx4：batch --json 输出信封形态。v2 = 顶层 {meta,results}（批统计一次，元素不带 meta）；
+    /// batch --json 输出信封形态。v2 = 顶层 {meta,results}（批统计一次，元素不带 meta）；
     /// 默认裸数组（存量 agent 零破坏）。单查询模式忽略此 flag。
     #[arg(long, value_enum)]
     envelope: Option<EnvelopeArg>,
-    /// 6dp：meta 压缩到少量字段（query/truncated/provider/elapsed_ms/recency）。
+    /// meta 压缩到少量字段（query/truncated/provider/elapsed_ms/recency）。
     /// 默认关（13 字段全量）；--verbose debug 或 GSEARCH_LOG=debug 时强制全量（排障现场保留）。
     #[arg(long, default_value_t = false)]
     compact_meta: bool,
-    /// `--dl N -o DIR`：把下载文件落到 DIR 下（按 URL 末段命名）；DIR 缺省落 CWD。M13 修复两处不一致。
+    /// `--dl N -o DIR`：把下载文件落到 DIR 下（按 URL 末段命名）；DIR 缺省落 CWD。
     #[arg(short = 'o', long = "output")]
     output: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = BrowserArg::Auto)]
-    /// 选择浏览器：auto = Chrome 优先缺则 Edge，强制选 chrome/edge。M11。
+    /// 选择浏览器：auto = Chrome 优先缺则 Edge，强制选 chrome/edge。
     browser: BrowserArg,
 }
 
@@ -670,7 +670,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     }
 }
 
-/// e7c：`similar <url>`——启发式派生查询（title 关键词，SearXNG 单查 + 词重合/同域重排）。
+/// `similar <url>`——启发式派生查询（title 关键词，SearXNG 单查 + 词重合/同域重排）。
 /// JSON 信封 = 常规 envelope + 顶层 similar_of/note 注解（0mf to_value 手法，不动公共结构）。
 async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode> {
     // qbw：非 URL 入参会退化成 site:<garbage> 派生查询白烧 token，发起前拒掉
@@ -729,7 +729,7 @@ async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode>
     Ok(ExitCode::SUCCESS)
 }
 
-/// batch 多查询（issue gsearch-rs-doh）：并发走 SearXNG，单条失败不阻塞其他条目。
+/// batch 多查询：并发走 SearXNG，单条失败不阻塞其他条目。
 /// 刻意边界：禁浏览器回退（浏览器单例不可并发）；--read/--dl/--open 不参与 batch。
 /// 输出：--json 为裸 BatchEntry 数组；人读模式逐条分隔标题。退出码：全成功 0 / 部分失败 1 / 全部失败 2。
 async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
@@ -1397,7 +1397,7 @@ mod tests {
         assert!(r.is_ok(), "--read 单用应通过");
     }
 
-    /// fve：browse --full 与 --headings-only clap 阶段互斥；单用通过。
+    /// browse --full 与 --headings-only clap 阶段互斥；单用通过。
     #[test]
     fn browse_full_headings_only_mutually_exclusive() {
         let r = Cli::try_parse_from(["gsearch", "browse", "https://example.com", "--full", "--headings-only"]);
@@ -1406,7 +1406,7 @@ mod tests {
         assert!(r.is_ok(), "--full 单用应通过");
     }
 
-    /// 6dp：--compact-meta 在 search / browse 上可解析、默认关。
+    /// --compact-meta 在 search / browse 上可解析、默认关。
     #[test]
     fn compact_meta_flag_parses() {
         let cli = Cli::try_parse_from(["gsearch", "search", "x", "--compact-meta"]).unwrap();
@@ -1420,7 +1420,7 @@ mod tests {
         assert!(compact_meta);
     }
 
-    /// 2i1→3gw：doctor 默认 JSON 输出；--human 切人读；--json 存量兼容（noop）。
+    /// doctor 默认 JSON 输出；--human 切人读；--json 存量兼容（noop）。
     #[test]
     fn doctor_json_flag_parses() {
         let cli = Cli::try_parse_from(["gsearch", "doctor"]).unwrap();
@@ -1437,7 +1437,7 @@ mod tests {
         assert!(!human);
     }
 
-    /// M14-1A→3gw：verify 子命令解析；默认 JSON、--human 切人读、--json 存量 noop。
+    /// verify 子命令解析；默认 JSON、--human 切人读、--json 存量 noop。
     #[test]
     fn verify_subcommand_parses_with_json_flag() {
         let cli = Cli::try_parse_from(["gsearch", "verify", "https://example.com", "--json"]).unwrap();
@@ -1455,8 +1455,8 @@ mod tests {
         assert!(human);
     }
 
-    /// 3gw 主案：search 默认 JSON（human=false）、--human 翻转、--json 存量 noop、snippet 默认 160；
-    /// cxa/l6o：--limit 1..=100、--read 1.. 越界值 clap 阶段拒绝。
+    /// search 默认 JSON（human=false）、--human 翻转、--json 存量 noop、snippet 默认 160；
+    /// --limit 1..=100、--read 1.. 越界值 clap 阶段拒绝。
     #[test]
     fn ai_first_flip_defaults_and_value_ranges() {
         let cli = Cli::try_parse_from(["gsearch", "search", "x"]).unwrap();
@@ -1501,7 +1501,7 @@ mod tests {
         assert!(Cli::try_parse_from(["gsearch", "search", "x", "--recency", "hour"]).is_err());
     }
 
-    /// e7c：similar 子命令解析——默认 limit 3、--json 兼容占位、limit 越界拒绝。
+    /// similar 子命令解析——默认 limit 3、--json 兼容占位、limit 越界拒绝。
     #[test]
     fn similar_subcommand_parses() {
         let cli = Cli::try_parse_from(["gsearch", "similar", "https://docs.rs/serde"]).unwrap();
@@ -1516,5 +1516,27 @@ mod tests {
         assert!(Cli::try_parse_from(["gsearch", "similar", "https://docs.rs/serde", "--limit", "0"]).is_err());
         // 零位置参数拒绝
         assert!(Cli::try_parse_from(["gsearch", "similar"]).is_err());
+    }
+
+    /// help 文本不得泄漏内部 issue 代号（盲测七受试者可见 cxa/l6o/3gw/M9/6dp）。
+    /// 渲染顶层级与全部子命令 help，断言已知代号零命中；泄漏时报出具体行便于定位。
+    #[test]
+    fn help_text_free_of_internal_issue_codes() {
+        use clap::CommandFactory;
+        let codes = [
+            "cxa", "l6o", "3gw", "M9", "6dp", "n76", "xih", "pkp", "kda", "dsg",
+            "nx4", "e1i", "cw8", "fve", "e7c", "q34", "i9a", "745", "ptb",
+        ];
+        let mut cmd = Cli::command();
+        let mut texts = vec![cmd.render_help().to_string()];
+        for sub in cmd.get_subcommands_mut() {
+            texts.push(sub.render_help().to_string());
+        }
+        for text in &texts {
+            for code in codes {
+                let leak = text.lines().find(|l| l.contains(code));
+                assert!(leak.is_none(), "help 泄漏内部代号 {code}: {:?}", leak);
+            }
+        }
     }
 }

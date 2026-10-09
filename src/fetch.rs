@@ -41,10 +41,10 @@ pub struct FetchOpts {
     /// 逗号分隔 CSS selector（如 "main,article"）：命中时取首个命中容器的正文并跳过 JS 壳判定；
     /// 未命中回退全文提取，--json 在 meta.include_hit=false 标注（用户明确知道要什么，壳判定不适用）。
     pub include: Option<String>,
-    /// xih：正文以 markdown 输出（表格/标题/链接保结构）。--json 下 text 字段换源为 markdown，
+    /// 正文以 markdown 输出（表格/标题/链接保结构）。--json 下 text 字段换源为 markdown，
     /// meta.format="markdown" 标注；无 flag 时逐字节不变。
     pub markdown: bool,
-    /// n76：正文字符预算（text 上限；超限截断，meta.truncated/omitted 如实标注）。CLI 默认 50000。
+    /// 正文字符预算（text 上限；超限截断，meta.truncated/omitted 如实标注）。CLI 默认 50000。
     pub max_chars: usize,
 }
 
@@ -196,7 +196,7 @@ pub(crate) fn build_client(proxy: Option<&str>, allow: bool, timeout: Duration) 
     builder.build().context("构建 HTTP 客户端失败")
 }
 
-/// q34：Content-Type 判 PDF（含参数形态 `application/pdf; charset=binary`，大小写不敏感）。
+/// Content-Type 判 PDF（含参数形态 `application/pdf; charset=binary`，大小写不敏感）。
 /// 纯函数离线单测覆盖；fetch 侧据此拒抓，指引走 dl。
 fn is_pdf_content_type(ct: &str) -> bool {
     // 剥参数段后精确匹配 mime 主类型，避免子串误伤（application/pdf+xml 之类复合类型不判 PDF）
@@ -207,7 +207,7 @@ fn is_pdf_content_type(ct: &str) -> bool {
         .eq_ignore_ascii_case("application/pdf")
 }
 
-/// kda：其余二进制 Content-Type 前置拒绝（图像/音视频/字体/压缩包/可执行等）——
+/// 其余二进制 Content-Type 前置拒绝（图像/音视频/字体/压缩包/可执行等）——
 /// 原样当文本透传 = 乱码正文。文本类（text/*、+xml/+json/javascript 等）不在此判；
 /// 无 Content-Type 头由调用方兜底按文本处理（既有契约）。大小写不敏感（调用方已
 /// to_lowercase，双保险与 is_pdf_content_type 同款）。
@@ -314,6 +314,7 @@ async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
 
     let limit = opts.max_chars;
     let mut fetched = process_html(url, &html, is_html, limit);
+    fetched.github_comment_hint = github_thread_comment_gap(url);
     // xih：--markdown 在剥标签前的原始 HTML 上转换（保表格/标题/链接结构），text 字段换源；
     // 非 HTML（text/plain / JSON / md 源文）本就是文本，原样保留。
     if opts.markdown && is_html {
@@ -343,6 +344,7 @@ async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
                 omitted: o,
                 include_hit: Some(true),
                 markdown: opts.markdown,
+                github_comment_hint: fetched.github_comment_hint,
             };
         }
     }
@@ -446,6 +448,25 @@ async fn cmd_fetch_batch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> 
     Ok(ExitCode::from(code))
 }
 
+/// GitHub issue/PR 页的评论区不在 SSR HTML 里（JS 动态加载），fetch 纯 HTTP 输出
+/// 必缺评论区——meta 打缺失信号 + 可行动建议（盲测七 wqm：输出自称完整，agent 据
+/// 此误判「无讨论」，靠 api.github.com 交叉验证才识破）。非 GitHub thread 页 None。
+fn github_thread_comment_gap(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let path = rest.split(['?', '#']).next()?;
+    let mut seg = path.split('/');
+    let owner = seg.next().filter(|s| !s.is_empty())?;
+    let repo = seg.next().filter(|s| !s.is_empty())?;
+    let number = match (seg.next()?, seg.next()?) {
+        ("issues", n) | ("pull", n) if !n.is_empty() => n,
+        _ => return None,
+    };
+    Some(format!(
+        "评论区由 JS 动态加载，未包含在本输出中（勿据本文判断有无讨论）；完整讨论：\
+         gsearch browse {url} --markdown，或 GET https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments"
+    ))
+}
+
 /// 单条 JSON 载荷（url/title/text/meta{truncated, omitted, content_untrusted}）。
 /// meta.include_hit 仅在用过 --include 时出现——不带 flag 的老输出结构不变。
 fn fetched_json(f: &Fetched) -> serde_json::Value {
@@ -459,6 +480,10 @@ fn fetched_json(f: &Fetched) -> serde_json::Value {
     }
     if f.markdown {
         meta["format"] = serde_json::json!("markdown");
+    }
+    if let Some(hint) = &f.github_comment_hint {
+        meta["github_comments_missing"] = serde_json::json!(true);
+        meta["github_comments_hint"] = serde_json::json!(hint);
     }
     serde_json::json!({
         "url": f.url,
@@ -477,8 +502,10 @@ struct Fetched {
     omitted: usize,
     /// --include 状态：None=未用 --include；Some(true)=selector 命中容器；Some(false)=未命中回退全文。
     include_hit: Option<bool>,
-    /// xih：text 字段是否已是 markdown（--json 据此写 meta.format）。
+    /// text 字段是否已是 markdown（--json 据此写 meta.format）。
     markdown: bool,
+    /// GitHub issue/PR 页的评论区缺失信号（None = 非 thread 页，键缺席）。
+    github_comment_hint: Option<String>,
 }
 
 /// 单 URL fetch 结果：Done = 正文已提取；JsShell = JS 壳需渲染（单条 exit 1 / 批量记 error）。
@@ -500,7 +527,7 @@ fn process_html(url: &str, html: &str, is_html: bool, limit: usize) -> Fetched {
         (String::new(), collapse_blank(html.to_string()))
     };
     let (text, truncated, omitted) = cap_chars(&raw, limit);
-    Fetched { url: url.to_string(), title, text, truncated, omitted, include_hit: None, markdown: false }
+    Fetched { url: url.to_string(), title, text, truncated, omitted, include_hit: None, markdown: false, github_comment_hint: None }
 }
 
 /// JS 壳判定：正文 < 500 字符 **且** html 含 SPA 挂载点标记（root/app/__next 等）。
@@ -657,7 +684,7 @@ mod tests {
         assert_eq!(text, "");
     }
 
-    /// kda 回归：属性值含 `>` 的标签不漏片段进正文（旧手写剥标签在 title="a>b" 处提前
+    /// 回归：属性值含 `>` 的标签不漏片段进正文（旧手写剥标签在 title="a>b" 处提前
     /// 截断标签，把 `b">` 起的尾巴漏进正文/title）。树内路径由解析器按引号正确处理。
     #[test]
     fn extract_text_attr_gt_no_leak() {
@@ -676,7 +703,7 @@ mod tests {
         assert!(!fetched.text.contains('<'), "不应残留标签: {}", fetched.text);
     }
 
-    /// kda：二进制 Content-Type 门——压缩包/图像/音视频/字体/文档判真，文本与结构化判假。
+    /// 二进制 Content-Type 门——压缩包/图像/音视频/字体/文档判真，文本与结构化判假。
     #[test]
     fn binary_content_type_detection() {
         for bin in [
@@ -830,7 +857,7 @@ mod tests {
         assert!(http_or_https_scheme("  https://example.com"));  // 前导空白允许
     }
 
-    /// q34：Content-Type 判 PDF——裸类型/带参数命中，复合类型与 html 不误伤。
+    /// Content-Type 判 PDF——裸类型/带参数命中，复合类型与 html 不误伤。
     #[test]
     fn pdf_content_type_detection() {
         assert!(is_pdf_content_type("application/pdf"));
@@ -876,7 +903,7 @@ mod tests {
         assert_eq!(buf.len(), 10);
     }
 
-    /// n76：--max-chars 字符预算——正文超限截断、meta.truncated/omitted 如实标注；
+    /// --max-chars 字符预算——正文超限截断、meta.truncated/omitted 如实标注；
     /// 未超限时不截断。JSON 载荷 meta 键同步（agent 可按键判断是否放大预算重取）。
     #[test]
     fn max_chars_caps_text_and_flags_truncated() {
@@ -894,5 +921,47 @@ mod tests {
         let v = fetched_json(&f);
         assert_eq!(v["meta"]["truncated"], serde_json::json!(true));
         assert!(v["meta"]["omitted"].as_u64().unwrap() > 0);
+    }
+
+    /// GitHub issue/PR 页评论区不在 SSR HTML 里（盲测七 wqm），meta 必打缺失信号 +
+    /// 可行动建议（api.github.com comments / browse --markdown）；非 thread 页键缺席。
+    #[test]
+    fn github_thread_meta_signals_missing_comments() {
+        // issue / PR 页命中，hint 含 api.github.com 端点与编号
+        let hint = github_thread_comment_gap("https://github.com/tokio-rs/tokio/issues/7787")
+            .expect("issue 页应命中");
+        assert!(hint.contains("api.github.com/repos/tokio-rs/tokio/issues/7787/comments"), "hint: {hint}");
+        assert!(hint.contains("browse"), "hint 应给 browse 出口: {hint}");
+        let hint = github_thread_comment_gap("https://github.com/tokio-rs/tokio/pull/7788")
+            .expect("PR 页应命中");
+        assert!(hint.contains("/issues/7788/comments"), "PR 对话走 issues 端点: {hint}");
+        // query/hash 不影响判定
+        assert!(github_thread_comment_gap("https://github.com/o/r/issues/1?foo=bar#top").is_some());
+        // 非 thread 页不出信号
+        assert!(github_thread_comment_gap("https://github.com/tokio-rs/tokio").is_none());
+        assert!(github_thread_comment_gap("https://github.com/tokio-rs/tokio/issues").is_none());
+        assert!(github_thread_comment_gap("https://github.com/tokio-rs/tokio/blob/main/Cargo.toml").is_none());
+        assert!(github_thread_comment_gap("https://docs.rs/serde_json").is_none());
+        assert!(github_thread_comment_gap("http://github.com/o/r/issues/1").is_none());
+
+        // JSON 载荷：thread 页带两键；非 thread 页键缺席（默认输出结构不变）
+        let f = Fetched {
+            url: "https://github.com/tokio-rs/tokio/issues/7787".into(),
+            title: "t".into(),
+            text: "body".into(),
+            truncated: false,
+            omitted: 0,
+            include_hit: None,
+            markdown: false,
+            github_comment_hint: github_thread_comment_gap("https://github.com/tokio-rs/tokio/issues/7787"),
+        };
+        let v = fetched_json(&f);
+        assert_eq!(v["meta"]["github_comments_missing"], serde_json::json!(true));
+        assert!(v["meta"]["github_comments_hint"].as_str().unwrap().contains("api.github.com"));
+
+        let f2 = Fetched { url: "https://e.test/".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, include_hit: None, markdown: false, github_comment_hint: None };
+        let v2 = fetched_json(&f2);
+        assert!(v2["meta"].get("github_comments_missing").is_none(), "非 thread 页不得出键");
+        assert!(v2["meta"].get("github_comments_hint").is_none());
     }
 }

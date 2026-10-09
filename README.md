@@ -89,6 +89,7 @@ gsearch similar "https://docs.rs/serde" --limit 3
 
 - `fetch --markdown --json`：`text` 字段换源为 markdown 产物，`meta.format: "markdown"` 标注；无 flag 输出逐字节不变（默认仍是剥标签纯文本）
 - `browse --markdown`：渲染后 HTML → markdown（隐含全文模式，与 `--headings-only` 互斥）；`--json` 时 `content_text` 字段换源为 markdown，`meta.format: "markdown"` 标注
+- fenced 代码块**逐字保真**（文档页签名/示例代码场景）：块内换行/缩进保留，`<a>` 只留链接文本（不注入 `[text](url)` 语法），ASCII 撇号等字符不变形；docs.rs 等页正文里已弯的引号是上游页面原样，转换层不改写字符
 - 非 HTML 源（text/plain / JSON / .md 源文）不转换，原文保留
 - **`search --read N`（含 shell `read`）暂不支持 `--markdown`**——read 输出走 AdaptiveRead 结构化装配（属 search 输出路径），后续补
 
@@ -115,6 +116,7 @@ gsearch fetch https://big-site/releases --max-chars 8000  # 字符预算：正�
 - **JS 壳页**：剥标签后正文 < 500 字符 **且** html 含 SPA 挂载点（`id="root"/id="app"/__next`）→ 退出码 1 + stderr `该页无服务端正文（JS 壳），需渲染：用 gsearch browse <url>`。**注意**：退出码 1 在这里是"需换 browse"，不是"命令错误"——agent 应改用 browse 而非重试 fetch。
 - **跟随重定向**：≤10 跳，每跳 host 都过私网门 + https 规则（防重定向绕过）。
 - **PDF 拒抓**：`Content-Type: application/pdf` 直接报错（不做本地 PDF 解析）并指引 `gsearch dl <url>` 落盘后用外部工具提取文本——剥标签路径对二进制 PDF 只会产出乱码。
+- **GitHub issue/PR 页评论区缺失信号**：`github.com/{owner}/{repo}/issues|pull/{n}` 页的评论区由 JS 动态加载，**不在纯 HTTP 输出里**——meta 恒带 `github_comments_missing: true` + `github_comments_hint`（给出 `gsearch browse <url> --markdown` 与 `GET https://api.github.com/repos/{owner}/{repo}/issues/{n}/comments` 两条完整讨论出口）。**勿据 fetch 输出判断有无讨论**；其他 GitHub 页无此两键。
 - **二进制内容拒抓**：其余非文本 Content-Type（`image/*` `audio/*` `video/*` `font/*`、zip/gzip/tar、`application/octet-stream`、Office 文档等）同样前置报错指引 `gsearch dl <url>`；文本类（`text/*`、JSON、`+xml`、javascript）照常提取，无 Content-Type 头按文本处理。
 - **正文提取走 scraper 树内解析**（与 `search --read` 的 AdaptiveRead 同一解析器）：HTML 由 html5ever 按浏览器规则解析，属性值含 `>` 的标签不会漏片段进正文，实体在解析期解码。
 - **fetch 输出 `content_untrusted: true`** 与 read/browse 同契约。
