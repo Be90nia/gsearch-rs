@@ -223,6 +223,8 @@ enum Command {
         /// JSONPath 投影（逗号分隔多路径）——text 为 JSON 时只保留指定字段。
         /// 例：`--json-keys "crate.max_version,crate.max_stable_version"` 命中后 text 换源为
         /// `{"max_version":"...","max_stable_version":"..."}`，meta.truncated_by_json_keys=true。
+        /// 数组支持：`0.field` 取单元素（GitHub comments 等顶层数组响应）、`[*].field`
+        /// 通配全部元素（输出数组形态），如 `--json-keys "[*].tag_name,0.body"`。
         /// text 非 JSON 时静默跳过（不动 text）。
         #[arg(long, value_delimiter = ',')]
         json_keys: Vec<String>,
