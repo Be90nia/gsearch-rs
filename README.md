@@ -93,6 +93,7 @@ gsearch similar "https://docs.rs/serde" --limit 3
 - `fetch --markdown --json`：`text` 字段换源为 markdown 产物，`meta.format: "markdown"` 标注；无 flag 输出逐字节不变（默认仍是剥标签纯文本）
 - `browse --markdown`：渲染后 HTML → markdown（隐含全文模式，与 `--headings-only` 互斥）；`--json` 时 `content_text` 字段换源为 markdown，`meta.format: "markdown"` 标注
 - fenced 代码块**逐字保真**（文档页签名/示例代码场景）：块内换行/缩进保留，`<a>` 只留链接文本（不注入 `[text](url)` 语法），ASCII 撇号等字符不变形；docs.rs 等页正文里已弯的引号是上游页面原样，转换层不改写字符
+- fetch 路径清洗：正文防斜体转义 `\_` 还原为 `_`（如 `serde\_json` → `serde_json`）、rustdoc 标题的 `[§](#锚点)` 自链剥为纯标题文本；browse 不清洗
 - 非 HTML 源（text/plain / JSON / .md 源文）不转换，原文保留
 - **`search --browse N`（含 shell `browse`）暂不支持 `--markdown`**——`--browse` 输出走 AdaptiveRead 结构化装配（属 search 输出路径）；`--read N` 是 snippet-only，无 markdown 概念。后续补
 
@@ -119,7 +120,7 @@ gsearch fetch --json-keys "crate.max_version,crate.max_stable_version" \
 - **host 级默认 include**：未传 `--include` 时按 host 自动路由——`github.com` 走 skeleton 容器优先级链 + nav 剥离（命中后 `meta.auto_include_applied="github"`），`docs.rs` 走 `<main>`（命中后 `meta.auto_include_applied="docs.rs"`）。用户显式 `--include "..."` 不被覆盖，但 host 判定恒保留：`auto_include_applied` 仍标注 host 想命中的 label + `meta.include_overridden_by_user=true` 标注覆盖事实，且用户 selector 未命中的回退全文仍走 host 剥离；host 未命中（未知 host / 裸 host）→ ...
 - **`<summary>` 折叠按钮文本剥离**：fetch 提取路径全局剥 `<summary>…</summary>`（docs.rs 的 "Expand description" 等折叠按钮文本不进正文；非 HTML 源文保真不碰）
 - **GitHub PR/issue 标题栏兜底**：容器链命中的正文头部缺页面标题时补 `# {页面title}\n\n` 前缀（GitHub 页 title 含 PR/issue 标题），caller 一眼可辨在看哪条 PR；正文已含标题则不重复
-- **`--json-keys <paths>`（逗号分隔多路径）**：JSONPath 投影——body 是 JSON 时按 `.field` / `[N]` / 裸字段名 / 裸数字段（=`[N]`，顶层数组如 GitHub comments API 的 `0.user.login`）/ `[*]` 数组通配（`[*].tag_name` 对每个元素取该字段，值为数组形态）路径缩成只含指定字段的子集（典型场景：crates.io API 的 5KB `categories` 后藏 `max_version`，不投影会被字符预算截掉）。多路径末段同名冲突时（如 `items.0.title,items.1.title`）冲突 key 自动改用全路径形态，两条都保留不丢数据；单路径/无冲突保持末段短名。`meta.truncated_by_json_keys=true` 标注；body 非 JSON 或路径错误静默走原路径（投影失败 stderr 一行提示后保留原 body，顶层数组误用裸字段路径时错误信息附 `0.field` / `[*]` 语法教学）
+- **`--json-keys <paths>`（逗号分隔多路径）**：JSONPath 投影——body 是 JSON 时按 `.field` / `[N]` / 裸字段名 / 裸数字段（=`[N]`，顶层数组如 GitHub comments API 的 `0.user.login`）/ `[*]` 数组通配（`[*].tag_name` 对每个元素取该字段，值为数组形态）路径缩成只含指定字段的子集（典型场景：crates.io API 的 5KB `categories` 后藏 `max_version`，不投影会被字符预算截掉）。多路径末段同名冲突时（如 `items.0.title,items.1.title`）冲突 key 自动改用全路径形态，两条都保留不丢数据；单路径/无冲突保持末段短名。`meta.truncated_by_json_keys=true` 标注；body 非 JSON 或路径错误静默走原路径（投影失败 stderr 一行提示后保留原 body，顶层数组误用裸字段路径时错误信息附 `0.field` / `[*]` 语法教学）。投影命中（`meta.truncated_by_json_keys=true`）时 `--json` 的 `text` 即投影 JSON 本身（对象/数组原生形态，免二次 parse）；投影产物超预算被截或回退原 body 时恒为 string
 - **URL `#N-M` 锚点裁剪**：URL 含纯数字行号范围时，`text` 字段裁到 `[start, end]`（1-based 含端点），`meta.anchor_crop_range=[actual_start, actual_end]` 标注实际裁到的行号范围；命名锚点 / 单行号 / 颠倒起终不裁剪（不误伤 GitHub `#issuecomment-` 等命名锚点 URL）
 
 - **无需浏览器**：纯 reqwest GET，秒取静态页（换机可用性兜底）。

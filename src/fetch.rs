@@ -445,7 +445,8 @@ async fn fetch_one_attempt(
     // xih：--markdown 在剥标签前的原始 HTML 上转换（保表格/标题/链接结构），text 字段换源；
     // 非 HTML（text/plain / JSON / md 源文）本就是文本，原样保留。
     if opts.markdown && is_html {
-        let (md, t, o, off) = cap_chars(&crate::convert::html_to_markdown(&html)?, limit);
+        let (md, t, o, off) =
+            cap_chars(&crate::convert::clean_markdown(crate::convert::html_to_markdown(&html)?), limit);
         fetched.text = md;
         fetched.truncated = t;
         fetched.omitted = o;
@@ -722,10 +723,17 @@ fn fetched_json(f: &Fetched) -> serde_json::Value {
     if let Some(off) = f.truncated_at_offset {
         meta["truncated_at_offset"] = serde_json::json!(off);
     }
+    // FixG16：投影命中时 text 为原生 JSON Value（对象/数组原样，agent 免二次解析）；
+    // 投影产物被字符预算截成非法 JSON 时回退 string。非投影路径恒为 string（老输出不变）。
+    let text = if f.truncated_by_json_keys {
+        serde_json::from_str::<serde_json::Value>(&f.text).unwrap_or_else(|_| f.text.clone().into())
+    } else {
+        f.text.clone().into()
+    };
     serde_json::json!({
         "url": f.url,
         "title": f.title,
-        "text": f.text,
+        "text": text,
         "meta": meta,
     })
 }
@@ -1036,7 +1044,7 @@ fn apply_github_host_route(
         None => return Ok(false),
     };
     let raw = if markdown {
-        crate::convert::html_to_markdown(&cleaned)?
+        crate::convert::clean_markdown(crate::convert::html_to_markdown(&cleaned)?)
     } else {
         extract_text(&cleaned)
     };
@@ -1421,7 +1429,7 @@ fn render_include_blocks(blocks: &[String], markdown: bool) -> Result<String> {
     let mut parts = Vec::with_capacity(blocks.len());
     for b in blocks {
         let raw = if markdown {
-            crate::convert::html_to_markdown(b)?
+            crate::convert::clean_markdown(crate::convert::html_to_markdown(b)?)
         } else {
             extract_text(b)
         };
@@ -1921,6 +1929,36 @@ mod tests {
         let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
         let v2 = fetched_json(&f2);
         assert!(v2["meta"].get("truncated_by_json_keys").is_none(), "默认不得出键");
+    }
+
+    /// FixG16：投影命中时 text 为原生 JSON Value（对象原样，免二次解析）；投影产物被截成
+    /// 非法 JSON 或非投影路径回退恒为 string（老输出不变）。
+    #[test]
+    fn fetched_json_text_native_value_on_projection_hit() {
+        let mk = |truncated_by_json_keys: bool, text: &str| Fetched {
+            url: "u".into(),
+            title: String::new(),
+            text: text.into(),
+            truncated: false,
+            omitted: 0,
+            truncated_at_offset: None,
+            include_hit: None,
+            include_hits: None,
+            markdown: false,
+            github_comment_hint: None,
+            anchor_crop_range: None,
+            truncated_by_json_keys,
+            auto_include_applied: None,
+            include_overridden_by_user: false,
+        };
+        let hit = fetched_json(&mk(true, r#"{"tag_name":"v1.53.2"}"#));
+        assert_eq!(hit["text"], serde_json::json!({"tag_name": "v1.53.2"}), "投影命中应为原生对象: {hit}");
+        // 投影产物被字符预算截断成非法 JSON → 回退 string
+        let cut = fetched_json(&mk(true, r#"{"tag_name":"v1"#));
+        assert!(cut["text"].is_string(), "非法 JSON 投影产物应回退 string: {cut}");
+        // 非投影路径恒为 string
+        let plain = fetched_json(&mk(false, r#"{"tag_name":"v1.53.2"}"#));
+        assert!(plain["text"].is_string(), "非投影 text 恒为 string: {plain}");
     }
 
     /// 9jx：fetch meta.truncated_at_offset——truncated=true 时出键且值非零，None 时键缺席。

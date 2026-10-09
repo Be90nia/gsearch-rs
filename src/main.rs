@@ -39,7 +39,7 @@ fn enable_utf8_console() {}
 #[command(
     name = "gsearch",
     version = gsearch::build::version_line(),
-    about = "Google 搜索 + 通用浏览器代理 CLI（真 Chrome + 持久 profile）"
+    about = "Google 搜索 + 通用浏览器代理 CLI（真 Chrome + 持久 profile）。输出契约：所有子命令默认输出 JSON（--json 显式同效），加 --human 切人读文本。"
 )]
 struct Cli {
     #[arg(long, global = true, default_value = "info")]
@@ -222,7 +222,8 @@ enum Command {
         retry: u32,
         /// JSONPath 投影（逗号分隔多路径）——text 为 JSON 时只保留指定字段。
         /// 例：`--json-keys "crate.max_version,crate.max_stable_version"` 命中后 text 换源为
-        /// `{"max_version":"...","max_stable_version":"..."}`，meta.truncated_by_json_keys=true。
+        /// `{"max_version":"...","max_stable_version":"..."}`（--json 下即原生 JSON 对象/数组，
+        /// 免二次解析），meta.truncated_by_json_keys=true。
         /// 数组支持：`0.field` 取单元素（GitHub comments 等顶层数组响应）、`[*].field`
         /// 通配全部元素（输出数组形态），如 `--json-keys "[*].tag_name,0.body"`。
         /// text 非 JSON 时静默跳过（不动 text）。

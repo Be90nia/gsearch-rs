@@ -21,6 +21,19 @@ pub(crate) fn html_to_markdown(html: &str) -> Result<String> {
     Ok(converter.convert(&sanitize_pre_blocks(html))?)
 }
 
+/// FixG16：fetch --markdown 产物清洗——htmd 的防斜体转义 `\_`（serde\_json 等标识符）
+/// 对 agent 消费是噪音，还原为 `_`；rustdoc 标题自链 `[§](#anchor)` 无信息，剥为纯标题
+/// 文本。仅 fetch 路径调用：browse/general 共用 html_to_markdown，search 输出路径冻结。
+pub(crate) fn clean_markdown(md: String) -> String {
+    let mut out = md;
+    while let Some(start) = out.find("[§](") {
+        // 锚点 target 不含 ')'；未闭合则整段不动（防误伤）
+        let Some(rel_end) = out[start..].find(')') else { break };
+        out.replace_range(start..start + rel_end + 1, "");
+    }
+    out.replace("\\_", "_")
+}
+
 /// pre>code 保真化（盲测七 0bh）：rustdoc 类文档页的 code 块内含 span 高亮 / a 链接 /
 /// div where 等结构，htmd 的 span 行尾修剪会折叠换行（#[derive] 与 struct 合行）、
 /// a 转成 markdown 链接语法（代码块内注入链接）、div 块级边界注入伪影空行——三处
@@ -202,5 +215,21 @@ mod tests {
         let md = html_to_markdown(html).unwrap();
         assert!(md.contains("```rust"), "语言标注丢失: {md:?}");
         assert!(md.contains("fn main() {}"), "内容丢失: {md:?}");
+    }
+
+    /// FixG16：htmd 防斜体转义 `\_` 还原为 `_`（agent 消费正文，转义是噪音）。
+    #[test]
+    fn clean_markdown_unescapes_underscore() {
+        assert_eq!(
+            clean_markdown("serde\\_json::from\\_str 很快".into()),
+            "serde_json::from_str 很快"
+        );
+    }
+
+    /// FixG16：rustdoc 标题自链 `[§](#anchor)` 剥为纯标题文本；未闭合不剥（防误伤）。
+    #[test]
+    fn clean_markdown_strips_section_anchor() {
+        assert_eq!(clean_markdown("## [§](#errors)Errors".into()), "## Errors");
+        assert_eq!(clean_markdown("[§](#unclosed".into()), "[§](#unclosed");
     }
 }
