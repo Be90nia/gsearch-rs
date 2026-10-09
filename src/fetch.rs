@@ -501,6 +501,18 @@ async fn fetch_one_attempt(
             };
         }
     }
+    // FixG13：用户 --include 覆盖且未命中 selector（回退全文）→ 补走 host 路由剥离；
+    // 命中用户 selector 时 include_hit=Some(true)，本调用是 no-op。
+    if let Some((label, true)) = host_route_decision(opts.include.as_deref(), url) {
+        apply_host_route_on_include_fallback(
+            &mut fetched,
+            label,
+            &html,
+            is_html,
+            opts.markdown,
+            limit,
+        )?;
+    }
     // FixG10 L-2：URL `#N-M` 锚点裁剪——命中时按行号裁 text + 扩 pad 行上下文，meta 记实际范围。
     // 必须在 cap_chars 之后（用最终 text 行号）且在 cap_chars_json 之前（裁后才做 cap；裁后短文无需 cap）。
     if let Some((start, end)) = parse_anchor_range(url) {
@@ -815,6 +827,7 @@ fn project_json_paths(v: &serde_json::Value, paths: &[String]) -> Result<serde_j
     Ok(serde_json::Value::Object(out))
 }
 
+#[derive(Debug, PartialEq)]
 enum Segment {
     Field(String),
     Index(usize),
@@ -857,7 +870,13 @@ fn parse_json_path(path: &str) -> Result<Vec<Segment>> {
                 }
                 anyhow::bail!("json-keys 路径首段字段名为空: {path:?}");
             }
-            segs.push(Segment::Field(name.to_string()));
+            // FixG13：裸纯数字段 = 数组下标（GitHub comments API 顶层数组 `0.user.login`）；
+            // 非纯数字（含 `-1`、`0abc`）维持字段名语义不变。
+            if let Ok(n) = name.parse::<usize>() {
+                segs.push(Segment::Index(n));
+            } else {
+                segs.push(Segment::Field(name.to_string()));
+            }
             s = &rest[end..];
         }
         if s.is_empty() {
@@ -943,6 +962,34 @@ fn apply_github_host_route(
     fetched.omitted = o;
     fetched.truncated_at_offset = t.then_some(off);
     Ok(true)
+}
+
+/// FixG13：用户 --include 覆盖且未命中 selector（include_hit≠true）→ 回退全文补走 host
+/// 路由剥离——回退正文不该比无 --include 时更脏（盲测十二 P：覆盖回退正文混入
+/// "Skip to content"/"Navigation Menu"）。命中用户 selector 时不调用本函数（用户明确要
+/// 什么就是什么，selector 提取的容器原样保留）。返回 true = 已改写 text；此时 include_hit
+/// 复位 Some(false)（命中标志只对应用户 selector，apply_docsrs 内部设的 true 撤回）。
+fn apply_host_route_on_include_fallback(
+    fetched: &mut Fetched,
+    label: &'static str,
+    html: &str,
+    is_html: bool,
+    markdown: bool,
+    limit: usize,
+) -> Result<bool> {
+    if fetched.include_hit == Some(true) {
+        return Ok(false);
+    }
+    let applied = match label {
+        "github" => apply_github_host_route(fetched, html, markdown, limit)?,
+        "docs.rs" => apply_docsrs_host_route(fetched, html, is_html, markdown, limit)?,
+        _ => false,
+    };
+    if applied {
+        fetched.include_hit = Some(false);
+        fetched.include_hits = None;
+    }
+    Ok(applied)
 }
 
 /// FixG12：正文头部缺页面标题时补 `# {title}\n\n` 前缀（GitHub 页 title 形如
@@ -1031,7 +1078,7 @@ fn process_html(url: &str, html: &str, is_html: bool, limit: usize) -> Fetched {
     // 路径的守门（fetch 漏斗处另有单点剥除，幂等）。
     let (title, raw) = if is_html {
         let doc = Html::parse_document(&strip_summary_elements(html));
-        (tree_title(&doc), collapse_blank(tree_text(&doc)))
+        (tree_title(&doc), collapse_preserving_code(tree_text(&doc)))
     } else {
         (String::new(), collapse_blank(html.to_string()))
     };
@@ -1083,12 +1130,57 @@ fn tree_text(doc: &Html) -> String {
                 if matches!(el.name(), "script" | "style" | "noscript" | "template") {
                     continue;
                 }
+                // wbr = 零宽可断行点，浏览器渲染不占宽——注入分隔符会把 from_<wbr>str
+                // 撕成 "from_ str"（盲测十二 R 游离空格实锤）
+                if el.name() == "wbr" {
+                    continue;
+                }
                 let sep = if is_block_boundary(el.name()) { '\n' } else { ' ' };
+                if matches!(el.name(), "pre" | "code") {
+                    // FixG13：pre/code 内空白是内容（签名 where 缩进 4 空格、from_&lt;a&gt;str
+                    // / println!&lt;/span&gt;( 的元素边界不注入空格）——子树文本原样输出，
+                    // \0 哨兵段由 collapse_preserving_code 跳过规整；整树收集不再递归入主栈。
+                    out.push(sep);
+                    out.push('\u{0}');
+                    let mut sub: Vec<_> = node.children().rev().collect();
+                    while let Some(n) = sub.pop() {
+                        match n.value() {
+                            Node::Text(t) => out.push_str(t),
+                            Node::Element(e)
+                                if !matches!(
+                                    e.name(),
+                                    "script" | "style" | "noscript" | "template"
+                                ) =>
+                            {
+                                sub.extend(n.children().rev());
+                            }
+                            _ => {}
+                        }
+                    }
+                    out.push('\u{0}');
+                    out.push(sep);
+                    continue;
+                }
                 out.push(sep);
                 stack.extend(node.children().rev());
                 out.push(sep);
             }
             _ => {}
+        }
+    }
+    out
+}
+
+/// tree_text 输出的空白规整：\\0 哨兵段（pre/code 原样文本）逐字节保留，普通文本仍走
+/// collapse_blank（FixG13：代码空白是内容，prose 空白是噪音）。无哨兵时输出与
+/// collapse_blank(s) 逐字节一致——非代码页零行为变化。
+fn collapse_preserving_code(s: String) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, seg) in s.split('\u{0}').enumerate() {
+        if i % 2 == 1 {
+            out.push_str(seg);
+        } else {
+            out.push_str(&collapse_blank(seg.to_string()));
         }
     }
     out
@@ -1104,7 +1196,7 @@ fn tree_title(doc: &Html) -> String {
 }
 
 fn extract_text(html: &str) -> String {
-    collapse_blank(tree_text(&Html::parse_document(html)))
+    collapse_preserving_code(tree_text(&Html::parse_document(html)))
 }
 
 /// 块级边界标签 → 换行（开闭都算，连续换行由 collapse_blank 压平）。
@@ -2011,5 +2103,191 @@ mod tests {
         assert_eq!(opts.anchor_pad_lines, 0);
         assert!(opts.proxy.is_none());
         assert!(!opts.allow_private);
+    }
+
+    /// FixG13 R 扣分：pre/code 内空白是内容——where 行 4 空格缩进保留；元素边界
+    ///（&lt;a&gt;str、println!&lt;/span&gt;(、&lt;wbr&gt;）不注入游离空格。fixture 取自
+    /// docs.rs fn.from_str 页实测结构（pre.item-decl 签名 + wbr 撕词 + where div）。
+    #[test]
+    fn extract_text_preserves_pre_code_whitespace() {
+        let html = "<html><head><title>from_str - serde_json</title></head><body>\
+                    <h1>Function <span class=\"fn\">from_<wbr>str</span>&nbsp;<button>Copy item path</button></h1>\
+                    <main>\
+                    <pre class=\"rust item-decl\"><code>pub fn from_str&lt;'a, T&gt;(s: &amp;'a \
+                    <a class=\"primitive\" href=\"/std/primitive.str.html\">str</a>) -&gt; \
+                    <a href=\"type.Result.html\">Result</a>&lt;T&gt;\
+                    <div class=\"where\">where\n    T: <a href=\"trait.Deserialize.html\">Deserialize</a>&lt;'a&gt;,</div>\
+                    </code></pre>\
+                    <pre class=\"rust example-wrap\"><code>\
+                    <span class=\"kw\">let </span>j = <span class=\"string\">\"{}\"</span>;\n\
+                    <span class=\"kw\">let </span>u: User = serde_json::from_str(j).unwrap();\n\
+                    <span class=\"macro\">println!</span>(<span class=\"string\">\"{:#?}\"</span>, u);</code></pre>\
+                    </main></body></html>";
+        let text = extract_text(html);
+        assert!(text.contains("where\n    T: Deserialize<'a>,"),
+            "where 缩进 4 空格是内容，不得折叠: {text:?}");
+        assert!(!text.contains("from_ str"), "wbr 不撕词: {text:?}");
+        assert!(!text.contains("println! ("), "code 内元素边界不注空格: {text:?}");
+        assert!(text.contains("unwrap();\n"), "code 内换行原样不被折叠: {text:?}");
+        assert!(text.contains("let u: User = serde_json::from_str(j).unwrap();"),
+            "code 内行内元素(span)边界不注空格: {text:?}");
+        // prose 部分仍走 collapse_blank：h1 的 &nbsp; 折叠、按钮文本保留
+        assert!(text.contains("Function from_str Copy item path"),
+            "prose 空白规整不变: {text:?}");
+    }
+
+    /// FixG13 零回归保证：无 \0 哨兵时 collapse_preserving_code 与 collapse_blank
+    /// 逐字节一致（非代码页行为零变化）。
+    #[test]
+    fn collapse_preserving_code_matches_collapse_blank_without_sentinel() {
+        for raw in [
+            "普通 一段\n\n多行   文本",
+            "  leading and trailing  ",
+            "",
+            "a\n\n\nb   c\td",
+        ] {
+            assert_eq!(
+                collapse_preserving_code(raw.to_string()),
+                collapse_blank(raw.to_string()),
+                "无哨兵必须等价: {raw:?}"
+            );
+        }
+    }
+
+    /// FixG13：哨兵段（pre/code 原样文本）逐字节保留（缩进/连续空白/换行），
+    /// 哨兵外 prose 段照常折叠；首尾哨兵段不被误 trim。
+    #[test]
+    fn collapse_preserving_code_keeps_code_segment_verbatim() {
+        let mixed = "前置   折叠\n\u{0}where\n    T:   保持\u{0}\n后置  折叠";
+        let out = collapse_preserving_code(mixed.to_string());
+        assert!(out.contains("where\n    T:   保持"), "哨兵段逐字节: {out:?}");
+        assert!(out.contains("前置 折叠"), "prose 段折叠: {out:?}");
+        assert!(out.contains("后置 折叠"), "prose 段折叠: {out:?}");
+        // 开头即哨兵（页面以 pre 起始）
+        let head = "\u{0}a\n  b\u{0}尾  部";
+        let out = collapse_preserving_code(head.to_string());
+        assert!(out.contains("a\n  b"), "首哨兵段原样: {out:?}");
+        assert!(out.contains("尾 部"), "尾部 prose 折叠: {out:?}");
+    }
+
+    /// FixG13 Q 扣分：裸纯数字段 = 数组下标（GitHub comments API `0.user.login`）；
+    /// 非纯数字段维持字段名；`[0]` 显式语法与连续下标不回归。
+    #[test]
+    fn parse_json_path_numeric_segment_becomes_index() {
+        use Segment::{Field, Index};
+        assert_eq!(
+            parse_json_path("0.user.login").unwrap(),
+            vec![Index(0), Field("user".into()), Field("login".into())],
+            "裸 0 → Index"
+        );
+        assert_eq!(
+            parse_json_path("0").unwrap(),
+            vec![Index(0)],
+            "单段裸 0 → Index"
+        );
+        assert_eq!(
+            parse_json_path("[0].user.login").unwrap(),
+            vec![Index(0), Field("user".into()), Field("login".into())],
+            "显式 [0] 语法不回归"
+        );
+        assert_eq!(
+            parse_json_path("0.1").unwrap(),
+            vec![Index(0), Index(1)],
+            "连续下标"
+        );
+        assert_eq!(
+            parse_json_path("0abc.def").unwrap(),
+            vec![Field("0abc".into()), Field("def".into())],
+            "非纯数字维持字段名"
+        );
+        assert_eq!(
+            parse_json_path("-1").unwrap(),
+            vec![Field("-1".into())],
+            "负数不是下标（对象键语义）"
+        );
+        assert!(parse_json_path("").is_err(), "空路径仍报错");
+    }
+
+    /// FixG13：顶层数组响应按裸数字段投影——GitHub comments API 形态
+    /// `--json-keys "0.user.login,0.body"`。
+    #[test]
+    fn project_json_paths_supports_top_level_array_index() {
+        let payload = serde_json::json!([
+            {"user": {"login": "alice"}, "body": "first comment"},
+            {"user": {"login": "bob"}, "body": "second"}
+        ]);
+        let out = project_json_paths(
+            &payload,
+            &["0.user.login".to_string(), "0.body".to_string()],
+        )
+        .unwrap();
+        assert_eq!(out["login"], serde_json::json!("alice"));
+        assert_eq!(out["body"], serde_json::json!("first comment"));
+        // 越界仍报错（不静默）
+        let err = project_json_paths(&payload, &["9.user.login".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("越界"), "越界语义: {err}");
+    }
+
+    /// FixG13 P 扣分：用户 --include 覆盖且未命中 selector → 回退全文补走 host 路由
+    /// 剥离（nav 不混入），include_hit 复位 Some(false)；命中用户 selector 时 no-op
+    ///（用户明确要什么就是什么）。
+    #[test]
+    fn include_miss_fallback_applies_host_route_stripping() {
+        let junk = "x".repeat(5_000);
+        let html = format!(
+            "<html><body><nav>Skip to content Navigation Menu Platform {junk}</nav>\
+             <div data-testid='markdown-body'><p>Motivation paragraph.</p></div></body></html>"
+        );
+        let full_text = format!("Skip to content Navigation Menu Platform {junk} 正文");
+        let mut fetched = Fetched {
+            url: "https://github.com/o/r/issues/1".into(),
+            title: "issue title".into(),
+            text: full_text.clone(),
+            truncated: false,
+            omitted: 0,
+            truncated_at_offset: None,
+            include_hit: Some(false),
+            include_hits: None,
+            markdown: false,
+            github_comment_hint: None,
+            anchor_crop_range: None,
+            truncated_by_json_keys: false,
+            auto_include_applied: Some("github".into()),
+            include_overridden_by_user: true,
+        };
+        let applied =
+            apply_host_route_on_include_fallback(&mut fetched, "github", &html, true, false, 50_000)
+                .unwrap();
+        assert!(applied, "未命中回退应改写 text");
+        assert!(!fetched.text.contains("Skip to content"), "nav 剥离: {}", fetched.text);
+        assert!(!fetched.text.contains("Navigation Menu"), "nav 剥离: {}", fetched.text);
+        assert!(fetched.text.contains("Motivation paragraph."), "正文保留: {}", fetched.text);
+        assert_eq!(fetched.include_hit, Some(false), "命中标志只对应用户 selector");
+        assert_eq!(fetched.include_hits, None);
+
+        // 命中用户 selector（include_hit=Some(true)）：no-op，用户容器原样
+        let mut hit = Fetched {
+            url: "https://github.com/o/r/issues/1".into(),
+            title: "issue title".into(),
+            text: full_text,
+            truncated: false,
+            omitted: 0,
+            truncated_at_offset: None,
+            include_hit: Some(true),
+            include_hits: Some(1),
+            markdown: false,
+            github_comment_hint: None,
+            anchor_crop_range: None,
+            truncated_by_json_keys: false,
+            auto_include_applied: Some("github".into()),
+            include_overridden_by_user: true,
+        };
+        let applied2 =
+            apply_host_route_on_include_fallback(&mut hit, "github", &html, true, false, 50_000)
+                .unwrap();
+        assert!(!applied2, "命中用户 selector 不动");
+        assert!(hit.text.contains("Skip to content"), "用户容器原样保留: {}", hit.text);
+        assert_eq!(hit.include_hit, Some(true));
+        assert_eq!(hit.include_hits, Some(1));
     }
 }
