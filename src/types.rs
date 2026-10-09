@@ -44,7 +44,12 @@ pub struct MetaOutput {
     /// 是否被 `--limit` 截断；false = 正常态，键缺席（8lp 空值缺席=正常）。
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
-    /// M16：本次搜索来源："searxng"（配了 SearXNG 且成功）或 "google"（直爬 / 回退 / browse / dl）。
+    /// M16：本次搜索来源："searxng"（配了 SearXNG 且成功）/ "google"（直爬 / 回退）/
+    /// "duckduckgo"（DDG html 直连）。h90：browse 等非搜索输出**无搜索来源**——置空串，
+    /// 键整体缺席（8lp 缺席=正常）。曾硬编码 "google" 与实际渲染目标相悖、误导 agent 分流；
+    /// 塞目标 host 又会与既定值域（三个 provider 名）冲突——缺席是最小惊讶解。
+    /// 搜索路径恒非空，搜索输出的键存在性不变。
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub provider: String,
     /// 时间过滤回显（--recency 的原始值）；未传时键缺席（ago：与 proxy 同缺席语义）。
     #[serde(skip_serializing_if = "skip_compact_absent_opt")]
@@ -267,6 +272,22 @@ mod tests {
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"proxy\":\"http://127.0.0.1:10808\""), "proxy 传值应出现: {s}");
         assert!(s.contains("\"recency\":\"week\""), "recency 传值应出现: {s}");
+    }
+
+    /// h90：browse 等非搜索输出 provider 置空串 → 键整体缺席；搜索输出（非空）键照常。
+    #[test]
+    fn provider_empty_key_absent_search_keeps_key() {
+        // browse 形态：provider 空 → 键缺席（不再伪装成 "google" 误导分流）
+        let mut m = sample_meta();
+        m.query = String::new();
+        m.provider = String::new();
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(!s.contains("\"provider\""), "空 provider 应键缺席: {s}");
+        // 搜索形态：非空 → 键照常出现
+        let mut m = sample_meta();
+        m.provider = "searxng".into();
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"provider\":\"searxng\""), "{s}");
     }
 
     /// M15：四种状态都正确序列化小写 snake_case。

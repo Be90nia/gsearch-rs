@@ -77,3 +77,58 @@ e2e：
 
 - `bd remember`：URL scheme 门「带 `:` 无 `://`」输入穿补全分支的坑（pkp 单测实锤抓出 javascript: 穿门）
 - `~/.omp/agent/rules/common.md` 新增「URL scheme 白名单门（跨语言）」：四分支结构 + file:///x 与 file:x 两类形态测试表
+
+## 评分（AI 消费者视角，修复后版本复测口径）
+
+**总分：8 / 10**（10 - sum(cost)）
+
+### deductions
+
+```json
+[
+  {
+    "point": "browse 不接受 --no-humanize，从 search 迁移来的调用习惯直接 rc=2，clap tip 也不指向真语义（browse 本就无 warmup，无等价 flag）",
+    "cost": 1,
+    "why": "pkp 验收第 5 步真实撞上：agent 在 search 学到『高频调用加 --no-humanize』，同一会话内对 browse 复用该习惯必吃 rc=2，多花一轮重跑并需要翻 --help 才能确认 browse 本来就不做 warmup",
+    "cmd": "target/debug/gsearch.exe browse \"http://192.168.89.249:8888/\" --allow-private --no-humanize  → error: unexpected argument '--no-humanize' found"
+  },
+  {
+    "point": "browse 输出 meta.provider 硬编码 \"google\"，与实际渲染目标无关，provider 字段对 browse 无信息量且误导分流",
+    "cost": 1,
+    "why": "browse 渲染的是自建 SearXNG 内网页（非任何搜索引擎），stdout 却标 provider=google——AI 若按 provider 做策略分流（如『google 来源需防撞码/结果按 google 量纲理解』）会拿到错误信号；实测 366B 输出中该键与 facts 相悖",
+    "cmd": "target/debug/gsearch.exe browse \"http://192.168.89.249:8888/\" --allow-private --full → {\"meta\":{...\"provider\":\"google\"...},\"content_text\":\"…SearXNG…\"}"
+  }
+]
+```
+
+### highlights（爽点，均有命令证据）
+
+```json
+[
+  {
+    "point": "空 query 前置拒绝：27ms 一行报错，替代原 6.5s 的 6 条 stderr 白烧回退链",
+    "cmd": "target/debug/gsearch.exe search \"\" → rc=2, elapsed_ms=27, error: query 不能为空或纯空白"
+  },
+  {
+    "point": "browse 私网门放行路径干净：rc=0，stdout 366B 纯净 JSON（stderr 仅 1 行 Chrome INFO），渲染正文完整",
+    "cmd": "browse \"http://192.168.89.249:8888/\" --allow-private --full → rc=0, stdout=366B, stderr=115B"
+  },
+  {
+    "point": "dl 直链快路径 + 绝对路径落盘：0.63s 完成，输出三行（mode/落盘路径/字节数）无噪声；穿越拒绝时指引可操作（『确需外部路径请用绝对路径』）",
+    "cmd": "dl https://raw.githubusercontent.com/.../README.md -o D:/gsbt5/abs_ok.md → rc=0, mode: direct, 9380 bytes"
+  },
+  {
+    "point": "similar 信封三信号一致：rc=0 + status=ok + message 摘要同帧到达，AI 无需交叉验证",
+    "cmd": "similar https://tokio.rs --limit 2 → rc=0, run.status=ok, run.message=\"searxng 派生查询命中 2 条（查询: site:tokio.rs）\""
+  },
+  {
+    "point": "filtered_empty 定态的 message 直接给行动建议（去掉 --recency/换窗/换词），AI 无需二次推断决策路径",
+    "cmd": "search \"site:zzqxkcd089.invalid\" --recency day → rc=2, run.status=filtered_empty, message=「recency 过滤后零结果（SearXNG 源健康…）；建议去掉 --recency…」"
+  }
+]
+```
+
+### notes（不扣分的观察）
+
+- doctor 默认 rc=1（network 检查直连 google:443 不吃 GSEARCH_PROXY，fail_count=1）——盲测五已裁定「观察不立案」，本轮实测 `gsearch doctor` 复现同形态；AI 需解析 JSON checks 才能区分「环境断网」与「工具故障」
+- 本 SearXNG 实例对 gibberish/引号短语做模糊兜底（`search "qxkcd089zzq731" --recency day` → 3 条 VIN decoder/优惠券级无关结果，status=ok）——搜索引擎侧行为，gsearch 忠实透传无相关性信号可用，造「真零结果」测试场景需 site: 语法

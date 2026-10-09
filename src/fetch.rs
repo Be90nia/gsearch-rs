@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use scraper::{Html, Node, Selector};
 
-use crate::postproc::{cap_chars, read_max_chars};
+use crate::postproc::cap_chars;
 
 /// fetch 总超时（含 redirect 链）；纯 HTTP 无渲染，10s 足够。
 const FETCH_TIMEOUT_SECS: u64 = 10;
@@ -44,6 +44,8 @@ pub struct FetchOpts {
     /// xih：正文以 markdown 输出（表格/标题/链接保结构）。--json 下 text 字段换源为 markdown，
     /// meta.format="markdown" 标注；无 flag 时逐字节不变。
     pub markdown: bool,
+    /// n76：正文字符预算（text 上限；超限截断，meta.truncated/omitted 如实标注）。CLI 默认 50000。
+    pub max_chars: usize,
 }
 
 /// scheme 前缀校验（大小写不敏感）。非 http(s) 一律拒（fetch 子命令的契约定位 = 互联网只读）。
@@ -310,7 +312,7 @@ async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
     drop(stream);
     let html = String::from_utf8_lossy(&buf).into_owned();
 
-    let limit = read_max_chars();
+    let limit = opts.max_chars;
     let mut fetched = process_html(url, &html, is_html, limit);
     // xih：--markdown 在剥标签前的原始 HTML 上转换（保表格/标题/链接结构），text 字段换源；
     // 非 HTML（text/plain / JSON / md 源文）本就是文本，原样保留。
@@ -872,5 +874,25 @@ mod tests {
         let (buf, hit) = accumulate_chunk(full.clone(), b"more", 10);
         assert!(hit);
         assert_eq!(buf.len(), 10);
+    }
+
+    /// n76：--max-chars 字符预算——正文超限截断、meta.truncated/omitted 如实标注；
+    /// 未超限时不截断。JSON 载荷 meta 键同步（agent 可按键判断是否放大预算重取）。
+    #[test]
+    fn max_chars_caps_text_and_flags_truncated() {
+        let html = "<html><head><title>t</title></head><body><p>你好世界，测试正文。</p></body></html>";
+        // 未超限：不截断；全文长度作 omitted 基准（提取文本含折叠空白，不从源串硬数）
+        let full = process_html("https://e.test/a", html, true, 50_000);
+        assert!(!full.truncated);
+        assert_eq!(full.omitted, 0);
+        // 超限：截到 3 字符，omitted 如实
+        let f = process_html("https://e.test/a", html, true, 3);
+        assert!(f.truncated);
+        assert_eq!(f.text.chars().count(), 3);
+        assert_eq!(f.omitted, full.text.chars().count() - 3);
+        // JSON 载荷 meta.truncated 标注同步
+        let v = fetched_json(&f);
+        assert_eq!(v["meta"]["truncated"], serde_json::json!(true));
+        assert!(v["meta"]["omitted"].as_u64().unwrap() > 0);
     }
 }

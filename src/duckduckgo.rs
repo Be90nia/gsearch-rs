@@ -177,7 +177,7 @@ fn real_url(href: &str) -> String {
 
 /// 最小 percent-decode：%XX 十六进制还原（uddg 值为标准 percent-encoding，'+' 不转空格）。
 /// ponytail: 与 search::urlencode 配对的手写小函数，不引 percent_encoding crate。
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;

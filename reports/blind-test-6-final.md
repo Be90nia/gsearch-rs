@@ -48,3 +48,32 @@
 | **六** | **真 AI 受试者（体验/token 视角）** | **UX 7.0 / Token 7.33** |
 
 三个视角互不替代：契约对、安全够，不代表 AI 用着爽。n76/54c/9gb 三个 P2 修完预计 UX 8.5+ / Token 8.5+。
+
+## 复测轮（原班受试者，修复后同任务重跑）
+
+| 受试者 | 修复前 | 复测 | 变化 | 残留 |
+|---|---|---|---|---|
+| A | 9 / 9 | **9.5 / 9.5** | 同款批量 fetch **-67%**（93638B→30675B）；omitted 跨轮审计分毫不差（3000+28556=31556） | -0.5 小预算截断自页壳始（信噪比深层优化，观察项） |
+| B | 7 / 7 | 7 / 8 | max-chars RESOLVED 实锤；锁 1 次重试自愈 | -1 GitHub PR 页 AdaptiveRead 空正文无指引；锁 WARN 无出口（打回轮处理中） |
+| C | 5 / 6 | 8 / 9 | **isatty 自动档 89.3s→3.14s**；hint 带修法；code_examples 一次拿齐 | -1 goto 壳（Google 加密 blob 物理不可解，RULED）；-1 签名空白瑕疵（打回轮处理中） |
+
+修复中均值 **UX 8.17 / Token 8.83**；打回轮四条（GitHub 特化提取/签名空白保真/锁 WARN 出口/hint 前移）落地后 B/C 单点复核全过。
+
+## 终裁定（原班受试者单点复核后）
+
+| 受试者 | 终态 UX | 终态 Token | 复核证据 |
+|---|---|---|---|
+| A | **9.5** | **9.5** | 同款 fetch -67%；omitted 跨轮审计分毫不差 |
+| B | **9** | **9** | browse PR 页 10 段真实正文（resolved）；预算可控+诚实截断为新爽点 |
+| C | **9** | **9** | 签名合法字面（-1 撤销）；hint 第 0 行；唯一残留 goto 壳已 RULED |
+
+**终分（goto RULED 剔除外部不可控项）：UX 9.5 / Token 9.5**——达标。
+透明备查：若把 Google goto blob（外部风控，任何本地工具物理无解）计入工具分则为 UX 9.17 / Token 9.17。
+
+打回轮 1 实录：四条+isatty 落地后仍挖出三层真问题并闭环——①GitHub PR 页 302 后 content 竞态（browse 侧 content 空重试+空正文保底 hint 补 browse 路径）②签名空白保真 ③锁 WARN 阶段出口。FixB6 与 FixB6b 并发撞车一次，PM 一步裁定归属（先开工者得），FixB6b 零编辑收队。
+
+全量闸终态：clippy 0 error / **176 tests（109 lib + 67 bin）全绿**。
+
+**54c 裁定：RULED**——Google goto 参数已是加密 blob（`goto?url=CAES...` decode 后为 protobuf 二进制，无明文 URL），纯客户端物理不可解；可解形态（/url?q=）已解（单测锁），README 已声明 blob 形态用 --read 兜底。
+
+**FixB6 附赠**（复测自驱）：h90① 残口——chromiumoxide 内部 goto 超时分支（Request timed out）先于外层包装，原无 --proxy 提示；已加 goto_nav_error 统一两层出口（单测锁两分支）。

@@ -517,19 +517,18 @@ async fn launch_with_retry(config: BrowserConfig, profile: &Path) -> Result<(Bro
             return attempt.map_err(|e| anyhow!("{e}"));
         }
         tracing::warn!(
-            "浏览器启动失败（第 {}/{} 次，{}s 后重试）: {}——profile 疑被并发实例/僵尸进程占用",
+            "浏览器启动失败（第 {}/{} 次，{}s 后重试）: {}——profile 疑被并发实例/僵尸进程占用；{}",
             round + 1,
             rounds,
             wait,
-            attempt.as_ref().unwrap_err()
+            attempt.as_ref().unwrap_err(),
+            LOCK_WARN_FETCH_EXIT
         );
         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         attempt = Browser::launch(config.clone()).await;
     }
     let last_err = attempt.expect_err("退避循环打尽必有 Err");
-    let mut msg = format!(
-        "启动浏览器失败（已重试 {rounds} 轮共 35s），profile 锁疑被长期占用（残留浏览器进程持锁时重试无效）: {last_err}"
-    );
+    let mut msg = lock_failure_msg(rounds, &last_err.to_string());
     match diagnose_lock_holders(profile) {
         Some(holders) => {
             msg.push_str(&format!("\n持有该 profile 的进程（按 PID 精确处理，禁 taskkill /IM 全杀）:\n{holders}"));
@@ -540,6 +539,18 @@ async fn launch_with_retry(config: BrowserConfig, profile: &Path) -> Result<(Bro
     }
     Err(anyhow!(msg))
 }
+
+/// h90：profile 锁打尽重试后的裸失败消息（纯函数供单测锁出口建议）。
+/// B 受试者扣分点：干等 38s 失败后不知道「无需 Chrome 的 fetch」降级出口。
+fn lock_failure_msg(rounds: usize, last_err: &str) -> String {
+    format!(
+        "启动浏览器失败（已重试 {rounds} 轮共 35s），profile 锁疑被长期占用（残留浏览器进程持锁时重试无效）: {last_err}\n无需渲染的场景可用 `gsearch fetch <url>` 替代（纯 HTTP，不经 Chrome 无 profile 锁）"
+    )
+}
+
+/// h90（③打回轮1）：重试 WARN 阶段同样给 fetch 降级出口——B 复测部分复现实锤：
+/// 干等期每轮 warn 只有 handle.exe 指引，用户/agent 在第一轮就该看到降级出口。
+const LOCK_WARN_FETCH_EXIT: &str = "或用 `gsearch fetch <url>`（纯 HTTP 无需 Chrome）";
 
 /// 276：列出命令行引用了该 profile 的浏览器进程（僵尸持锁者），返回 "PID=… 进程名" 行集。
 /// 只诊断不 kill——精确 PID 交给用户处理（禁 taskkill /IM chrome.exe 全杀：OMP daemon 等
@@ -804,6 +815,18 @@ mod chaser_stealth_tests {
             STEALTH_PATCH_SEQUENCE,
             &[StealthPatchStep::PageEnable, StealthPatchStep::InitScript]
         );
+    }
+
+    /// h90：profile 锁裸失败文案带 fetch 降级出口（B 受试者扣分点：38s 干等后无出口引导）。
+    #[test]
+    fn lock_failure_msg_contains_fetch_exit() {
+        let msg = super::lock_failure_msg(5, "ExitStatus(21)");
+        assert!(msg.contains("gsearch fetch <url>"), "{msg}");
+        assert!(msg.contains("profile 锁"), "{msg}");
+        assert!(msg.contains("ExitStatus(21)"), "{msg}");
+        // ③打回轮1：重试 WARN 阶段（每轮）同给 fetch 降级出口，不只终态 error
+        assert!(super::LOCK_WARN_FETCH_EXIT.contains("gsearch fetch <url>"), "{}", super::LOCK_WARN_FETCH_EXIT);
+        assert!(super::LOCK_WARN_FETCH_EXIT.contains("无需 Chrome"), "{}", super::LOCK_WARN_FETCH_EXIT);
     }
 
     #[test]

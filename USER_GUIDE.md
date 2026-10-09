@@ -206,15 +206,20 @@ GSEARCH_PROXY=socks5://127.0.0.1:1080 gsearch search "..." --limit 5
 
 支持 HTTP / SOCKS5（Chrome 协议）。
 
-### 6.2 `--no-humanize`（默认启用 warmup）
+### 6.2 humanize 自动档（isatty）
 
-搜索前默认启用 warmup（随机访问 Wikipedia/GitHub/HN + 滚动 + 10 个指纹补丁）——人用保留，**agent 反复调用建议加 `--no-humanize` 跳过**：
+搜索前 warmup（随机访问 Wikipedia/GitHub/HN + 滚动 + 10 个指纹补丁）**默认随 stdout 自动判定**：
+
+- **交互终端（人）**：默认启用——保留防撞码暖场
+- **管道 / agent 调用（stdout 非 TTY）**：默认关闭（快档，实测省 80s+/次）
+- 显式 `--humanize` / `--no-humanize` 恒覆盖自动档：
 
 ```bash
-gsearch search "..." --limit 5 --no-humanize
+gsearch search "..." --limit 5 --no-humanize   # 终端里强制快档
+gsearch search "..." --limit 5 --humanize      # 管道里强制暖场档（stderr 会提示耗时代价）
 ```
 
-**注意**：flag 是 `--no-humanize`（SetFalse），`--humanize=false` / `--humanize` 都不存在，传入会 rc=2。
+**注意**：两个 flag 都是 SetTrue 开关（`--humanize` 开 / `--no-humanize` 关）；`--humanize=false` 形态不存在，传入 rc=2。
 
 ---
 

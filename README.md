@@ -12,13 +12,13 @@
 gsearch search "python asyncio" --limit 10        # 默认输出紧凑 JSON（单行无缩进）
 gsearch search "fastapi tutorial" --human         # 人读文本模式（旧格式）
 gsearch search "rust release" --recency week      # 时间过滤 day|week|month|year
-gsearch search "..." --no-humanize                # 跳过搜索前 warmup（agent 高频调用建议）
+gsearch search "..." --no-humanize                # 强制跳过 warmup（TTY 下想快档时用；管道默认已关）
 gsearch search "..." --read 1
 gsearch search "..." --dl 1
 gsearch search "..." --open 1
 ```
 
-`--humanize` 默认启用：Google 搜索前随机访问 Wikipedia/GitHub/HN，滚动并短暂停留；指纹补丁仅用于 search，不改变 browse/login。agent 反复调用建议加 `--no-humanize`。
+`--humanize` 默认随 stdout 自动（isatty 自动档）：**交互终端（人）默认启用**——搜索前随机访问 Wikipedia/GitHub/HN、滚动并短暂停留 + 指纹补丁；**管道/agent 调用（非 TTY）默认关闭**（快档，实测省 80s+）。显式 `--humanize` / `--no-humanize` 恒覆盖自动档；指纹补丁仅用于 search，不改变 browse/login。
 
 `--recency day|week|month|year` 时间过滤多 provider 生效：SearXNG 请求追加 `time_range`，Google SERP URL 追加 `tbs=qdr:d/w/m/y`，DDG html 表单追加 `df=d/w/m/y`；不传时请求 URL 与旧版逐字节一致。`site:` 等查询语法原样透传，无专属参数。batch 多查询同样生效（batch 仅 SearXNG 源）。`meta.recency` 回显本次过滤值；`meta.proxy` 回显代理——两者未传时**键真缺席**（ago：缺席语义执行到底，不输出 `null`）。
 
@@ -52,7 +52,7 @@ gsearch search "rust async runtime" "tokio tutorial" --limit 3
 #### SearXNG 熔断与零结果三态（searxng_degraded / filtered_empty / no_results）
 
 单查询回退链为 **SearXNG → DDG html → Google**：SearXNG 挂/零结果时先试 DDG html 直连（纯 HTTP 免浏览器，命中时 `meta.provider=duckduckgo`、stderr 一行接管提示）；DDG 也空才做 Google 直连预检（TCP 1.5s）：不通则**熔断**——跳过回退秒级返回，`run.status=searxng_degraded`、exit 2、stderr 一行诊断（基础设施降级 ≠ 查询无资料，agent 应换短 query / `doctor` / 直接 `fetch` 已知源，而非当空结果处理）。
-IP 可达时回退 Google 直爬；**若回退也零结果，按 SearXNG 主源健康度定态（o1p 三态，stderr 诊断行与 `run.status`/`run.message` 同步）**：
+IP 可达时回退 Google 直爬（**未配置 SearXNG 的裸环境回退时 stderr 一行 `[hint] SearXNG 未配置…`**，给出 `GSEARCH_SEARXNG_URL` 配置出口；isatty 自动档下管道调用默认已是快档）；**若回退也零结果，按 SearXNG 主源健康度定态（o1p 三态，stderr 诊断行与 `run.status`/`run.message` 同步）**：
 
 - SearXNG **故障**（HTTP 4xx/5xx、超时、解析失败）→ `run.status=searxng_degraded`，message 尾部透传真因（如 `HTTP 400 Bad Request`）
 - SearXNG **健康**（HTTP 200 但零结果）+ `--recency` → `run.status=filtered_empty`（「过滤后空」≠ 基础设施故障；去掉 `--recency` / 换时间窗即可）
@@ -73,6 +73,7 @@ gsearch similar "https://docs.rs/serde" --limit 3
 `search --read N` 与 `browse` 默认输出 AdaptiveRead 结构化 JSON：
 
 - `summary_paragraphs`：按文章长度自适应选的摘要段全文（<10 段全给 / 10-50 段给前 10 / >50 给前 5）
+- `code_examples`（有 `<pre>` 代码块时才出键）：文档页函数签名 + Example 代码块全文（前 2 块、单块 1500 字符封顶）——文档页 `--read 1` 一次拿齐签名 + 示例，无需 `--full` 二跑
 - `paragraph_index`：**默认只列未进摘要的段落**（摘要段全文已在 summary 里，再列首句是同载荷重复）；`--excerpt N` 场景恢复全量（每项附该段前 N 字符实际文本）；空段保留占位以对齐 `--from K` 段号
 - `headings` 超过 30 项截断，`meta.headings_truncated: true` 标记
 - 正文有 **HTML 源码硬截断**（默认 50000 字符，gsearch.json `"read_max_chars"` 可配）；截断发生时 meta 才出现 `truncated / omitted` 键
@@ -100,10 +101,12 @@ gsearch fetch https://internal --allow-private  # 放行私网（默认拒）
 gsearch fetch URL1 URL2 ...                     # 批量并发（≤5 并发，单条失败不阻塞）
 gsearch fetch https://spa-site --include "main,article"  # 只提取命中容器正文
 gsearch fetch https://docs-site/page --markdown # 正文 markdown（表格/标题/链接保结构）
+gsearch fetch https://big-site/releases --max-chars 8000  # 字符预算：正文截到 8000（meta.truncated=true）
 ```
 
 - **批量**：多位置参数并发抓取，默认 JSON 裸数组（元素含 `url/title/text/meta/status`，单条失败 `status=private_blocked|error` 不阻塞其他）；退出码 `0` 全成功 / `1` 部分失败 / `2` 全失败；每条 URL 独立过私网门
 - **`--include <selector>`**：逗号分隔 CSS selector，取首个命中容器正文；命中时跳过 JS 壳判定，`meta.include_hit=false` 表示未命中回退全文
+- **`--max-chars <N>`（默认 50000）**：`text` 字段字符预算——超限截断并在 `meta.truncated=true` / `meta.omitted` 如实标注（n76：大页面是 token 放血口，agent 按预算取数）
 
 - **无需浏览器**：纯 reqwest GET，秒取静态页（换机可用性兜底）。
 - **HTTPS only（公网）**：公网 URL 初始请求与重定向链都强制 https，`http://` 直接拒绝并给出明确提示（防降级 + 重定向中转 SSRF）；`--allow-private`/env 放行私网时允许内网明文 http（内网端点常见 http-only）。
@@ -115,6 +118,27 @@ gsearch fetch https://docs-site/page --markdown # 正文 markdown（表格/标�
 - **二进制内容拒抓**：其余非文本 Content-Type（`image/*` `audio/*` `video/*` `font/*`、zip/gzip/tar、`application/octet-stream`、Office 文档等）同样前置报错指引 `gsearch dl <url>`；文本类（`text/*`、JSON、`+xml`、javascript）照常提取，无 Content-Type 头按文本处理。
 - **正文提取走 scraper 树内解析**（与 `search --read` 的 AdaptiveRead 同一解析器）：HTML 由 html5ever 按浏览器规则解析，属性值含 `>` 的标签不会漏片段进正文，实体在解析期解码。
 - **fetch 输出 `content_untrusted: true`** 与 read/browse 同契约。
+
+### 单行 JSON 消费姿势（agent/管道必读）
+
+输出是**单行紧凑 JSON**——行式读取工具（`read`/`sed -n Np`）一行就是整个响应，大页面全量进上下文是 token 放血口。三种省 token 姿势：
+
+```bash
+# 1. 重定向落盘 + 按需切片（大页面首选：stdout 不进上下文）
+gsearch fetch https://github.com/x/y/releases --max-chars 8000 > page.json
+python -c "import json;d=json.load(open('page.json'));print(d['text'][:2000])"
+
+# 2. 美化 + 分页看结构（只在需要浏览字段结构时用）
+gsearch search "rust async" | python -m json.tool | less
+
+# 3. 预算内直取（--max-chars 控正文上限；截断时 meta.truncated=true 如实标注）
+gsearch fetch https://big.site --max-chars 8000          # 默认 50000
+gsearch browse https://spa.site --max-chars 8000
+
+# 禁 2>&1：stderr 承载 Chrome 启动 INFO/截断告警，混流会破坏 json.loads
+```
+
+注意：`browse` 等非搜索输出**没有 `meta.provider` 键**（无搜索来源，键缺席=正常）；`search` 输出恒有该键（`searxng` / `duckduckgo` / `google`）。
 
 ### 退出码（agent 消费必读，对照源码 main.rs/verify.rs）
 
@@ -135,6 +159,7 @@ search 遇 CAPTCHA 超时不走退出码 3 的 stderr 文案，而是输出 `sta
 ```
 gsearch browse https://example.com              # 渲染后正文 AdaptiveRead JSON + URL/标题
 gsearch browse https://example.com --full       # innerText 全文（50000 字 cap）
+gsearch browse https://example.com --max-chars 8000  # 字符预算：渲染 HTML/innerText 截到 8000（meta.truncated=true）
 gsearch browse https://example.com --markdown   # 渲染后 HTML → markdown（隐含全文模式）
 gsearch browse https://example.com --human      # 人读文本模式
 gsearch login  https://github.com               # 弹有头窗人工登录；关窗 = 完成，cookie 落 profile

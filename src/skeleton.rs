@@ -6,7 +6,7 @@
 //! - `format_headings_only`：仅目录，最省 token（~50）。
 //! - `slice_from`：应用 `--from K`（仅在摘要起点偏移）。
 
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector};
 use serde::Serialize;
 
 /// 单个标题节点（h1/h2/h3）。
@@ -38,10 +38,20 @@ pub struct AdaptiveRead {
     pub summary_paragraphs: Vec<String>,
     /// 全文章段落首句 + 字数（agent 可针对性 `--from K` 拿指定段）。
     pub paragraph_index: Vec<Paragraph>,
+    /// 9as：<pre> 代码块全文（文档页签名/Example 段；--read 一次拿齐，免 --full 二跑）。
+    /// 文档页的签名与示例代码在 <pre> 里（不在 <p>），单独成字段不挤占摘要段语义；
+    /// 空时键缺席（8lp 缺席=正常，默认输出逐键不变）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub code_examples: Vec<String>,
 }
 
 const SEL_HEADINGS: &str = "h1, h2, h3";
 const SEL_P: &str = "p";
+/// 9as：代码块收集（<pre> 覆盖 docs.rs rustdoc 与 GitHub md 围栏块——内层 <code> 文本已被
+/// pre 的 text 覆盖；行内 <code> 本就在 <p> 文本里，不重复收）。
+const SEL_PRE: &str = "pre";
+/// ①打回轮1：GitHub issues/PR 主评论容器（新旧两代 markup 各占其一；URL gate 在调用方）。
+const SEL_GITHUB_COMMENT: &str = ".js-comment-body, .comment-body";
 /// 段落索引展示上限：超出折叠"..另 X 段省略"，免索引段把 token 吃光。
 const INDEX_DISPLAY_LIMIT: usize = 20;
 
@@ -50,6 +60,11 @@ const SHORT_MAX: usize = 10;        // < SHORT_MAX 给全文
 const MEDIUM_TAKE: usize = 10;     // 10..=50 给前 MEDIUM_TAKE 段
 const LONG_TAKE: usize = 5;        // > 50 给前 LONG_TAKE 段
 const LONG_THRESHOLD: usize = 50;
+
+/// 9as：代码块预算——只收前 2 块（文档页首两块 = 函数签名 + 首个 Example）、
+/// 单块 1500 字符封顶（防 minified 巨块把摘要吃光），超长尾部标注截断。
+const CODE_EXAMPLE_MAX_BLOCKS: usize = 2;
+const CODE_EXAMPLE_BLOCK_MAX_CHARS: usize = 1500;
 
 /// 从 HTML 提取 AdaptiveRead。url/title 由调用方拿到 HTML 后补（HTML <title> 不一定可信）。
 /// excerpt_chars：Some(N) = paragraph_index 每项附该段前 N 字符（html 已被调用方 cap 过
@@ -109,13 +124,87 @@ pub fn extract_adaptive(html: &str, excerpt_chars: Option<usize>) -> AdaptiveRea
         })
         .collect();
 
+    // 9as：<pre> 代码块（文档页签名 + Example 段）。取前 2 块、单块 1500 字符封顶，
+    // 超长尾部标注截断——预算固定，摘要 token 上界不因巨块失控。
+    let pre_sel = Selector::parse(SEL_PRE).expect("静态选择器必然合法");
+    let code_examples: Vec<String> = doc
+        .select(&pre_sel)
+        .map(|el| code_block_text(&el).trim().to_string())
+        .filter(|t| !t.is_empty())
+        .take(CODE_EXAMPLE_MAX_BLOCKS)
+        .map(|t| {
+            if t.chars().count() > CODE_EXAMPLE_BLOCK_MAX_CHARS {
+                let head: String = t.chars().take(CODE_EXAMPLE_BLOCK_MAX_CHARS).collect();
+                format!("{head}\n..（代码块超长已截断）")
+            } else {
+                t
+            }
+        })
+        .collect();
+
     AdaptiveRead {
         url: String::new(),
         title: String::new(),
         headings,
         summary_paragraphs,
         paragraph_index,
+        code_examples,
     }
+}
+
+/// ②打回轮1：pre 文本提取——元素边界无空白文本节点时按词边界补一个空格（rustdoc 签名的
+/// token 间距靠 CSS margin，`text()` 直拼会把 `Result<T>where` 粘成非法 Rust 字面）。
+/// 内部空白原样保留（禁空白折叠）：只在两侧都是词字符、或左侧以 `>`/`)` 收尾且右侧为词字符
+/// 时插入；`from_str(`、`&'a` 等天然相邻形态不被拆开。
+fn code_block_text(root: &ElementRef) -> String {
+    use scraper::Node;
+    let mut out = String::new();
+    // 显式栈 DFS，children 逆序入栈保持文档序（ego_tree 未被 scraper re-export，类型全程推断）
+    let mut stack: Vec<_> = root.children().rev().collect();
+    while let Some(node) = stack.pop() {
+        match node.value() {
+            Node::Text(t) => {
+                // 原样保留（禁空白折叠）；仅当节点以非空白字符开头且上一输出以词字符收尾时补一个
+                // 空格——节点自带前导空白（如 where 后的 "\n    T:"）时插空格会产生尾随空格
+                let s: &str = &t.text;
+                if let (Some(last), Some(first)) = (out.chars().last(), s.chars().next())
+                    && !first.is_whitespace()
+                    && joins_word(last, first)
+                {
+                    out.push(' ');
+                }
+                out.push_str(s);
+            }
+            Node::Element(_) => {
+                stack.extend(node.children().rev());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 词边界补空格判定：两侧都是词字符，或左侧 `>`/`)` 收尾且右侧词字符（`Result<T>where` →
+/// `Result<T> where`）；`from_str(`、`&'a`、`foo,` 等不插。
+fn joins_word(left: char, right: char) -> bool {
+    let left_word = left.is_alphanumeric() || left == '_' || left == '>' || left == ')';
+    let right_word = right.is_alphanumeric() || right == '_';
+    left_word && right_word
+}
+
+/// ①打回轮1：GitHub issues/PR 主评论容器抽取——页面正文在 DOM 尾部（head/nav/SVG sprite
+/// 占掉前几十万字符），调用方先 cap 后抽会把正文全裁掉（实测 omitted=589331 / summary 空）。
+/// 命中 .js-comment-body/.comment-body 返回容器 inner_html 拼接（None = 非 GitHub 形态，
+/// 调用方按 URL gate 后才调）。产物交 extract_adaptive 正常走 <p>/<pre> 提取。
+pub fn github_comment_html(html: &str) -> Option<String> {
+    let doc = Html::parse_document(html);
+    let sel = Selector::parse(SEL_GITHUB_COMMENT).expect("静态选择器必然合法");
+    let mut buf = String::new();
+    for el in doc.select(&sel) {
+        buf.push_str(&el.inner_html());
+        buf.push('\n');
+    }
+    (!buf.is_empty()).then_some(buf)
 }
 
 fn first_sentence(p: &str) -> String {
@@ -188,6 +277,15 @@ pub fn format_adaptive(read: &AdaptiveRead, from_offset: usize) -> String {
         for p in summary {
             out.push_str(p);
             out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    // 9as：[示例代码]（<pre> 块；文档页 = 签名 + Example，--read 一次拿齐）
+    if !read.code_examples.is_empty() {
+        out.push_str(&format!("[示例代码 - {} 块]\n", read.code_examples.len()));
+        for (i, code) in read.code_examples.iter().enumerate() {
+            out.push_str(&format!("[code {}]\n{code}\n", i + 1));
         }
         out.push('\n');
     }
@@ -449,5 +547,110 @@ mod tests {
         assert!(!s.contains("excerpt"), "默认档不应出 excerpt 键: {s}");
         let s = serde_json::to_string(&with.paragraph_index[0]).unwrap();
         assert!(s.contains(r#""excerpt":"hello""#), "{s}");
+    }
+
+    /// 9as：文档页 Example fixture——签名 + 示例 <pre> 块进 code_examples，
+    /// --read 一次拿到签名 + 示例，无需 --full 二跑。无 <pre> 页面键缺席（默认输出逐键不变）。
+    #[test]
+    fn code_examples_collected_from_pre_blocks() {
+        // docs.rs 形态：函数签名 <pre> + 描述 <p> 若干 + Examples 节 <pre>
+        let html = r##"<!doctype html><html><body>
+<h1>Function from_str</h1>
+<pre><code>pub fn from_str&lt;'a, T&gt;(s: &amp;'a str) -&gt; Result&lt;T&gt;
+where
+    T: Deserialize&lt;'a&gt;,
+</code></pre>
+<p>Deserializes an instance of type T directly from a string.</p>
+<p>Errors section body text goes here.</p>
+<h2>Example</h2>
+<p>An example of deserializing:</p>
+<pre><code>let v: Value = serde_json::from_str(r#"{"a":1}"#).unwrap();</code></pre>
+</body></html>"##;
+        let read = extract_adaptive(html, None);
+        assert_eq!(read.code_examples.len(), 2, "签名 + Example 各一块");
+        assert!(read.code_examples[0].contains("pub fn from_str"), "首块 = 函数签名");
+        assert!(read.code_examples[1].contains("serde_json::from_str"), "次块 = Example");
+        // 无 <pre> 页面：键缺席（serde skip_serializing_if）
+        let plain = extract_adaptive("<html><body><p>no code here</p></body></html>", None);
+        assert!(plain.code_examples.is_empty());
+        let s = serde_json::to_string(&plain).unwrap();
+        assert!(!s.contains("code_examples"), "空时不出键: {s}");
+    }
+
+    /// 9as：代码块预算——超过 2 块只收前 2；单块超 1500 字符截断并标注。
+    #[test]
+    fn code_examples_bounded_by_budget() {
+        let mut html = String::from("<html><body>");
+        for i in 1..=4 {
+            html.push_str(&format!("<pre>block {i}</pre>"));
+        }
+        html.push_str("</body></html>");
+        let read = extract_adaptive(&html, None);
+        assert_eq!(read.code_examples.len(), 2, "只收前 2 块");
+        assert_eq!(read.code_examples[0], "block 1");
+
+        let huge = "x".repeat(2000);
+        let big = extract_adaptive(&format!("<html><body><pre>{huge}</pre></body></html>"), None);
+        assert_eq!(big.code_examples.len(), 1);
+        assert!(
+            big.code_examples[0].starts_with("x") && big.code_examples[0].contains("..（代码块超长已截断）"),
+            "超长块截断并标注"
+        );
+        assert!(big.code_examples[0].chars().count() < 2000);
+    }
+
+    /// 9as：文本渲染带 [示例代码] 节，夹在摘要与段落索引之间。
+    #[test]
+    fn format_adaptive_renders_code_section() {
+        let html = "<html><body><pre>let x = 1;</pre><p>prose</p></body></html>";
+        let mut read = extract_adaptive(html, None);
+        read.url = "u".into();
+        read.title = "t".into();
+        let out = format_adaptive(&read, 0);
+        let code_start = out.find("[示例代码").expect("示例代码节存在");
+        let summary_start = out.find("[摘要").unwrap();
+        let index_start = out.find("[段落索引").unwrap();
+        assert!(summary_start < code_start && code_start < index_start, "节序：摘要→示例代码→段落索引");
+        assert!(out.contains("let x = 1;"));
+    }
+
+    /// ②打回轮1：签名空白保真——rustdoc token 间距靠 CSS（span 相邻无空白文本节点），
+    /// 词边界补空格让 `Result<T>where` 还原为合法 Rust；天然相邻形态（`from_str(`、`&'a`）
+    /// 不被拆；内部换行缩进原样保留（禁空白折叠）。
+    #[test]
+    fn code_block_text_preserves_word_boundaries() {
+        let html = r##"<html><body><pre><code><span>pub</span><span>fn</span><span>from_str</span>(s: &amp;'a str) -&gt; <span>Result&lt;T&gt;</span><span>where</span>
+    T: Deserialize&lt;'a&gt;,
+</code></pre></body></html>"##;
+        let read = extract_adaptive(html, None);
+        assert_eq!(read.code_examples.len(), 1);
+        let code = &read.code_examples[0];
+        assert!(code.contains("pub fn from_str"), "词字符相邻补空格: {code:?}");
+        assert!(code.contains("Result<T> where"), ">词边界补空格: {code:?}");
+        assert!(code.contains("\n    T: Deserialize<'a>,"), "内部换行缩进原样: {code:?}");
+        assert!(!code.contains("( s:"), "非词边界不插空格: {code:?}");
+        assert!(!code.contains(" \n"), "自带前导空白的节点不产生尾随空格: {code:?}");
+    }
+
+    /// ①打回轮1：GitHub 主评论容器抽取——容器在 DOM 尾部（head 巨大），抽取命中容器内容；
+    /// 无容器的普通页返回 None。
+    #[test]
+    fn github_comment_html_extracts_thread_containers() {
+        let junk = "x".repeat(20_000);
+        let html = format!(
+            "<html><head><meta>{junk}</meta></head><body><nav>menu</nav>\
+             <div class='js-comment-body'><p>issue body text here</p><pre>let a = 1;</pre></div>\
+             <div class='comment-body'><p>first comment reply</p></div></body></html>"
+        );
+        let container = github_comment_html(&html).expect("容器命中");
+        assert!(container.contains("issue body text here"));
+        assert!(container.contains("first comment reply"));
+        assert!(!container.contains(&junk), "head 噪声不进容器产物");
+        // 抽取产物走 extract_adaptive 正常通道：<p> 进摘要、<pre> 进 code_examples
+        let read = extract_adaptive(&container, None);
+        assert!(read.summary_paragraphs.iter().any(|p| p.contains("issue body text here")));
+        assert!(read.code_examples.iter().any(|c| c.contains("let a = 1;")));
+        // 无容器页面 → None
+        assert!(github_comment_html("<html><body><p>plain page</p></body></html>").is_none());
     }
 }

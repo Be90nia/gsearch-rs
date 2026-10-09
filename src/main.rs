@@ -1,5 +1,6 @@
 //! gsearch-rs 入口：clap 子命令派发 + Windows 控制台 UTF-8 + tracing 初始化
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -122,6 +123,9 @@ enum Command {
         /// --json 时 content_text 字段换源为 markdown，meta.format="markdown" 标注。
         #[arg(long, default_value_t = false, conflicts_with = "headings_only")]
         markdown: bool,
+        /// n76：正文字符预算（HTML/innerText/markdown 上限；超限截断并在 meta.truncated 如实标注）。
+        #[arg(long, default_value_t = 50_000, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=10_000_000))]
+        max_chars: usize,
         /// pkp：放行私网地址（loopback / RFC1918 / link-local / 云 metadata），语义与 fetch 对齐。
         /// 默认拒（SSRF 门）：browse 的 URL 可能来自 LLM 输出（搜索结果/页面内容间接注入），
         /// 私网地址默认不渲染；非 http/https scheme（file:///javascript:/data: 等）一律拒绝，无 flag 可绕。
@@ -203,6 +207,9 @@ enum Command {
         /// meta.format="markdown" 标注；无 flag 输出逐字节不变。
         #[arg(long, default_value_t = false)]
         markdown: bool,
+        /// n76：正文字符预算（text 字段上限；超限截断并在 meta.truncated 如实标注）。
+        #[arg(long, default_value_t = 50_000, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=10_000_000))]
+        max_chars: usize,
     },
     /// 启发式相似页搜索（e7c）：URL → title 关键词派生查询，SearXNG 单查 + 词重合/同域重排。
     /// 派生查询而非 exa 神经 findSimilar（README 预期管理）。
@@ -243,9 +250,13 @@ struct SearchArgs {
     #[arg(long, group = "post")]
     open: Option<usize>,
     /// 跳过搜索前的 warmup（Wikipedia/GitHub/HN 随机访问 + 滚动）+ 指纹补丁。
-    /// Agent 反复调时建议加；人用保留默认 warmup。
-    #[arg(long = "no-humanize", default_value_t = true, action = clap::ArgAction::SetFalse)]
+    /// isatty 自动档（盲测六拍板）：stdout 是 TTY（人）默认开；管道/agent 调用默认关（快档，
+    /// 实测省 80s+）。显式 --humanize / --no-humanize 恒覆盖自动档。
+    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "no_humanize")]
     humanize: bool,
+    /// 显式关闭 humanize（覆盖 TTY 自动档；管道/agent 调用自动档已是关，通常无需传）。
+    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "humanize")]
+    no_humanize: bool,
     #[arg(long, default_value_t = false)]
     full: bool,
     /// 3gw：输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
@@ -324,7 +335,7 @@ async fn main() -> ExitCode {
     gsearch::types::set_compact_meta(compact_requested && !debug_logging);
     let result: Result<ExitCode> = match cli.cmd {
         Command::Search(args) => cmd_search(args, proxy.clone()).await,
-        Command::Browse { url, full, human, from, headings_only, compact_meta: _, markdown, browser, allow_private, .. } => {
+        Command::Browse { url, full, human, from, headings_only, compact_meta: _, markdown, browser, allow_private, max_chars, .. } => {
             let opts = general::BrowseOpts {
                 full,
                 // 3gw：--json 已是默认，--human 才切人读
@@ -335,6 +346,7 @@ async fn main() -> ExitCode {
                 browser: browser.into(),
                 proxy: proxy.clone(),
                 allow_private,
+                max_chars,
             };
             general::cmd_browse(&url, &opts).await
         }
@@ -347,8 +359,8 @@ async fn main() -> ExitCode {
         Command::Verify { url, human, timeout, urls_file, .. } => {
             gsearch::verify::cmd_verify(&url, !human, proxy.as_deref(), timeout, urls_file.as_deref())
         }
-        Command::Fetch { url, human, allow_private, include, markdown, .. } => {
-            fetch::cmd_fetch(&url, &fetch::FetchOpts { json: !human, proxy: proxy.clone(), allow_private, include, markdown }).await
+        Command::Fetch { url, human, allow_private, include, markdown, max_chars, .. } => {
+            fetch::cmd_fetch(&url, &fetch::FetchOpts { json: !human, proxy: proxy.clone(), allow_private, include, markdown, max_chars }).await
         }
         Command::Similar { url, limit, human, .. } => cmd_similar(url, limit, human).await,
         Command::Update => update::cmd_update(proxy.clone()).await,
@@ -371,6 +383,25 @@ async fn main() -> ExitCode {
 /// 不发起任何网络。返回首个非法 query 供报错（与 qbw similar 闸同型一行报错）。
 fn first_blank_query(queries: &[String]) -> Option<&str> {
     queries.iter().map(String::as_str).find(|q| q.trim().is_empty())
+}
+
+/// 盲测六 isatty 拍板：humanize 生效档 = 显式 flag 优先，都未传时跟随 stdout 是否 TTY——
+/// 人（TTY）保留 warmup 档，管道/agent 自动快档。纯函数，三态单测锁。
+fn resolve_humanize(explicit_on: bool, explicit_off: bool, stdout_is_tty: bool) -> bool {
+    if explicit_on {
+        true
+    } else if explicit_off {
+        false
+    } else {
+        stdout_is_tty
+    }
+}
+
+impl SearchArgs {
+    /// 运行时生效档（--humanize/--no-humanize 显式传参恒覆盖 isatty 自动档）。
+    fn humanize_effective(&self) -> bool {
+        resolve_humanize(self.humanize, self.no_humanize, std::io::stdout().is_terminal())
+    }
 }
 
 async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode> {
@@ -426,12 +457,19 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         gsearch::search::SearxngAttempt::HealthyEmpty
             | gsearch::search::SearxngAttempt::FallbackGoogle(None)
     );
+    // 9gb：NotConfigured = 裸环境（没配 SearXNG）——落到 Google 直爬时给一行配置出口提示
+    let searxng_not_configured = matches!(&searxng, gsearch::search::SearxngAttempt::NotConfigured);
     let (mut results, captcha_solved, provider) = match searxng {
         gsearch::search::SearxngAttempt::Results(
             gsearch::search::SearchOutcome::Results { results, captcha_solved, provider },
         ) => (results, captcha_solved, provider),
         // NotConfigured（未配 SearXNG）/ FallbackGoogle（预检通过，回退 warn 已打）→ Google 直爬
         _ => {
+        // 9gb（④打回轮1）：hint 前移到回退决策点——用户/agent 在 Chrome 启动等待期就能看到，
+        // 而不是运行结束才出现
+        if searxng_not_configured {
+            eprintln!("[hint] SearXNG 未配置，已回退 Google 直爬（可配 GSEARCH_SEARXNG_URL 提速；agent 高频建议 --no-humanize）");
+        }
         // H2 包成 async 块统一收尾：launch 成功后所有 ? 早返回路径（new_page / install_init_script /
         // browser 用 Cell 模式（Option<Browser>）保留到外层，Err 路径也走 graceful_close 再上抛
         // （防 Browser::drop 在 Windows 上不杀子进程的漏）。
@@ -444,7 +482,11 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             h_slot = Some(gsearch::browser::spawn_handler(handler));
             let mut browser = b;
             let page = gsearch::browser::open_page(&browser).await?;
-            if args.humanize {
+            if args.humanize_effective() {
+                // 9gb：isatty 自动档下这只在用户显式 --humanize 且非交互管道时出现——提示耗时代价
+                if !std::io::stdout().is_terminal() {
+                    eprintln!("[hint] humanize 已显式开启（非交互管道）：warmup + CAPTCHA 处理会显著增加耗时；高频调用去掉 --humanize 走快档");
+                }
                 stealth::install_init_script(&page).await?;
                 stealth::warmup(&page).await?;
             }
@@ -523,7 +565,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         query: query.clone(),
         profile: gsearch::browser::profile_name_only(),
         proxy: proxy.clone(),
-        humanize: args.humanize,
+        humanize: args.humanize_effective(),
         limit: args.limit,
         elapsed_ms: started.elapsed().as_millis(),
         truncated: results.len() >= args.limit,
@@ -741,7 +783,7 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
                 profile: profile.clone(),
                 // batch 全程纯 HTTP 直连局域网 searxng（searxng.rs 固定 no_proxy），代理字段恒空
                 proxy: None,
-                humanize: args.humanize,
+                humanize: args.humanize_effective(),
                 limit: args.limit,
                 elapsed_ms,
                 truncated: results.len() >= args.limit,
@@ -850,7 +892,7 @@ fn emit_captcha_timeout_json(
         query: query.to_string(),
         profile: gsearch::browser::profile_name_only(),
         proxy,
-        humanize: args.humanize,
+        humanize: args.humanize_effective(),
         limit: args.limit,
         elapsed_ms,
         truncated: false,
@@ -886,7 +928,7 @@ fn emit_searxng_degraded_json(
         query: query.to_string(),
         profile: gsearch::browser::profile_name_only(),
         proxy,
-        humanize: args.humanize,
+        humanize: args.humanize_effective(),
         limit: args.limit,
         elapsed_ms,
         truncated: false,
@@ -1264,6 +1306,7 @@ async fn fetch_public_ip() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::check_exit_ip_drift;
+    use super::resolve_humanize;
     use super::{first_blank_query, Cli, Command, RecencyArg};
     use clap::Parser;
 
@@ -1296,15 +1339,27 @@ mod tests {
         assert_eq!(first_blank_query(&["rust async".into(), "tokio".into()]), None);
     }
 
-    /// M18：humanize 默认 true（人用保留 warmup），加 --no-humanize 跳过。
+    /// 盲测六 isatty 拍板：--humanize / --no-humanize 两个显式 flag 都可解析。
     #[test]
-    fn humanize_defaults_to_true_unless_opted_out() {
-        let cli = Cli::try_parse_from(["gsearch", "search", "test"]).unwrap();
+    fn humanize_explicit_flags_parse_both_directions() {
+        let cli = Cli::try_parse_from(["gsearch", "search", "test", "--humanize"]).unwrap();
         let Command::Search(args) = cli.cmd else { panic!("expected search") };
-        assert!(args.humanize);
+        assert!(args.humanize && !args.no_humanize);
         let cli2 = Cli::try_parse_from(["gsearch", "search", "test", "--no-humanize"]).unwrap();
         let Command::Search(args2) = cli2.cmd else { panic!("expected search") };
-        assert!(!args2.humanize);
+        assert!(!args2.humanize && args2.no_humanize);
+    }
+
+    /// 盲测六 isatty 拍板：生效档纯函数三态——显式覆盖恒优先；都未传跟随 TTY。
+    #[test]
+    fn resolve_humanize_three_states() {
+        // 显式 --humanize 覆盖非 TTY（管道里强制慢档）
+        assert!(resolve_humanize(true, false, false));
+        // 显式 --no-humanize 覆盖 TTY（终端里强制快档）
+        assert!(!resolve_humanize(false, true, true));
+        // 默认：跟随 stdout——人（TTY）开，管道/agent 关
+        assert!(resolve_humanize(false, false, true));
+        assert!(!resolve_humanize(false, false, false));
     }
 
     /// batch（issue gsearch-rs-doh）：多位置参数收集为 Vec；单查询向后兼容；零查询拒绝。

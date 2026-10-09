@@ -30,7 +30,10 @@ pub fn parse_serp(html: &str) -> Vec<SearchResult> {
             let Some(title_el) = el.select(&h3).next() else {
                 continue;
             };
-            let url = absolutize(el.value().attr("href").unwrap_or_default().trim(), "https://www.google.com");
+            let url = unwrap_google_redirect(&absolutize(
+                el.value().attr("href").unwrap_or_default().trim(),
+                "https://www.google.com",
+            ));
             let domain_class = crate::util::domain_class(&url);
             results.push(SearchResult {
                 title: text_of(&title_el),
@@ -75,6 +78,46 @@ pub(crate) fn absolutize(href: &str, origin: &str) -> String {
     } else {
         href.to_string()
     }
+}
+
+/// 54c：Google 直爬壳 URL 解包——`google.com/url?q=<目标>` 与 `google.com/goto?url=<目标>`
+/// 两种包装解出真实目标 URL（percent-decode 后须为 http/https 才采用）。
+/// 解不出（非 google 壳 / 无参数 / 目标非 http）保留原样返回，不报错不丢结果。
+pub(crate) fn unwrap_google_redirect(url: &str) -> String {
+    let lower = url.to_ascii_lowercase();
+    let is_google = lower.starts_with("https://www.google.com/") || lower.starts_with("https://google.com/");
+    if !is_google {
+        return url.to_string();
+    }
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    if !matches!(
+        base.to_ascii_lowercase().as_str(),
+        "https://www.google.com/url"
+            | "https://www.google.com/goto"
+            | "https://google.com/url"
+            | "https://google.com/goto"
+    ) {
+        return url.to_string();
+    }
+    // q= 优先、url= 兜底（Google 两种包装形态各占其一）
+    let mut q: Option<String> = None;
+    let mut u: Option<String> = None;
+    for pair in query.split('&') {
+        if let Some(v) = pair.strip_prefix("q=") {
+            q.get_or_insert_with(|| crate::duckduckgo::percent_decode(v));
+        } else if let Some(v) = pair.strip_prefix("url=") {
+            u.get_or_insert_with(|| crate::duckduckgo::percent_decode(v));
+        }
+    }
+    for cand in [q, u].into_iter().flatten() {
+        let lc = cand.to_ascii_lowercase();
+        if lc.starts_with("https://") || lc.starts_with("http://") {
+            return cand;
+        }
+    }
+    url.to_string()
 }
 
 #[cfg(test)]
@@ -127,5 +170,54 @@ mod tests {
         let html = "<!doctype html><html><body>no results here</body></html>";
         let r = parse_serp(html);
         assert!(r.is_empty());
+    }
+
+    /// 54c：壳 URL 解包表——直链不动 / /url?q= 与 /goto?url= 解开 / 解不出保留原样。
+    #[test]
+    fn unwrap_google_redirect_table() {
+        use super::unwrap_google_redirect;
+        // 直链（含 SearXNG 实例链接）原样
+        assert_eq!(unwrap_google_redirect("https://example.com/a?b=1"), "https://example.com/a?b=1");
+        assert_eq!(
+            unwrap_google_redirect("https://192.168.1.1:8888/search?q=x"),
+            "https://192.168.1.1:8888/search?q=x"
+        );
+        // /url?q= 包装解开（percent-decode）
+        assert_eq!(
+            unwrap_google_redirect("https://www.google.com/url?q=https%3A%2F%2Fgithub.com%2Ffoo&sa=U"),
+            "https://github.com/foo"
+        );
+        // /goto?url= 包装解开
+        assert_eq!(
+            unwrap_google_redirect("https://www.google.com/goto?url=https%3A%2F%2Fdocs.rs%2Fserde"),
+            "https://docs.rs/serde"
+        );
+        // 裸域 google.com 壳同样解开
+        assert_eq!(
+            unwrap_google_redirect("https://google.com/url?q=https%3A%2F%2Fexample.org%2Fx"),
+            "https://example.org/x"
+        );
+        // /url 无 q 参数 → 保留原样
+        assert_eq!(
+            unwrap_google_redirect("https://www.google.com/url?sa=t&rct=j"),
+            "https://www.google.com/url?sa=t&rct=j"
+        );
+        // q 目标非 http(s)（畸形注入面）→ 保留原样
+        assert_eq!(
+            unwrap_google_redirect("https://www.google.com/url?q=javascript%3Aalert(1)"),
+            "https://www.google.com/url?q=javascript%3Aalert(1)"
+        );
+    }
+
+    /// 54c 端到端：SERP 里 /url?q= 壳链接解析后 url 是真实目标域。
+    #[test]
+    fn parse_serp_unwraps_goto_shell_urls() {
+        let html = r#"<!doctype html><html><body>
+            <a href="/url?q=https%3A%2F%2Fcrates.io%2Fcrates%2Ftokio&sa=U"><h3>tokio</h3></a>
+        </body></html>"#;
+        let r = parse_serp(html);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].url, "https://crates.io/crates/tokio");
+        assert_eq!(r[0].domain_class, "other", "domain_class 按解包后真实 URL 判定");
     }
 }

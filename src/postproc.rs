@@ -183,6 +183,21 @@ pub(crate) fn read_max_chars() -> usize {
     gsearch::config::load().read_max_chars.unwrap_or(READ_BODY_MAX_CHARS)
 }
 
+/// ①打回轮1：GitHub issues/PR 页主评论容器在 DOM 尾部（head/nav/SVG sprite 占掉前几十万
+/// 字符），先 cap 后抽会把正文全裁掉（实测 omitted=589331 / summary 空）。github.com 的
+/// issues|pull URL 先抽容器再过同一字符预算；其余 URL 与容器未命中路径行为逐字节不变。
+pub(crate) fn cap_extract_source(html_full: &str, limit: usize, url: &str) -> (String, bool, usize) {
+    let lower = url.to_ascii_lowercase();
+    let is_github_thread =
+        lower.contains("github.com/") && (lower.contains("/issues/") || lower.contains("/pull/"));
+    if is_github_thread
+        && let Some(container) = gsearch::skeleton::github_comment_html(html_full)
+    {
+        return cap_chars(&container, limit);
+    }
+    cap_chars(html_full, limit)
+}
+
 /// jp4：字符级硬截断（按 chars 计，不劈 UTF-8）。返回 (截后文本, 是否截断, 省略字符数)。
 pub(crate) fn cap_chars(s: &str, limit: usize) -> (String, bool, usize) {
     let total = s.chars().count();
@@ -205,6 +220,11 @@ pub(crate) fn render_read(
     omitted: usize,
     headings_truncated: bool,
 ) -> String {
+    // ①打回轮1通用保底：截断发生了却一无所获（GitHub 类页正文在 DOM 尾部被 cap 吃光）→
+    // stderr 一行出口指引（stderr 不污染 stdout JSON 契约）。headings-only 摘要本就为空，不适用。
+    if !headings_only && read.summary_paragraphs.is_empty() && omitted > 0 {
+        eprintln!("[hint] 正文提取为空（omitted {omitted} 字符），试 --markdown 或 --full");
+    }
     if json {
         // b95：headings-only 的 JSON 只带标题数组——段落索引/char_count/摘要不进输出
         // （「只要标题」反而更贵的根因：旧 json 分支从未看 headings_only，全量序列化 AdaptiveRead）。
@@ -292,7 +312,7 @@ pub async fn read(
         None => eval_string_retry(&page, "document.title").await,
     };
     let html_full = content_retry(&page).await;
-    let (html, truncated, omitted) = cap_chars(&html_full, read_max_chars());
+    let (html, truncated, omitted) = cap_extract_source(&html_full, read_max_chars(), url);
     let mut read = extract_adaptive(&html, opts.excerpt);
     read.url = url.to_string();
     read.title = title;
@@ -338,7 +358,7 @@ pub async fn read_full(
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
     let (page, _) = open_page(browser, h_slot, url).await?;
-    let (txt, _, _) = read_full_text(&page).await?;
+    let (txt, _, _) = read_full_text(&page, read_max_chars()).await?;
     if !opts.json {
         println!("=== {url} ===\n{txt}");
     }
@@ -346,10 +366,11 @@ pub async fn read_full(
 }
 
 /// innerText 截断 + 截断标注（fve：cap 与 AdaptiveRead 同一 READ_BODY_MAX_CHARS 上限；
-/// browse --full --json 在 meta.truncated 照标）。read_full / general::cmd_browse 共用。
-pub(crate) async fn read_full_text(page: &chromiumoxide::Page) -> Result<(String, bool, usize)> {
+/// browse --full --json 在 meta.truncated 照标；n76：上限由调用方注入——browse 走 --max-chars，
+/// read_full 保持 read_max_chars() 配置语义）。read_full / general::cmd_browse 共用。
+pub(crate) async fn read_full_text(page: &chromiumoxide::Page, limit: usize) -> Result<(String, bool, usize)> {
     let txt = eval_string_retry(page, "document.body.innerText").await;
-    Ok(cap_chars(&txt, READ_BODY_MAX_CHARS))
+    Ok(cap_chars(&txt, limit))
 }
 
 /// M4 健壮性修复：打开结果页并等语义定稿——read / read_full 共用的 goto 前置。
@@ -683,6 +704,28 @@ mod tests {
         let long = "x".repeat(READ_BODY_MAX_CHARS + 1);
         let (s, trunc, omitted) = cap_chars(&long, READ_BODY_MAX_CHARS);
         assert!(trunc && omitted == 1 && s.chars().count() == READ_BODY_MAX_CHARS);
+    }
+
+    /// ①打回轮1：GitHub issues|pull URL 先抽主评论容器再 cap——head 巨页（正文在 DOM 尾部）
+    /// 不再被 cap 全裁；非 GitHub URL / 非线程页行为与 cap_chars 逐字节一致。
+    #[test]
+    fn cap_extract_source_prefers_github_containers() {
+        let junk = "x".repeat(5_000);
+        let html = format!(
+            "<html><head>{junk}</head><body><div class='js-comment-body'><p>real issue body</p></div></body></html>"
+        );
+        // GitHub 线程 URL：容器命中（head 噪声被剔除，预算内拿到正文）
+        let (html2, trunc, _omitted) = cap_extract_source(&html, 200, "https://github.com/tokio-rs/tokio/issues/2782");
+        assert!(!html2.contains(&junk), "容器抽取绕过 head 噪声");
+        assert!(html2.contains("real issue body"));
+        assert!(!trunc || html2.len() <= 200);
+        // 同 html 非 GitHub URL：走原 cap_chars（head 噪声在预算内，正文被裁——保底 hint 由 render_read 出）
+        let (html3, _, _) = cap_extract_source(&html, 200, "https://example.com/page");
+        assert!(html3.contains("xxxx"), "原路径仍从 head 开始 cap（行为不变）");
+        assert!(!html3.contains("real issue body"), "原路径正文仍被 cap 裁掉（对比组）");
+        // GitHub 非 issues|pull 页：不启用容器抽取
+        let (html4, _, _) = cap_extract_source(&html, 200, "https://github.com/tokio-rs/tokio");
+        assert!(!html4.contains("real issue body"), "仓库主页不走容器抽取");
     }
 
     /// jp4：render_read 仅 --json 注入 meta（追加不覆盖既有字段）；文本模式不加任何 JSON 键，

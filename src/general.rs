@@ -44,6 +44,8 @@ pub struct BrowseOpts {
     pub proxy: Option<String>,
     /// pkp：放行私网地址（仅 browse 子命令挂此 flag；语义与 fetch --allow-private 对齐）。
     pub allow_private: bool,
+    /// n76：正文字符预算（HTML/innerText/markdown 上限；超限截断 meta.truncated 如实）。CLI 默认 50000。
+    pub max_chars: usize,
 }
 
 /// pkp：浏览器入口 scheme 白名单（http/https）——非白名单（file:///javascript:/data: 等）
@@ -84,6 +86,31 @@ fn has_parent_traversal(p: &Path) -> bool {
     !p.is_absolute() && p.components().any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
+/// h90：browse goto 超时给代理出口建议（B 受试者：直连超时只报 Request timed out，
+/// 不知道有 --proxy 可救）。纯函数供单测锁文案。
+fn goto_timeout_error(url: &str) -> anyhow::Error {
+    anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}；若目标站点需代理可达，试 `--proxy http://127.0.0.1:7890`（GSEARCH_PROXY 同效）")
+}
+
+/// h90（复测残口）：chromiumoxide 内部超时（Request timed out）常先于外层 30s 包装触发，
+/// 同样裸报无出口——传输层失败（超时/DNS/reset）统一附代理建议。
+fn goto_nav_error(url: &str, e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!("goto {url} 失败: {e}；若目标站点需代理可达，试 `--proxy http://127.0.0.1:7890`（GSEARCH_PROXY 同效）")
+}
+
+/// 打回轮2：302 竞态探针——goto 只覆盖首个响应，/issues/N → /pull/N 落定前 content()
+/// 常拿空/极短（wait_content_stable 对空串 marker 恒稳，兜不住）。阈值 200 字符。
+fn content_needs_settle_retry(html: &str) -> bool {
+    html.trim().chars().count() < 200
+}
+
+/// 打回轮2：browse 空正文保底指引判定（PM 公式：summary 空 && (omitted>0 || 原始 content 为空)；
+/// omitted>0 = 截断吃光（B 上轮 58 万字符形态），content 空 = 302 竞态/-32000 变体拿空——
+/// 两条失败形态都要给出口。headings-only 摘要本就为空，不适用）。
+fn needs_empty_body_hint(summary_len: usize, headings_only: bool, omitted: usize, raw_content_empty: bool) -> bool {
+    summary_len == 0 && !headings_only && (omitted > 0 || raw_content_empty)
+}
+
 /// `browse <url>`：headless 渲染 → 默认 AdaptiveRead（M9），`--full` 纯 innerText（50000 cap，
 /// fve：--json 走 0mf 同款信封 + content_text；与 --headings-only clap 互斥）。
 /// CAPTCHA 路径：撞码报错退出，提示用 login 手工验证。
@@ -111,12 +138,22 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
         let page = open_page(&browser).await?;
         tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
             .await
-            .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
-            .map_err(|e| anyhow!("goto {url} 失败: {e}"))?;
+            .map_err(|_| goto_timeout_error(url))?
+            .map_err(|e| goto_nav_error(url, e))?;
         // uhp/j44：等语义定稿（marker 连续两次相同），避免 -32000 与风控页假 complete。
         let snap = postproc::wait_content_stable(&page, 50).await; // 50×200ms ≈ 10s
 
-        let html_probe = postproc::content_retry(&page).await;
+        let mut html_probe = postproc::content_retry(&page).await;
+        // 打回轮2：/issues/N → /pull/N 的 302 竞态——重定向落定前 content() 拿空/极短。
+        // 重新 goto（直达落定页）+ content 重试一次。
+        if content_needs_settle_retry(&html_probe) {
+            tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
+                .await
+                .map_err(|_| goto_timeout_error(url))?
+                .map_err(|e| goto_nav_error(url, e))?;
+            let _ = postproc::wait_content_stable(&page, 50).await;
+            html_probe = postproc::content_retry(&page).await;
+        }
         if is_captcha(&html_probe) {
             return Err(anyhow!(
                 "{url} 遇 CAPTCHA：用 `gsearch login {url}` 开有头窗手工验证后重试"
@@ -129,10 +166,10 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
         // --json 对齐 0mf search 契约：信封（meta.truncated 标内容截断）+ content_text 单文档
         if opts.full || opts.markdown {
             let (txt, truncated, omitted) = if opts.markdown {
-                let (md, t, o) = postproc::cap_chars(&crate::convert::html_to_markdown(&html_probe)?, postproc::read_max_chars());
+                let (md, t, o) = postproc::cap_chars(&crate::convert::html_to_markdown(&html_probe)?, opts.max_chars);
                 (md, t, o)
             } else {
-                postproc::read_full_text(&page).await?
+                postproc::read_full_text(&page, opts.max_chars).await?
             };
             if opts.json {
                 let meta = gsearch::types::MetaOutput {
@@ -146,7 +183,9 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
                     limit: 0,
                     elapsed_ms: started.elapsed().as_millis(),
                     truncated,
-                    provider: "google".into(),
+                    // h90：browse 无搜索来源——provider 置空串，键整体缺席（types.rs 缺席语义），
+                    // 不再伪装成 "google" 误导 agent 分流；搜索路径恒非空不受影响
+                    provider: String::new(),
                     recency: None,
                 };
                 let run = gsearch::types::RunStatusInfo {
@@ -185,10 +224,15 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
             None => postproc::eval_string_retry(&page, "document.title").await,
         };
         let html_full = html_probe;
-        let (html, truncated, omitted) = postproc::cap_chars(&html_full, postproc::read_max_chars());
+        let (html, truncated, omitted) = postproc::cap_extract_source(&html_full, opts.max_chars, url);
         let mut read = extract_adaptive(&html, None);
         read.url = url.to_string();
         read.title = title;
+        // 打回轮2：browse 空正文保底（PM 公式两形态：截断吃光 / content 拿空）——
+        // agent 一轮自救（--markdown 或 --full），不再静默空输出
+        if needs_empty_body_hint(read.summary_paragraphs.len(), opts.headings_only, omitted, html_full.trim().is_empty()) {
+            eprintln!("[hint] 正文提取为空，试 --markdown 或 --full");
+        }
 
         let out = postproc::render_read(&read, opts.json, opts.headings_only, opts.from, truncated, omitted, false);
         println!("{out}");
@@ -568,6 +612,41 @@ mod tests {
         assert!(!is_gate_dns_error(&anyhow::anyhow!(
             "fetch 拒绝私网地址 127.0.0.1（host=localhost）"
         )));
+    }
+
+    /// h90：browse goto 超时文案带 --proxy 出口建议（B 受试者扣分点：超时裸报无出口）。
+    #[test]
+    fn goto_timeout_error_contains_proxy_hint() {
+        let msg = goto_timeout_error("https://slow.example.com").to_string();
+        assert!(msg.contains("--proxy"), "{msg}");
+        assert!(msg.contains("https://slow.example.com"), "{msg}");
+        // 复测残口：chromiumoxide 内部超时先于外层包装触发，传输层失败同给出口
+        let msg = goto_nav_error("https://192.0.2.1/", "Request timed out.").to_string();
+        assert!(msg.contains("--proxy"), "{msg}");
+        assert!(msg.contains("Request timed out."), "{msg}");
+    }
+
+    /// 打回轮2：302 竞态探针——空/极短 content 判未落定（重 goto+content 一次），正常正文不触发。
+    #[test]
+    fn content_needs_settle_retry_threshold() {
+        assert!(content_needs_settle_retry(""));
+        assert!(content_needs_settle_retry("   \n  "));
+        assert!(content_needs_settle_retry("<html><body>partial"), "极短判未落定");
+        assert!(!content_needs_settle_retry(&"x".repeat(200)), "达到阈值不重试");
+    }
+
+    /// 打回轮2：browse 空正文保底判定——PM 公式两形态（截断吃光 / content 拿空）都给出口；
+    /// headings-only 不适用；有正文不适用。
+    #[test]
+    fn empty_body_hint_gate() {
+        // 形态一：截断吃光（B 上轮 omitted=589331）
+        assert!(needs_empty_body_hint(0, false, 589_331, false));
+        // 形态二：content 拿空（302 竞态，omitted=0）
+        assert!(needs_empty_body_hint(0, false, 0, true));
+        // 不适用：headings-only / 有正文 / 无截断有 content（真·无段落小页）
+        assert!(!needs_empty_body_hint(0, true, 589_331, false));
+        assert!(!needs_empty_body_hint(10, false, 0, false));
+        assert!(!needs_empty_body_hint(3, false, 0, false));
     }
 
     /// pkp：scheme 白名单表——http/https 放行；file:///javascript:/data:/ftp:/chrome: 拒；
