@@ -23,7 +23,9 @@ pub(crate) fn html_to_markdown(html: &str) -> Result<String> {
 
 /// FixG16：fetch --markdown 产物清洗——htmd 的防斜体转义 `\_`（serde\_json 等标识符）
 /// 对 agent 消费是噪音，还原为 `_`；rustdoc 标题自链 `[§](#anchor)` 无信息，剥为纯标题
-/// 文本。仅 fetch 路径调用：browse/general 共用 html_to_markdown，search 输出路径冻结。
+/// 文本。FixG18 JJ：docs.rs 复制按钮控件文字与 NBSP（htmd 不折叠；文本路径已由
+/// collapse_blank 折叠）泄入正文，经 strip_docsrs_controls 定点清洗。仅 fetch 路径调用：
+/// browse/general 共用 html_to_markdown，search 输出路径冻结。
 pub(crate) fn clean_markdown(md: String) -> String {
     let mut out = md;
     while let Some(start) = out.find("[§](") {
@@ -31,12 +33,23 @@ pub(crate) fn clean_markdown(md: String) -> String {
         let Some(rel_end) = out[start..].find(')') else { break };
         out.replace_range(start..start + rel_end + 1, "");
     }
-    out.replace("\\_", "_")
+    strip_docsrs_controls(&out.replace("\\_", "_")).replace('\u{a0}', " ")
+}
+
+/// FixG18 JJ：docs.rs 标题行复制按钮控件文字（`…\xa0Copy item path`）泄入提取产物。
+/// 该短语是 docs.rs 页面特有控件文案，通用清洗处定点剥除（含前导 NBSP/空格防行尾残留）。
+/// clean_markdown 与 clean_text_anchors（--include / docs.rs host route 文本路径）共用，
+/// 勿在调用方复制此逻辑。
+fn strip_docsrs_controls(text: &str) -> String {
+    text.replace("\u{a0}Copy item path", "")
+        .replace(" Copy item path", "")
 }
 
 /// FixG17：--include 纯文本提取路径的 rustdoc 标题锚点清洗——docs.rs 标题自链的 § 与
 /// 标题文本经 extract_text 胶成行首 "§Example"（--markdown 路径已由 clean_markdown 覆盖）。
 /// 只剥行首孤立 §：正文引用（"见 §3.2"）的行中 § 不动；Rust 代码不会以 § 开头，代码块免疫。
+/// FixG18 JJ：同时经 strip_docsrs_controls 剥复制按钮控件文字（NBSP 已由 extract_text
+/// 的 collapse_blank 折叠，此处无需归一）。
 /// 仅 render_include_blocks 提取漏斗调用（--include 命中与 docs.rs host route 共用）。
 pub(crate) fn clean_text_anchors(text: String) -> String {
     let mut out = String::with_capacity(text.len());
@@ -46,7 +59,7 @@ pub(crate) fn clean_text_anchors(text: String) -> String {
         }
         out.push_str(line.strip_prefix('§').unwrap_or(line));
     }
-    out
+    strip_docsrs_controls(&out)
 }
 
 /// pre>code 保真化（盲测七 0bh）：rustdoc 类文档页的 code 块内含 span 高亮 / a 链接 /
@@ -249,7 +262,7 @@ mod tests {
     }
 
     /// FixG17：纯文本路径剥行首孤立 §（extract_text 把标题自链 § 与标题文本胶成
-    /// 行首 "§Example"）；行中引用（"见 §3.2"）与无 § 行逐字节保真。
+    /// 行首 "§Example"）。行中 § 不动，代码块免疫。
     #[test]
     fn clean_text_anchors_strips_line_leading_only() {
         assert_eq!(clean_text_anchors("§Example\n§Errors\nPanics".into()), "Example\nErrors\nPanics");
@@ -257,5 +270,29 @@ mod tests {
         assert_eq!(clean_text_anchors("no anchors here".into()), "no anchors here");
         // 行首 § 独立成行（链接文本单独成段）同样剥除
         assert_eq!(clean_text_anchors("§\nExample".into()), "\nExample");
+    }
+
+    /// FixG18 JJ：--markdown 标题行 `# Function from_str\xa0Copy item path` 清洗——
+    /// 复制按钮控件文字剥除 + NBSP 归一空格；既有 § 锚点 / `\_` 还原不回归。
+    #[test]
+    fn clean_markdown_strips_docsrs_button_and_nbsp() {
+        assert_eq!(
+            clean_markdown("# Function from_str\u{a0}Copy item path".into()),
+            "# Function from_str",
+            "按钮文案连前导 NBSP 一并剥除，标题行无残留"
+        );
+        assert_eq!(clean_markdown("行内\u{a0}NBSP 归一".into()), "行内 NBSP 归一");
+        assert_eq!(clean_markdown("## [§](#errors)Errors".into()), "## Errors");
+        assert_eq!(clean_markdown("serde\\_json".into()), "serde_json");
+    }
+
+    /// FixG18 JJ：文本路径（--include / docs.rs host route 非 markdown）同款剥按钮文案
+    /// （extract_text 已把 NBSP 折叠成空格，此处剥 " Copy item path"）。
+    #[test]
+    fn clean_text_anchors_strips_docsrs_button() {
+        assert_eq!(
+            clean_text_anchors("Function from_str Copy item path\n§Errors".into()),
+            "Function from_str\nErrors"
+        );
     }
 }

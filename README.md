@@ -37,6 +37,7 @@ gsearch search "..." --open 1
 - 顶层 `run.status`：`ok / captcha_required / captcha_timeout / searxng_degraded / filtered_empty / no_results / error`——零结果三态分立（o1p）：`searxng_degraded` = 源故障/熔断（跑 doctor），`filtered_empty` = recency 过滤后空、源健康（去掉 --recency 或换时间窗），`no_results` = 查询无果、源健康（换词重试）
 - `meta` 键缺席语义：`truncated:false`、空 `message`、`captcha_solved:false` 均不占键；`results_count` 已移除（`len(results)` 可推导）；`browser_path` / `browser_kind` 已移除（环境噪声，浏览器信息走 `gsearch doctor`）
 - `meta.truncated`（search 路径）= **结果数触及 `--limit` 上限**（可能还有更多被裁），与正文/snippet 截断无关；`truncated:true` 时附 `meta.truncated_detail: "results_capped_by_limit"` 自解释键（fetch/browse 路径的 truncated 仍是正文/响应体截断，语义见下文各节）
+- `meta.limit` 如实反映返回集：`--read N` 截断后 `meta.limit = N`（而非 `--limit` 原值），下游按它判断返回集大小/预算（FixG18 HH）
 - `--compact-meta`（opt-in）：meta 裁到 query/limit/elapsed_ms/provider/recency 等少量键（`--verbose debug` 时强制全量排障）
 
 #### read 失败显式化

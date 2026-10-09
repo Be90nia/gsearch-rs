@@ -2516,6 +2516,30 @@ mod tests {
             "prose 空白规整不变: {text:?}");
     }
 
+    /// FixG18 JJ：docs.rs host route 清洗后产物不再混入复制按钮文案与 NBSP——
+    /// markdown 路径（clean_markdown）与文本路径（clean_text_anchors）同验；
+    /// pre>code 签名经 sanitize_pre_blocks 保真，逐字符不受清洗影响。
+    #[test]
+    fn docsrs_route_strips_copy_button_and_nbsp_both_modes() {
+        let html = "<html><head><title>from_str - serde_json</title></head><body>\
+                    <main>\
+                    <h1>Function <span class=\"fn\">from_str</span>&nbsp;<button>Copy item path</button></h1>\
+                    <pre class=\"rust item-decl\"><code>pub fn from_str&lt;'a, T&gt;(s: &amp;'a str) -&gt; Result&lt;T&gt;</code></pre>\
+                    <p>Deserializes\u{a0}any value.</p>\
+                    </main></body></html>";
+        let (blocks, _) = extract_with_include(html, "main").unwrap().unwrap();
+        let md = render_include_blocks(&blocks, true).unwrap();
+        assert!(!md.contains("Copy item path"), "markdown 按钮文案剥除: {md:?}");
+        assert!(!md.contains('\u{a0}'), "markdown NBSP 归一: {md:?}");
+        assert!(md.contains("# Function from_str"), "标题保留: {md:?}");
+        assert!(md.contains("pub fn from_str<'a, T>(s: &'a str) -> Result<T>"),
+            "签名逐字符保真: {md:?}");
+        let text = render_include_blocks(&blocks, false).unwrap();
+        assert!(!text.contains("Copy item path"), "文本路径按钮文案同剥: {text:?}");
+        assert!(text.contains("pub fn from_str<'a, T>(s: &'a str) -> Result<T>"),
+            "文本路径签名保真: {text:?}");
+    }
+
     /// FixG13 零回归保证：无 \0 哨兵时 collapse_preserving_code 与 collapse_blank
     /// 逐字节一致（非代码页行为零变化）。
     #[test]

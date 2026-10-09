@@ -208,6 +208,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         markdown: bool,
         /// 正文字符预算（text 字段上限；超限截断并在 meta.truncated/omitted 如实标注）。
+        /// 作用顺序：--json-keys 投影先替换 text，本预算再对投影产物计（截断按投影后长度算）。
         #[arg(long, default_value_t = 50_000, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=10_000_000))]
         max_chars: usize,
         /// 单请求超时（秒）；默认 30、范围 1..=300。
@@ -229,6 +230,7 @@ enum Command {
         /// {"tag_name":["v1.0.0",...]}，多字段按下标对齐；单字段/多字段均此形态），
         /// 如 `--json-keys "[*].tag_name,0.body"`。
         /// text 非 JSON 时静默跳过（不动 text）。
+        /// 输出键命名：嵌套路径取末段（user.login → "login"）；同末段冲突时自动全路径化。
         #[arg(long, value_delimiter = ',')]
         json_keys: Vec<String>,
     },
@@ -690,7 +692,9 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         profile: gsearch::browser::profile_name_only(),
         proxy: proxy.clone(),
         humanize: args.humanize_effective(),
-        limit: args.limit,
+        // FixG18 HH：--read N 已 truncate 结果集，meta.limit 如实回写 N（契约字段 =
+        // 返回集大小，下游分页/预算按它判断不再误判）；N ≤ --limit 已前置校验。
+        limit: read_n.unwrap_or(args.limit),
         elapsed_ms: started.elapsed().as_millis(),
         truncated: results.len() >= args.limit,
         truncated_at_offset: 0,
@@ -1797,5 +1801,30 @@ mod tests {
         let cli = Cli::try_parse_from(["gsearch", "fetch", "https://e.test/", "--json-keys", "crate.max_version,crate.max_stable_version"]).unwrap();
         let Command::Fetch { json_keys, .. } = cli.cmd else { panic!("expected fetch") };
         assert_eq!(json_keys, vec!["crate.max_version".to_string(), "crate.max_stable_version".to_string()]);
+    }
+
+    /// FixG18 II/HH：fetch --help 写明嵌套投影键命名规则（末段/冲突全路径化）与
+    /// --max-chars 作用顺序（投影先替换 text 再计预算）——直接断言 arg help 原文，
+    /// 不经 render_help 换行（CJK 换行会拆断片段）。
+    #[test]
+    fn fetch_help_documents_jsonkeys_naming_and_maxchars_order() {
+        use clap::CommandFactory;
+        let cli_cmd = Cli::command();
+        let cmd = cli_cmd
+            .find_subcommand("fetch")
+            .expect("fetch 子命令存在");
+        let help_of = |id: &str| {
+            cmd.get_arguments()
+                .find(|a| a.get_id() == id)
+                // 单段 doc comment 只进 short help（多段才有 long_help），取 help 兜底
+                .and_then(|a| a.get_help().map(|h| h.to_string()))
+                .unwrap_or_default()
+        };
+        let jk = help_of("json_keys");
+        assert!(jk.contains("嵌套路径取末段"), "键命名规则句缺失: {jk}");
+        assert!(jk.contains("冲突时自动全路径化"), "冲突全路径化句缺失: {jk}");
+        let mc = help_of("max_chars");
+        assert!(mc.contains("投影先替换 text"), "作用顺序句缺失: {mc}");
+        assert!(mc.contains("投影后长度"), "顺序细节句缺失: {mc}");
     }
 }
