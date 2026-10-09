@@ -327,7 +327,7 @@ async fn cmd_read(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
         return Ok(());
     }
     // jp4：与顶层 read 同一截断契约（read_max_chars 硬顶 + --json meta 标注）
-    let (html, truncated, omitted) = cap_chars(&html_full, read_max_chars());
+    let (html, truncated, omitted, truncated_at_offset) = cap_chars(&html_full, read_max_chars());
     let title = ctx
         .page
         .evaluate("document.title")
@@ -337,7 +337,16 @@ async fn cmd_read(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     let mut read = extract_adaptive(&html, None);
     read.url = if ctx.current_url.is_empty() { "(未设)".into() } else { ctx.current_url.clone() };
     read.title = title;
-    let out = render_read(&read, opts.json, opts.headings_only, opts.from, truncated, omitted, false);
+    let out = render_read(
+        &read,
+        opts.json,
+        opts.headings_only,
+        opts.from,
+        truncated,
+        omitted,
+        truncated_at_offset,
+        false,
+    );
     println!("{out}");
     Ok(())
 }

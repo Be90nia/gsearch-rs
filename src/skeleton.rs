@@ -52,6 +52,17 @@ const SEL_P: &str = "p";
 const SEL_PRE: &str = "pre";
 /// ①打回轮1：GitHub issues/PR 主评论容器（新旧两代 markup 各占其一；URL gate 在调用方）。
 const SEL_GITHUB_COMMENT: &str = ".js-comment-body, .comment-body";
+/// 9jx：新版 GitHub React DOM 主评论容器选择器优先级链（markdown-body → issue-body → article → .markdown-body），
+/// 命中后拼装正文，主选器全 miss 走 .js-comment-body/.comment-body 旧回退（保留旧逻辑不破坏）。
+const SEL_GITHUB_NEW: &[&str] = &[
+    r#"[data-testid="markdown-body"]"#,
+    r#"[data-testid="issue-body"]"#,
+    r#"[role="article"]"#,
+    ".markdown-body",
+];
+/// 9jx：广义容器可能含 nav/header（盲测九实测 7KB），剥离这些避免污染正文。
+const SEL_GITHUB_NAV: &str =
+    r#"[role="banner"], .Header, .gh-header, .js-header-wrapper, nav.Header"#;
 /// 段落索引展示上限：超出折叠"..另 X 段省略"，免索引段把 token 吃光。
 const INDEX_DISPLAY_LIMIT: usize = 20;
 
@@ -194,17 +205,57 @@ fn joins_word(left: char, right: char) -> bool {
 
 /// ①打回轮1：GitHub issues/PR 主评论容器抽取——页面正文在 DOM 尾部（head/nav/SVG sprite
 /// 占掉前几十万字符），调用方先 cap 后抽会把正文全裁掉（实测 omitted=589331 / summary 空）。
-/// 命中 .js-comment-body/.comment-body 返回容器 inner_html 拼接（None = 非 GitHub 形态，
+/// 9jx：新版 GitHub 改用 React DOM（2024+），容器选择器链扩展为 markdown-body/issue-body/
+/// article/.markdown-body 优先级匹配；广义容器（markdown-body 等）可能含 nav/header，
+/// 命中时按 SEL_GITHUB_NAV 剥离再拼装正文。主选器全 miss 走 .js-comment-body/.comment-body
+/// 旧回退（保留 SSR 时代页面的兼容）。命中容器返回 inner_html 拼接（None = 非 GitHub 形态，
 /// 调用方按 URL gate 后才调）。产物交 extract_adaptive 正常走 <p>/<pre> 提取。
 pub fn github_comment_html(html: &str) -> Option<String> {
     let doc = Html::parse_document(html);
-    let sel = Selector::parse(SEL_GITHUB_COMMENT).expect("静态选择器必然合法");
     let mut buf = String::new();
-    for el in doc.select(&sel) {
-        buf.push_str(&el.inner_html());
-        buf.push('\n');
+    let nav_sel = Selector::parse(SEL_GITHUB_NAV).expect("静态选择器必然合法");
+    let mut matched_new = false;
+    for sel_str in SEL_GITHUB_NEW {
+        let Ok(sel) = Selector::parse(sel_str) else { continue };
+        let hits: Vec<_> = doc.select(&sel).collect();
+        if hits.is_empty() {
+            continue;
+        }
+        for el in &hits {
+            buf.push_str(&container_html_skip_nav(el, &nav_sel));
+            buf.push('\n');
+        }
+        matched_new = true;
+        break;
+    }
+    if !matched_new {
+        let sel = Selector::parse(SEL_GITHUB_COMMENT).expect("静态选择器必然合法");
+        for el in doc.select(&sel) {
+            buf.push_str(&el.inner_html());
+            buf.push('\n');
+        }
     }
     (!buf.is_empty()).then_some(buf)
+}
+
+/// 9jx：广义容器剥 nav——逐 child 判断 nav_sel，匹配则跳过；其余 child 取其 outer HTML 拼接。
+/// 命中 markdown-body 后再剥离 banner/header，避免 7KB nav 进容器产物（盲测九实测）。
+fn container_html_skip_nav(el: &ElementRef, nav_sel: &Selector) -> String {
+    use scraper::Node;
+    let mut out = String::new();
+    for child in el.children() {
+        if let Some(child_el) = ElementRef::wrap(child) {
+            if nav_sel.matches(&child_el) {
+                continue;
+            }
+            out.push_str(&child_el.html());
+            continue;
+        }
+        if let Node::Text(t) = child.value() {
+            out.push_str(&t.text);
+        }
+    }
+    out
 }
 
 fn first_sentence(p: &str) -> String {
@@ -652,5 +703,63 @@ where
         assert!(read.code_examples.iter().any(|c| c.contains("let a = 1;")));
         // 无容器页面 → None
         assert!(github_comment_html("<html><body><p>plain page</p></body></html>").is_none());
+    }
+
+    /// 9jx：新版 GitHub React DOM 容器命中——`[data-testid="markdown-body"]` 是盲测九实测
+    /// 当前 GitHub 主评论容器形态；命中后产物走 extract_adaptive 正常通道。
+    #[test]
+    fn github_comment_html_matches_react_dom_markdown_body() {
+        let junk = "x".repeat(20_000);
+        let html = format!(
+            "<html><head><meta>{junk}</meta></head><body>\
+             <div data-testid='markdown-body'>\
+             <p>react dom issue body text</p>\
+             <pre><code>let x = 42;</code></pre>\
+             </div></body></html>"
+        );
+        let container = github_comment_html(&html).expect("新 React 容器命中");
+        assert!(container.contains("react dom issue body text"));
+        assert!(!container.contains(&junk), "head 噪声不进容器产物");
+        let read = extract_adaptive(&container, None);
+        assert!(read.summary_paragraphs.iter().any(|p| p.contains("react dom issue body text")));
+        assert!(read.code_examples.iter().any(|c| c.contains("let x = 42;")));
+    }
+
+    /// 9jx：`[data-testid="issue-body"]` 也是新版主容器，命中优先级第二（markdown-body 优先）。
+    #[test]
+    fn github_comment_html_matches_issue_body_testid() {
+        let html = "<html><body>\
+                    <div data-testid='issue-body'><p>issue-body content here</p></div>\
+                    </body></html>";
+        let container = github_comment_html(html).expect("issue-body 命中");
+        assert!(container.contains("issue-body content here"));
+    }
+
+    /// 9jx：广义 markdown-body 容器含 banner/header 时按 SEL_GITHUB_NAV 剥离——
+    /// 盲测九实测 7KB nav 进容器产物（Platform/Solutions/Resources 等），剥离后正文只剩 issue content。
+    #[test]
+    fn github_comment_html_strips_nav_inside_container() {
+        let html = "<html><body>\
+                    <div data-testid='markdown-body'>\
+                    <nav class='Header'><a>Platform</a><a>Solutions</a><a>Resources</a></nav>\
+                    <p>actual issue content paragraph</p>\
+                    <div role='banner' class='gh-header'><span>GH Header</span></div>\
+                    </div></body></html>";
+        let container = github_comment_html(html).expect("容器命中");
+        assert!(container.contains("actual issue content paragraph"), "正文保留");
+        assert!(!container.contains("Platform"), "banner nav 文本剥离");
+        assert!(!container.contains("Solutions"), "Header nav 文本剥离");
+        assert!(!container.contains("Resources"), "Resources nav 文本剥离");
+        assert!(!container.contains("GH Header"), "gh-header 剥离");
+    }
+
+    /// 9jx：优先级链——新选择器全 miss 仍走 .js-comment-body/.comment-body 旧回退（盲测九 SSR 兜底）。
+    #[test]
+    fn github_comment_html_falls_back_to_legacy_selectors() {
+        let html = "<html><body>\
+                    <div class='js-comment-body'><p>legacy body</p></div>\
+                    </body></html>";
+        let container = github_comment_html(html).expect("旧回退命中");
+        assert!(container.contains("legacy body"));
     }
 }

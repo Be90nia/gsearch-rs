@@ -186,7 +186,11 @@ pub(crate) fn read_max_chars() -> usize {
 /// ①打回轮1：GitHub issues/PR 页主评论容器在 DOM 尾部（head/nav/SVG sprite 占掉前几十万
 /// 字符），先 cap 后抽会把正文全裁掉（实测 omitted=589331 / summary 空）。github.com 的
 /// issues|pull URL 先抽容器再过同一字符预算；其余 URL 与容器未命中路径行为逐字节不变。
-pub(crate) fn cap_extract_source(html_full: &str, limit: usize, url: &str) -> (String, bool, usize) {
+pub(crate) fn cap_extract_source(
+    html_full: &str,
+    limit: usize,
+    url: &str,
+) -> (String, bool, usize, usize) {
     let lower = url.to_ascii_lowercase();
     let is_github_thread =
         lower.contains("github.com/") && (lower.contains("/issues/") || lower.contains("/pull/"));
@@ -198,13 +202,16 @@ pub(crate) fn cap_extract_source(html_full: &str, limit: usize, url: &str) -> (S
     cap_chars(html_full, limit)
 }
 
-/// 字符级硬截断（按 chars 计，不劈 UTF-8）。返回 (截后文本, 是否截断, 省略字符数)。
-pub(crate) fn cap_chars(s: &str, limit: usize) -> (String, bool, usize) {
+/// 字符级硬截断（按 chars 计，不劈 UTF-8）。返回 (截后文本, 是否截断, 省略字符数, 截断字节偏移)。
+/// 9jx：第四个值是截断点在源里的 byte offset（meta.truncated_at_offset 用）；
+/// 未截断时 offset=0 让缺席语义（0=缺席）自然生效。
+pub(crate) fn cap_chars(s: &str, limit: usize) -> (String, bool, usize, usize) {
     let total = s.chars().count();
     if total <= limit {
-        return (s.to_string(), false, 0);
+        return (s.to_string(), false, 0, 0);
     }
-    (s.chars().take(limit).collect(), true, total - limit)
+    let byte_offset = char_to_byte_offset(s, limit);
+    (s.chars().take(limit).collect(), true, total - limit, byte_offset)
 }
 
 /// JSON 感知 cap_chars：若文本以 `{` 或 `[` 开头且截断点不在字符串内，回退到
@@ -212,7 +219,8 @@ pub(crate) fn cap_chars(s: &str, limit: usize) -> (String, bool, usize) {
 /// UnclosedBraceError（G 盲测八实锤：GitHub API list JSON 按字节截断后
 /// json.loads 失败）。非 JSON 形态（不以 `{`/`[` 起首）走原 cap_chars，行为不变。
 /// 边界找不到（截断发生在字符串字面量中）回退硬截断——避免返回合法但语义错乱。
-pub(crate) fn cap_chars_json(s: &str, limit: usize) -> (String, bool, usize) {
+/// 9jx：第四个值是截断点在源里的 byte offset（meta.truncated_at_offset 用）。
+pub(crate) fn cap_chars_json(s: &str, limit: usize) -> (String, bool, usize, usize) {
     let trimmed = s.trim_start();
     let offset = s.len() - trimmed.len();
     let first = trimmed.chars().next();
@@ -221,7 +229,7 @@ pub(crate) fn cap_chars_json(s: &str, limit: usize) -> (String, bool, usize) {
     }
     let total = s.chars().count();
     if total <= limit {
-        return (s.to_string(), false, 0);
+        return (s.to_string(), false, 0, 0);
     }
     // 取前 limit 字符，按 char 索引转 byte offset
     let byte_limit = char_to_byte_offset(s, limit);
@@ -229,7 +237,8 @@ pub(crate) fn cap_chars_json(s: &str, limit: usize) -> (String, bool, usize) {
     if let Some(end) = last_brace_boundary(trimmed, byte_limit - offset) {
         let truncated_str = format!("{}{}", &s[..offset], &trimmed[..end]);
         let truncated_chars = truncated_str.chars().count();
-        return (truncated_str, true, total - truncated_chars);
+        let truncated_byte_offset = offset + end;
+        return (truncated_str, true, total - truncated_chars, truncated_byte_offset);
     }
     // 兜底：硬截断（截断点在字符串字面量里也走硬截，不返回坏 JSON）
     cap_chars(s, limit)
@@ -278,6 +287,10 @@ fn last_brace_boundary(s: &str, byte_len: usize) -> Option<usize> {
 /// = 注入面，正文永远是数据非指令，content_untrusted 恒在）；文本模式截断时 eprintln 提醒
 /// （stdout 保持可解析，stderr 承载告警）。
 /// 8lp/e19：缺席=正常——truncated=false / omitted=0 不占键；headings 截断时 meta 附标记。
+/// 9jx：truncated_at_offset > 0 时 meta 附 `truncated_at_offset` 键（截断字节位置）；
+/// 未截断/未注入偏移时键缺席（offset=0=正常态）。
+// 参数按调用方语义分组传递（截断三联：truncated/omitted/truncated_at_offset），无 helper 简化空间。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_read(
     read: &gsearch::skeleton::AdaptiveRead,
     json: bool,
@@ -285,6 +298,7 @@ pub(crate) fn render_read(
     from: usize,
     truncated: bool,
     omitted: usize,
+    truncated_at_offset: usize,
     headings_truncated: bool,
 ) -> String {
     // ①打回轮1通用保底：截断发生了却一无所获（GitHub 类页正文在 DOM 尾部被 cap 吃光）→
@@ -314,6 +328,12 @@ pub(crate) fn render_read(
             }
             if omitted > 0 {
                 meta.insert("omitted".into(), serde_json::json!(omitted));
+            }
+            if truncated_at_offset > 0 {
+                meta.insert(
+                    "truncated_at_offset".into(),
+                    serde_json::json!(truncated_at_offset),
+                );
             }
             meta.insert("content_untrusted".into(), serde_json::Value::Bool(true));
             if headings_truncated {
@@ -379,7 +399,8 @@ pub async fn read(
         None => eval_string_retry(&page, "document.title").await,
     };
     let html_full = content_retry(&page).await;
-    let (html, truncated, omitted) = cap_extract_source(&html_full, read_max_chars(), url);
+    let (html, truncated, omitted, truncated_at_offset) =
+        cap_extract_source(&html_full, read_max_chars(), url);
     let mut read = extract_adaptive(&html, opts.excerpt);
     read.url = url.to_string();
     read.title = title;
@@ -404,6 +425,7 @@ pub async fn read(
         opts.from,
         truncated,
         omitted,
+        truncated_at_offset,
         headings_truncated,
     );
     // 0mf：--json 时不再直接打印（envelope 先打 + read JSON 追加 = 两段拼接破坏 json.loads），
@@ -425,7 +447,7 @@ pub async fn read_full(
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
     let (page, _) = open_page(browser, h_slot, url).await?;
-    let (txt, _, _) = read_full_text(&page, read_max_chars()).await?;
+    let (txt, _, _, _) = read_full_text(&page, read_max_chars()).await?;
     if !opts.json {
         println!("=== {url} ===\n{txt}");
     }
@@ -435,7 +457,11 @@ pub async fn read_full(
 /// innerText 截断 + 截断标注（fve：cap 与 AdaptiveRead 同一 READ_BODY_MAX_CHARS 上限；
 /// browse --full --json 在 meta.truncated 照标；n76：上限由调用方注入——browse 走 --max-chars，
 /// read_full 保持 read_max_chars() 配置语义）。read_full / general::cmd_browse 共用。
-pub(crate) async fn read_full_text(page: &chromiumoxide::Page, limit: usize) -> Result<(String, bool, usize)> {
+/// 9jx：第四个返回值为截断字节偏移（meta.truncated_at_offset 用）。
+pub(crate) async fn read_full_text(
+    page: &chromiumoxide::Page,
+    limit: usize,
+) -> Result<(String, bool, usize, usize)> {
     let txt = eval_string_retry(page, "document.body.innerText").await;
     Ok(cap_chars(&txt, limit))
 }
@@ -764,13 +790,29 @@ mod tests {
     /// jp4：cap_chars 字符级硬截断（按 chars 计不劈 UTF-8；未超限零拷贝语义）。
     #[test]
     fn cap_chars_cases() {
-        let (s, trunc, omitted) = cap_chars("hello", 10);
-        assert!(!trunc && omitted == 0 && s == "hello");
-        let (s, trunc, omitted) = cap_chars("你好世界", 2);
-        assert!(trunc && omitted == 2 && s == "你好");
+        let (s, trunc, omitted, offset) = cap_chars("hello", 10);
+        assert!(!trunc && omitted == 0 && s == "hello" && offset == 0);
+        let (s, trunc, omitted, offset) = cap_chars("你好世界", 2);
+        assert!(trunc && omitted == 2 && s == "你好" && offset == "你好".len());
         let long = "x".repeat(READ_BODY_MAX_CHARS + 1);
-        let (s, trunc, omitted) = cap_chars(&long, READ_BODY_MAX_CHARS);
+        let (s, trunc, omitted, offset) = cap_chars(&long, READ_BODY_MAX_CHARS);
         assert!(trunc && omitted == 1 && s.chars().count() == READ_BODY_MAX_CHARS);
+        assert_eq!(offset, READ_BODY_MAX_CHARS);
+    }
+
+    /// 9jx：cap_chars 截断字节偏移——ASCII 输入 offset 恰好等于 limit（每字符 1 字节）；
+    /// UTF-8 中文 offset 等于已截字符的 byte 总长；未截断 offset=0（缺席语义）。
+    #[test]
+    fn cap_chars_records_truncation_offset() {
+        // ASCII：offset = limit
+        let (_s, _t, _o, offset) = cap_chars("abcdefghij", 5);
+        assert_eq!(offset, 5);
+        // UTF-8：「你好世界」每字 3 字节，截 2 字 = 6 字节
+        let (_s, _t, _o, offset) = cap_chars("你好世界", 2);
+        assert_eq!(offset, 6, "中文字节偏移按 char→byte 换算");
+        // 未截断：offset=0（缺席语义）
+        let (_s, _t, _o, offset) = cap_chars("short", 100);
+        assert_eq!(offset, 0);
     }
 
     /// P1 fetch JSON 截断：JSON 形态文本截断时回退到最后一个完整 `}`/`]` 边界。
@@ -781,53 +823,54 @@ mod tests {
     #[test]
     fn cap_chars_json_truncates_to_brace_boundary() {
         // 简单对象：截到 8 字符 → `{"a":1,"` 内无右花括号 → 兜底硬截
-        let (s, trunc, omitted) = cap_chars_json(r#"{"a":1,"b":2}"#, 8);
+        let (s, trunc, omitted, _offset) = cap_chars_json(r#"{"a":1,"b":2}"#, 8);
         assert!(trunc, "应截断");
         assert_eq!(s, r#"{"a":1,""#, "8 字符内无右花括号 → 硬截到 limit");
         assert!(omitted > 0);
 
         // 简单对象：limit=9 拿全（输入 13 字符）
         // 实际 13 字符需要 limit >= 13 才不截
-        let (s, trunc, _o) = cap_chars_json(r#"{"a":1,"b":2}"#, 13);
+        let (s, trunc, _o, _offset) = cap_chars_json(r#"{"a":1,"b":2}"#, 13);
         assert!(!trunc && s == r#"{"a":1,"b":2}"#, "未超限不截");
 
         // limit=11 截到 `{"a":1,"b"`；前 11 字符内无右花括号 → 兜底硬截
-        let (s, trunc, _o) = cap_chars_json(r#"{"a":1,"b":2}"#, 11);
+        let (s, trunc, _o, _offset) = cap_chars_json(r#"{"a":1,"b":2}"#, 11);
         assert!(trunc && s.chars().count() == 11, "无闭括号 → 硬截: {s}");
 
         // 嵌套对象：最后一个右花括号应被找到
         let json = r#"{"a":{"x":1},"b":2}"#; // len=19；位置 11 是内层 `}`
         // limit=10 截到 `{"a":{"x":` 内无闭括号 → 硬截
-        let (s2, t2, _o2) = cap_chars_json(json, 10);
+        let (s2, t2, _o2, _offset) = cap_chars_json(json, 10);
         assert!(t2 && s2 == r#"{"a":{"x":"#, "无闭括号 → 硬截: {s2}");
         // limit=12 含内层 `}`（位置 11）→ 应回退到 12，结果含闭合 `}`
-        let (s4, t4, _o4) = cap_chars_json(json, 12);
+        let (s4, t4, _o4, offset4) = cap_chars_json(json, 12);
         assert!(t4 && s4.ends_with('}'), "应回退到右花括号: {s4}");
         assert_eq!(s4, r#"{"a":{"x":1}"#, "应得内层完整对象: {s4}");
+        assert_eq!(offset4, 12, "brace 边界回退的字节偏移 = 截后文本字节长度");
 
         // 字符串内的右花括号不算边界（heuristic）
         let json = r#"{"msg":"hi}there","x":1}"#; // len=24
-        let (s2, t2, _o2) = cap_chars_json(json, 5);
+        let (s2, t2, _o2, _offset) = cap_chars_json(json, 5);
         assert!(t2 && s2.chars().count() <= 5, "字符串内无闭括号 → 兜底硬截: {s2}");
 
         // 数组形态：截到中段无右方括号 → 兜底硬截
-        let (s2, t2, _o2) = cap_chars_json("[1,2,3]", 5);
+        let (s2, t2, _o2, _offset) = cap_chars_json("[1,2,3]", 5);
         assert!(t2 && s2 == "[1,2," && s2.chars().count() == 5, "兜底硬截: {s2}");
-        let (s3, t3, _o3) = cap_chars_json("[1]", 2);
+        let (s3, t3, _o3, _offset) = cap_chars_json("[1]", 2);
         assert!(t3 && s3 == "[1" && s3.chars().count() == 2, "兜底硬截: {s3}");
 
         // 未超限：不截断
-        let (s, trunc, omitted) = cap_chars_json(r#"{"a":1}"#, 100);
-        assert!(!trunc && omitted == 0 && s == r#"{"a":1}"#);
+        let (s, trunc, omitted, offset) = cap_chars_json(r#"{"a":1}"#, 100);
+        assert!(!trunc && omitted == 0 && s == r#"{"a":1}"# && offset == 0);
 
         // 非 JSON 形态（不以 `{`/`[` 起首）走原 cap_chars，行为不变
-        let (s, trunc, omitted) = cap_chars_json("plain text", 5);
+        let (s, trunc, omitted, _offset) = cap_chars_json("plain text", 5);
         assert!(trunc && s == "plain" && s.chars().count() == 5 && omitted == 5, "非 JSON 走 cap_chars: {s}");
 
         // G 盲测八实证场景：GitHub API list JSON 按字符截断 → 至少停在最后一个完整对象后。
         let gh = r#"[{"tag":"v1","assets":10},{"tag":"v2","assets":20}]"#;
         // len=52；limit=30 截到第 2 个对象中段；前 30 字符内最后一个 `}` 是位置 24（`assets":10}`）
-        let (s4, t4, _o4) = cap_chars_json(gh, 30);
+        let (s4, t4, _o4, _offset) = cap_chars_json(gh, 30);
         assert!(t4 && s4.ends_with('}'), "应停在最后一个完整对象: {s4}");
         assert_eq!(s4, r#"[{"tag":"v1","assets":10}"#, "应得第 1 个完整对象: {s4}");
     }
@@ -841,21 +884,22 @@ mod tests {
             "<html><head>{junk}</head><body><div class='js-comment-body'><p>real issue body</p></div></body></html>"
         );
         // GitHub 线程 URL：容器命中（head 噪声被剔除，预算内拿到正文）
-        let (html2, trunc, _omitted) = cap_extract_source(&html, 200, "https://github.com/tokio-rs/tokio/issues/2782");
+        let (html2, trunc, _omitted, _off) = cap_extract_source(&html, 200, "https://github.com/tokio-rs/tokio/issues/2782");
         assert!(!html2.contains(&junk), "容器抽取绕过 head 噪声");
         assert!(html2.contains("real issue body"));
         assert!(!trunc || html2.len() <= 200);
         // 同 html 非 GitHub URL：走原 cap_chars（head 噪声在预算内，正文被裁——保底 hint 由 render_read 出）
-        let (html3, _, _) = cap_extract_source(&html, 200, "https://example.com/page");
+        let (html3, _, _, _) = cap_extract_source(&html, 200, "https://example.com/page");
         assert!(html3.contains("xxxx"), "原路径仍从 head 开始 cap（行为不变）");
         assert!(!html3.contains("real issue body"), "原路径正文仍被 cap 裁掉（对比组）");
         // GitHub 非 issues|pull 页：不启用容器抽取
-        let (html4, _, _) = cap_extract_source(&html, 200, "https://github.com/tokio-rs/tokio");
+        let (html4, _, _, _) = cap_extract_source(&html, 200, "https://github.com/tokio-rs/tokio");
         assert!(!html4.contains("real issue body"), "仓库主页不走容器抽取");
     }
 
     /// jp4：render_read 仅 --json 注入 meta（追加不覆盖既有字段）；文本模式不加任何 JSON 键，
     /// 截断走 eprintln。8lp/e19：truncated=false / omitted=0 缺席；headings_truncated 标记可注入。
+    /// 9jx：truncated_at_offset > 0 时 meta 附该键；offset=0 缺席。
     #[test]
     fn render_read_injects_meta_json_only() {
         let html = r#"<html><head><title>T</title></head><body><h1>One</h1><p>p1 alpha.</p></body></html>"#;
@@ -864,21 +908,23 @@ mod tests {
         read.url = "u".into();
         read.title = "T".into();
         let v: serde_json::Value =
-            serde_json::from_str(&render_read(&read, true, false, 0, true, 7, false)).unwrap();
+            serde_json::from_str(&render_read(&read, true, false, 0, true, 7, 100, false)).unwrap();
         assert_eq!(v["meta"]["truncated"], true);
         assert_eq!(v["meta"]["omitted"], 7);
+        assert_eq!(v["meta"]["truncated_at_offset"], 100, "offset>0 注入键");
         assert_eq!(v["meta"]["content_untrusted"], true);
         assert_eq!(v["title"], "T");
         // 空值缺席：正常态 meta 只剩 content_untrusted 一键
         let v: serde_json::Value =
-            serde_json::from_str(&render_read(&read, true, false, 0, false, 0, false)).unwrap();
+            serde_json::from_str(&render_read(&read, true, false, 0, false, 0, 0, false)).unwrap();
         assert!(v["meta"].get("truncated").is_none(), "truncated=false 应缺席: {v}");
         assert!(v["meta"].get("omitted").is_none(), "omitted=0 应缺席: {v}");
+        assert!(v["meta"].get("truncated_at_offset").is_none(), "offset=0 应缺席: {v}");
         assert_eq!(v["meta"]["content_untrusted"], true);
         let v: serde_json::Value =
-            serde_json::from_str(&render_read(&read, true, false, 0, false, 0, true)).unwrap();
-        assert_eq!(v["meta"]["headings_truncated"], true, "截断标记应可注入: {v}");
-        let text = render_read(&read, false, false, 0, false, 0, false);
+            serde_json::from_str(&render_read(&read, true, false, 0, false, 0, 0, true)).unwrap();
+        assert_eq!(v["meta"]["headings_truncated"], true, "截断标记可注入: {v}");
+        let text = render_read(&read, false, false, 0, false, 0, 0, false);
         assert!(!text.contains("content_untrusted"), "文本模式不应出现 meta: {text}");
     }
 

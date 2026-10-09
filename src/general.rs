@@ -165,9 +165,10 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
         // md 产物再过同一字符上限——先截 HTML 会把表格腰斩）。
         // --json 对齐 0mf search 契约：信封（meta.truncated 标内容截断）+ content_text 单文档
         if opts.full || opts.markdown {
-            let (txt, truncated, omitted) = if opts.markdown {
-                let (md, t, o) = postproc::cap_chars(&crate::convert::html_to_markdown(&html_probe)?, opts.max_chars);
-                (md, t, o)
+            let (txt, truncated, omitted, truncated_at_offset) = if opts.markdown {
+                let (md, t, o, off) =
+                    postproc::cap_chars(&crate::convert::html_to_markdown(&html_probe)?, opts.max_chars);
+                (md, t, o, off)
             } else {
                 postproc::read_full_text(&page, opts.max_chars).await?
             };
@@ -183,6 +184,7 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
                     limit: 0,
                     elapsed_ms: started.elapsed().as_millis(),
                     truncated,
+                    truncated_at_offset,
                     // h90：browse 无搜索来源——provider 置空串，键整体缺席（types.rs 缺席语义），
                     // 不再伪装成 "google" 误导 agent 分流；搜索路径恒非空不受影响
                     provider: String::new(),
@@ -225,7 +227,8 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
             None => postproc::eval_string_retry(&page, "document.title").await,
         };
         let html_full = html_probe;
-        let (html, truncated, omitted) = postproc::cap_extract_source(&html_full, opts.max_chars, url);
+        let (html, truncated, omitted, truncated_at_offset) =
+            postproc::cap_extract_source(&html_full, opts.max_chars, url);
         let mut read = extract_adaptive(&html, None);
         read.url = url.to_string();
         read.title = title;
@@ -235,7 +238,16 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
             eprintln!("[hint] 正文提取为空，试 --markdown 或 --full");
         }
 
-        let out = postproc::render_read(&read, opts.json, opts.headings_only, opts.from, truncated, omitted, false);
+        let out = postproc::render_read(
+            &read,
+            opts.json,
+            opts.headings_only,
+            opts.from,
+            truncated,
+            omitted,
+            truncated_at_offset,
+            false,
+        );
         println!("{out}");
         browser_opt = Some(browser);
         Ok(())

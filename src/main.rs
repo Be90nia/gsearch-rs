@@ -98,7 +98,7 @@ enum EnvelopeArg {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Google 搜索（`--read N` 默认 AdaptiveRead）
+    /// Google/SearXNG 搜索（`--browse N` 默认 AdaptiveRead；`--read N` 仅截前 N 条 snippet 不启浏览器）
     Search(SearchArgs),
     /// 任意 URL → 渲染后页面正文（默认 AdaptiveRead）
     Browse {
@@ -184,13 +184,13 @@ enum Command {
         #[arg(long, conflicts_with = "url")]
         urls_file: Option<std::path::PathBuf>,
     },
-    /// 纯 HTTP GET 取网页正文（无需 Chrome；JS 壳页会提示用 browse）。
+    /// `gsearch fetch <url>...`：GET → 轻量正文提取 → 人读 / --json 输出。
     /// 单 URL = 原行为；多 URL = batch 并发（上限 5、单条失败不阻塞，退出码 0 全成功 / 1 部分失败 / 2 全失败）。
     Fetch {
         #[arg(required = true, num_args = 1..)]
         url: Vec<String>,
-        /// 逗号分隔 CSS selector（如 "main,article"）：命中时取首个命中容器的正文并跳过 JS 壳判定；
-        /// 未命中回退全文提取，--json 在 meta.include_hit=false 标注。
+        /// 逗号分隔 CSS selector（如 "main,article"）：FixG10 J-3 多选器累加——所有命中容器
+        /// inner_html 用 `\n\n---\n\n` 拼接；未命中回退全文提取，--json 在 meta.include_hit=false 标注。
         #[arg(long)]
         include: Option<String>,
         /// 输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
@@ -207,9 +207,24 @@ enum Command {
         /// meta.format="markdown" 标注；无 flag 输出逐字节不变。
         #[arg(long, default_value_t = false)]
         markdown: bool,
-        /// 正文字符预算（text 字段上限；超限截断并在 meta.truncated 如实标注）。
+        /// 正文字符预算（text 字段上限；超限截断并在 meta.truncated/omitted 如实标注）。
         #[arg(long, default_value_t = 50_000, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=10_000_000))]
         max_chars: usize,
+        /// FixG10 J-1：单请求超时（秒）；默认 10、范围 1..=300。
+        /// 用于 GitHub 抖动下给单 URL 留更长的握手/读体窗口；与 --retry 配合使用。
+        #[arg(long, default_value_t = 10, value_parser = clap::builder::RangedI64ValueParser::<u64>::from(1..=300))]
+        timeout: u64,
+        /// FixG10 J-1：失败重试次数（不含首次）；默认 0 = 不重试（行为不变）；范围 0..=3。
+        /// backoff 1s/2s/4s（第 N 次重试前等 2^(N-1) 秒）；stderr 一行「第 N/总 N 次重试」提示。
+        /// 私网门拒 / scheme 错 / PDF 等确定性错误不重试；HTTP 4xx（除 408/429）不重试。
+        #[arg(long, default_value_t = 0, value_parser = clap::builder::RangedI64ValueParser::<u32>::from(0..=3))]
+        retry: u32,
+        /// FixG10 J-2：JSONPath 投影（逗号分隔多路径）——text 为 JSON 时只保留指定字段。
+        /// 例：`--json-keys "crate.max_version,crate.max_stable_version"` 命中后 text 换源为
+        /// `{"max_version":"...","max_stable_version":"..."}`，meta.truncated_by_json_keys=true。
+        /// text 非 JSON 时静默跳过（不动 text）。
+        #[arg(long, value_delimiter = ',')]
+        json_keys: Vec<String>,
     },
     /// 启发式相似页搜索：URL → title 关键词派生查询，SearXNG 单查 + 词重合/同域重排。
     /// 派生查询而非 exa 神经 findSimilar（README 预期管理）。
@@ -241,10 +256,16 @@ struct SearchArgs {
     /// `site:` 等查询语法原样透传，无专属参数。
     #[arg(long, value_enum)]
     recency: Option<RecencyArg>,
-    /// `--open / --read / --dl` 互斥：每次只能指定一个；不可同时传。
-    /// 1..——`--read 0` 曾被 Some(0) 当真值白起完整浏览器读阶段。
+    /// `--read N`（FixG10 L-1）：从搜索结果中只取前 N 条的 snippet 进输出（纯 HTTP 路径，不启动浏览器）。
+    /// 原 `--read N` 的"启动 Chrome 读网页正文"语义改名为 `--browse N`；本 flag 不触发浏览器、纯 snippet。
+    /// 与 `--open / --dl / --browse` 互斥（clap group "post"）；1..——0 视为非法。
     #[arg(long, group = "post", value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..))]
     read: Option<usize>,
+    /// `--browse N`（FixG10 L-1：原 `--read N` 启浏览器读网页正文的语义改名到此）：
+    /// 用 Chrome 渲染前 N 条结果的 URL、取页面正文（AdaptiveRead），仍走浏览器 launch 链。
+    /// 与 `--open / --dl / --read` 互斥；1..。
+    #[arg(long, group = "post", value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..))]
+    browse: Option<usize>,
     #[arg(long, group = "post")]
     dl: Option<usize>,
     #[arg(long, group = "post")]
@@ -268,13 +289,13 @@ struct SearchArgs {
     /// JSON 结果 snippet 截断长度（按字符）；默认 160。
     #[arg(long, default_value_t = 160, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=100000))]
     snippet_len: usize,
-    /// `--read N --from K`：摘要段从第 K 段开始（1-based；默认 0 = 从首段）
+    /// `--browse N --from K`：摘要段从第 K 段开始（1-based；默认 0 = 从首段）
     #[arg(long)]
     from: Option<usize>,
-    /// `--read N --headings-only`：只输出目录（最省 token fast path）
+    /// `--browse N --headings-only`：只输出目录（最省 token fast path）
     #[arg(long, default_value_t = false)]
     headings_only: bool,
-    /// `--read N --excerpt N`——paragraph_index 每项附该段前 N 字符实际文本（--json 生效，
+    /// `--browse N --excerpt N`——paragraph_index 每项附该段前 N 字符实际文本（--json 生效，
     /// 受 read_max_chars 总 cap 约束）。与 --full/--headings-only 互斥；默认不启用（输出逐键不变）。
     #[arg(long, conflicts_with_all = ["full", "headings_only"])]
     excerpt: Option<usize>,
@@ -359,8 +380,19 @@ async fn main() -> ExitCode {
         Command::Verify { url, human, timeout, urls_file, .. } => {
             gsearch::verify::cmd_verify(&url, !human, proxy.as_deref(), timeout, urls_file.as_deref())
         }
-        Command::Fetch { url, human, allow_private, include, markdown, max_chars, .. } => {
-            fetch::cmd_fetch(&url, &fetch::FetchOpts { json: !human, proxy: proxy.clone(), allow_private, include, markdown, max_chars }).await
+        Command::Fetch { url, human, allow_private, include, markdown, max_chars, timeout, retry, json_keys, .. } => {
+            fetch::cmd_fetch(&url, &fetch::FetchOpts {
+                json: !human,
+                proxy: proxy.clone(),
+                allow_private,
+                include,
+                markdown,
+                max_chars,
+                timeout_secs: timeout,
+                retry,
+                json_keys,
+                anchor_pad_lines: 0,
+            }).await
         }
         Command::Similar { url, limit, human, .. } => cmd_similar(url, limit, human).await,
         Command::Update => update::cmd_update(proxy.clone()).await,
@@ -470,13 +502,19 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     if args.query.len() > 1 {
         return cmd_search_batch(args).await;
     }
-    // d3u：--read N 的静态可判越界（N > --limit）在发起搜索前拒绝——结果数 ≤ limit 恒成立，
+    // d3u：--read / --browse N 的静态可判越界（N > --limit）在发起搜索前拒绝——结果数 ≤ limit 恒成立，
     // N > limit 必越界，参数校验阶段 rc=2，零网络零浏览器。运行时越界（N ≤ limit 但返回不足）
     // 仍在搜索完成后、浏览器 launch 前校验（post 块）。
     if let Some(n) = args.read
         && n > args.limit
     {
         eprintln!("error: --read {n} 越界：结果数上限为 --limit {}，请求前即可判定", args.limit);
+        return Ok(ExitCode::from(2));
+    }
+    if let Some(n) = args.browse
+        && n > args.limit
+    {
+        eprintln!("error: --browse {n} 越界：结果数上限为 --limit {}，请求前即可判定", args.limit);
         return Ok(ExitCode::from(2));
     }
     let started = std::time::Instant::now();
@@ -610,11 +648,32 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     } else {
         (gsearch::types::RunStatus::Ok, String::new())
     };
-    // 0mf：--json + --read 时 read 产物并入单一 JSON 文档——envelope 延后装配，stdout 只出
+    // 0mf：--json + --browse 时 read 产物并入单一 JSON 文档——envelope 延后装配，stdout 只出
     // 一份可解析 JSON（旧行为 envelope 先打 + read raw 追加 = json.loads 崩）。
     // b95：--headings-only 连 SERP 集都不进输出（text 模式同样跳过 print_text）。
-    let read_solo_json = json_mode && args.read.is_some();
-    let headings_solo = args.read.is_some() && args.headings_only;
+    // FixG10 L-1：`--read N` 不再触发浏览器，改为纯 snippet 截断；原语义改名为 `--browse N`。
+    let read_n = args.read;
+    let browse_n = args.browse;
+    // --read N 越界前置拒绝（不依赖浏览器 launch）——与 --browse 同型校验
+    if let Some(n) = read_n
+        && n > results.len()
+    {
+        eprintln!("error: --read {n} 越界（结果数 {}）", results.len());
+        return Ok(ExitCode::from(2));
+    }
+    if let Some(n) = browse_n
+        && n > results.len()
+    {
+        eprintln!("error: --browse {n} 越界（结果数 {}）", results.len());
+        return Ok(ExitCode::from(2));
+    }
+    // FixG10 L-1：--read N 命中时直接 truncate 结果集到前 N（snippet-only，不启浏览器）。
+    // envelope + stdout 在 truncate 之后打，输出只含 top N 条 snippet。
+    if let Some(n) = read_n {
+        results.truncate(n);
+    }
+    let browse_solo_json = json_mode && browse_n.is_some();
+    let headings_solo = browse_n.is_some() && args.headings_only;
     let meta = gsearch::types::MetaOutput {
         tool: "gsearch",
         version: env!("CARGO_PKG_VERSION"),
@@ -625,6 +684,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         limit: args.limit,
         elapsed_ms: started.elapsed().as_millis(),
         truncated: results.len() >= args.limit,
+        truncated_at_offset: 0,
         provider: provider.into(),
         recency: recency.map(|r| r.as_str().into()),
         site_warn: site_warn_for(&query),
@@ -638,26 +698,23 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         message: run_message,
     };
     let envelope = gsearch::types::OutputEnvelope { meta, run, results: &results };
-    if !read_solo_json {
+    // FixG10 L-1：--read N 已 truncate 结果，envelope 用 truncate 后的切片；与 --browse 共用同一份 envelope。
+    // browse_solo_json 由 browse 触发（read 已是 snippet-only，不需要单独 envelope 装配）。
+    if !browse_solo_json {
         if json_mode {
             gsearch::output::print_envelope_json(&envelope)?;
         } else if !headings_solo {
             gsearch::output::print_text(&results);
         }
     }
-    // M4 后处理（PLAN §3.4）：clap ArgGroup "post" 保证 --open/--read/--dl 互斥；仅剩运行时分发。
+    // M4 后处理（PLAN §3.4）：clap ArgGroup "post" 保证 --open/--read/--browse/--dl 互斥；仅剩运行时分发。
+    // FixG10 L-1：--read 已 truncate（无浏览器）；--browse 走原 read 路径（启 Chrome 读网页正文）。
     let post = async {
         if let Some(n) = args.open {
             postproc::open(&results, n)?;
         }
-        if let Some(n) = args.read {
-            // d3u：越界是静态可判的——结果数在搜索完成时已知，检查前移到浏览器 launch
-            // 之前（纯参数校验阶段拒绝），免白起一次完整 Chrome（~1-2s）。错误信息与
-            // postproc::pick 内层检查同款（read_error 输出契约不变）。
-            if n > results.len() {
-                anyhow::bail!("--read {n} 越界（结果数 {}）", results.len());
-            }
-            // M17 惰性：SearXNG 命中时浏览器尚未启动，--read/--dl 首次用到才 launch(headless)
+        if let Some(n) = browse_n {
+            // M17 惰性：SearXNG 命中时浏览器尚未启动，--browse/--dl 首次用到才 launch(headless)
             let browser = ensure_search_browser(&mut browser_opt, &mut h_slot, browser_kind, proxy.clone()).await?;
             let opts = postproc::ReadOpts {
                 full: args.full,
@@ -671,7 +728,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             } else {
                 postproc::read(browser, &mut h_slot, &results, n, &opts).await?
             };
-            if read_solo_json {
+            if browse_solo_json {
                 // 0mf：单一 JSON 文档 = envelope（meta/run/results）+ read 产物字段
                 let mut doc = serde_json::to_value(&envelope)?;
                 if let Some(obj) = doc.as_object_mut() {
@@ -695,14 +752,14 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         anyhow::Ok(())
     }
     .await;
-    // 仅 Google 路径（或 --read/--dl 惰性启动过）才有 browser 需要收尾
+    // 仅 Google 路径（或 --browse/--dl 惰性启动过）才有 browser 需要收尾
     if let Some(browser) = browser_opt.as_mut() {
         gsearch::browser::graceful_close(browser).await;
     }
     if let Err(e) = post {
         eprintln!("postproc 失败: {e}");
-        if read_solo_json {
-            // w9y：read 失败必须结构化可见——补打信封并顶层挂 read_error，
+        if browse_solo_json {
+            // w9y：browse 失败必须结构化可见——补打信封并顶层挂 read_error，
             // agent 不再把「SERP 正常 + 读失败」误读为全成功。
             let mut doc = serde_json::to_value(&envelope)?;
             if let Some(obj) = doc.as_object_mut() {
@@ -710,8 +767,8 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             }
             println!("{doc}");
         }
-        if args.read.is_some() {
-            // w9y：显式请求的读失败不再静默 exit 0
+        if browse_n.is_some() {
+            // w9y：显式请求的 browse 失败不再静默 exit 0
             return Ok(ExitCode::from(1));
         }
     }
@@ -770,6 +827,7 @@ async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode>
         limit,
         elapsed_ms: started.elapsed().as_millis(),
         truncated: hits.len() >= limit,
+        truncated_at_offset: 0,
         provider: "searxng".into(),
         recency: None,
         site_warn: site_warn_for(&derived_query),
@@ -791,9 +849,9 @@ async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode>
 /// 刻意边界：禁浏览器回退（浏览器单例不可并发）；--read/--dl/--open 不参与 batch。
 /// 输出：--json 为裸 BatchEntry 数组；人读模式逐条分隔标题。退出码：全成功 0 / 部分失败 1 / 全部失败 2。
 async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
-    if args.read.is_some() || args.dl.is_some() || args.open.is_some() {
+    if args.read.is_some() || args.browse.is_some() || args.dl.is_some() || args.open.is_some() {
         return Err(anyhow!(
-            "batch 多查询暂不支持 --read/--dl/--open（batch 无浏览器参与）；请对单查询使用"
+            "batch 多查询暂不支持 --read/--browse/--dl/--open（batch 无浏览器参与）；请对单查询使用"
         ));
     }
     // 3gw：JSON 默认，--human 切人读
@@ -845,6 +903,7 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
                 limit: args.limit,
                 elapsed_ms,
                 truncated: results.len() >= args.limit,
+                truncated_at_offset: 0,
                 provider: "searxng".into(),
                 recency: recency.map(|r| r.as_str().into()),
                 site_warn: site_warn_for(&query),
@@ -955,6 +1014,7 @@ fn emit_captcha_timeout_json(
         limit: args.limit,
         elapsed_ms,
         truncated: false,
+        truncated_at_offset: 0,
         // CAPTCHA 超时只发生在 Google 直爬路径（searxng 不撞码）
         provider: "google".into(),
         recency: recency.map(|r| r.as_str().into()),
@@ -992,6 +1052,7 @@ fn emit_searxng_degraded_json(
         limit: args.limit,
         elapsed_ms,
         truncated: false,
+        truncated_at_offset: 0,
         // 熔断时结果确实来自 SearXNG 链路（provider 照实标注，非 google）
         provider: "searxng".into(),
         recency: recency.map(|r| r.as_str().into()),
@@ -1484,16 +1545,24 @@ mod tests {
         assert!(!gsearch::search::is_captcha("normal results"));
     }
 
-    /// M12 互斥：--open/--read/--dl 三个 flag 在 clap 解析阶段就拒绝。
+    /// M12 互斥：--open/--read/--browse/--dl 四个 flag 在 clap 解析阶段就拒绝。
+    /// FixG10 L-1：--read 是 snippet-only、--browse 启浏览器；两者不能同时传。
     #[test]
     fn post_flags_mutually_exclusive() {
         let r = Cli::try_parse_from(["gsearch", "search", "x", "--open", "1", "--read", "1"]);
         assert!(r.is_err(), "--open + --read 应在 clap 阶段被拒绝");
         let r = Cli::try_parse_from(["gsearch", "search", "x", "--read", "1", "--dl", "1"]);
         assert!(r.is_err(), "--read + --dl 应在 clap 阶段被拒绝");
+        // L-1：--read + --browse 也互斥（同一 post 组）
+        let r = Cli::try_parse_from(["gsearch", "search", "x", "--read", "1", "--browse", "1"]);
+        assert!(r.is_err(), "--read + --browse 应在 clap 阶段被拒绝");
+        let r = Cli::try_parse_from(["gsearch", "search", "x", "--browse", "1", "--dl", "1"]);
+        assert!(r.is_err(), "--browse + --dl 应在 clap 阶段被拒绝");
         // 单用 OK
         let r = Cli::try_parse_from(["gsearch", "search", "x", "--read", "1"]);
         assert!(r.is_ok(), "--read 单用应通过");
+        let r = Cli::try_parse_from(["gsearch", "search", "x", "--browse", "1"]);
+        assert!(r.is_ok(), "--browse 单用应通过");
     }
 
     /// browse --full 与 --headings-only clap 阶段互斥；单用通过。
@@ -1574,9 +1643,12 @@ mod tests {
         assert!(Cli::try_parse_from(["gsearch", "search", "x", "--limit", "0"]).is_err());
         assert!(Cli::try_parse_from(["gsearch", "search", "x", "--limit", "101"]).is_err());
         assert!(Cli::try_parse_from(["gsearch", "search", "x", "--limit", "100"]).is_ok());
-        // l6o：--read 0 拒绝（不再白起浏览器）
+        // l6o：--read 0 拒绝（不再白起浏览器）；L-1：--read 是 snippet-only，0 仍拒
         assert!(Cli::try_parse_from(["gsearch", "search", "x", "--read", "0"]).is_err());
         assert!(Cli::try_parse_from(["gsearch", "search", "x", "--read", "1"]).is_ok());
+        // L-1：--browse 0 同理拒
+        assert!(Cli::try_parse_from(["gsearch", "search", "x", "--browse", "0"]).is_err());
+        assert!(Cli::try_parse_from(["gsearch", "search", "x", "--browse", "1"]).is_ok());
     }
 
     /// --recency：day/week/month/year 枚举解析、缺省 None（URL 不得带过滤）、非法值拒绝。
@@ -1637,5 +1709,31 @@ mod tests {
                 assert!(leak.is_none(), "help 泄漏内部代号 {code}: {:?}", leak);
             }
         }
+    }
+
+    /// FixG10 J-1/J-2：fetch 新 flag 解析——--timeout 1..=300、--retry 0..=3、--json-keys 逗号分隔。
+    /// FixG10 L-1：fetch 命令解析不挂 --read/--browse（那是 search 的 flag）。
+    #[test]
+    fn fetch_new_flags_parse_with_ranges() {
+        // --timeout 默认 10、范围 1..=300
+        let cli = Cli::try_parse_from(["gsearch", "fetch", "https://e.test/"]).unwrap();
+        let Command::Fetch { timeout, retry, json_keys, .. } = cli.cmd else { panic!("expected fetch") };
+        assert_eq!(timeout, 10, "默认 timeout 10");
+        assert_eq!(retry, 0, "默认 retry 0");
+        assert!(json_keys.is_empty(), "默认 json-keys 空");
+        // --timeout 30 + --retry 2 命中
+        let cli = Cli::try_parse_from(["gsearch", "fetch", "https://e.test/", "--timeout", "30", "--retry", "2"]).unwrap();
+        let Command::Fetch { timeout, retry, .. } = cli.cmd else { panic!("expected fetch") };
+        assert_eq!(timeout, 30);
+        assert_eq!(retry, 2);
+        // 越界：--timeout 0 / 301 都拒
+        assert!(Cli::try_parse_from(["gsearch", "fetch", "https://e.test/", "--timeout", "0"]).is_err());
+        assert!(Cli::try_parse_from(["gsearch", "fetch", "https://e.test/", "--timeout", "301"]).is_err());
+        // 越界：--retry 4 拒
+        assert!(Cli::try_parse_from(["gsearch", "fetch", "https://e.test/", "--retry", "4"]).is_err());
+        // --json-keys 逗号分隔多字段
+        let cli = Cli::try_parse_from(["gsearch", "fetch", "https://e.test/", "--json-keys", "crate.max_version,crate.max_stable_version"]).unwrap();
+        let Command::Fetch { json_keys, .. } = cli.cmd else { panic!("expected fetch") };
+        assert_eq!(json_keys, vec!["crate.max_version".to_string(), "crate.max_stable_version".to_string()]);
     }
 }

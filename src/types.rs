@@ -44,6 +44,10 @@ pub struct MetaOutput {
     /// 是否被 `--limit` 截断；false = 正常态，键缺席（8lp 空值缺席=正常）。
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// 9jx：正文/HTML 截断点在源里的字节偏移（供 agent 精准换预算重取）。
+    /// 截断时才填（>0 才占键）；未截断=0=缺席（meta 键不出现）。
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub truncated_at_offset: usize,
     /// M16：本次搜索来源："searxng"（配了 SearXNG 且成功）/ "google"（直爬 / 回退）/
     /// "duckduckgo"（DDG html 直连）。h90：browse 等非搜索输出**无搜索来源**——置空串，
     /// 键整体缺席（8lp 缺席=正常）。曾硬编码 "google" 与实际渲染目标相悖、误导 agent 分流；
@@ -88,6 +92,10 @@ fn skip_compact_bool(_: &bool) -> bool {
 }
 fn skip_compact_usize(_: &usize) -> bool {
     compact_on()
+}
+/// 9jx：truncated_at_offset = 0 = 未截断 = 缺席（与 truncated=false 同 8lp 缺席语义）。
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
 }
 
 /// `--json` 输出的统一信封，`results` 是真正的载荷（Vec 或 AdaptiveRead）。
@@ -226,6 +234,7 @@ mod tests {
             limit: 10,
             elapsed_ms: 1234,
             truncated: false,
+            truncated_at_offset: 0,
             provider: "google".into(),
             recency: None,
             site_warn: None,

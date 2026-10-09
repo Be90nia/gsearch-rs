@@ -19,8 +19,7 @@ use scraper::{Html, Node, Selector};
 
 use crate::postproc::{cap_chars, cap_chars_json};
 
-/// fetch 总超时（含 redirect 链）；纯 HTTP 无渲染，10s 足够。
-const FETCH_TIMEOUT_SECS: u64 = 10;
+/// fetch 总超时默认（FixG10 J-1：--timeout 默认值，封装在 FetchOpts::default，便于 main 复用）。
 /// JS 壳判定阈值：剥标签后正文低于此字符数 → 大概率是渲染型页面。
 const SHELL_MIN_CHARS: usize = 500;
 /// redirect 跟随上限（reqwest 默认同款，显式声明防歧义）。
@@ -30,22 +29,56 @@ const FETCH_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// fetch batch 并发上限（防目标站/出口压力）。
 const FETCH_CONCURRENCY: usize = 5;
 
+/// fetch 单请求超时上限（秒，FixG10 J-1：--timeout 上限拉宽，给 GitHub 抖动下重试留余地）
+const FETCH_TIMEOUT_MAX_SECS: u64 = 300;
+/// fetch 重试上限（次，FixG10 J-1：--retry 上限 3 次；backoff 1s/2s/4s）
+const FETCH_RETRY_MAX: u32 = 3;
+
 /// `fetch <url>` 选项集（与 general::BrowseOpts 同风格）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FetchOpts {
     pub json: bool,
     /// 显式代理（--proxy / GSEARCH_PROXY）；None = 跟随环境代理（面向公网，与 searxng 的 no_proxy 相反）。
     pub proxy: Option<String>,
     /// 放行私网（loopback / RFC1918 / link-local）。默认 false：SSRF 门。
     pub allow_private: bool,
-    /// 逗号分隔 CSS selector（如 "main,article"）：命中时取首个命中容器的正文并跳过 JS 壳判定；
-    /// 未命中回退全文提取，--json 在 meta.include_hit=false 标注（用户明确知道要什么，壳判定不适用）。
+    /// 逗号分隔 CSS selector（如 "main,article"）：命中时取所有命中容器的正文并跳过 JS 壳判定；
+    /// 未命中回退全文提取，--json 在 meta.include_hit=false / include_hits=N 标注。
+    /// FixG10 J-3：多选器累加（旧版只取首个，命中断章不再卡死）。
     pub include: Option<String>,
     /// 正文以 markdown 输出（表格/标题/链接保结构）。--json 下 text 字段换源为 markdown，
     /// meta.format="markdown" 标注；无 flag 时逐字节不变。
     pub markdown: bool,
     /// 正文字符预算（text 上限；超限截断，meta.truncated/omitted 如实标注）。CLI 默认 50000。
     pub max_chars: usize,
+    /// FixG10 J-1：单请求超时（秒）；默认 10（与 FetchOpts::default 行为一致）；CLI 默认 10，范围 1..=300。
+    pub timeout_secs: u64,
+    /// FixG10 J-1：失败重试次数（不含首次）；默认 0 = 不重试（行为不变）；CLI 默认 0，范围 0..=3。
+    /// backoff：1s, 2s, 4s（第 N 次等待 2^(N-1) 秒）。每次重试 stderr 一行提示「第 N/总 N 次重试」。
+    pub retry: u32,
+    /// FixG10 J-2：JSONPath 投影（例：`.crate.max_version,.crate.max_stable_version`）；
+    /// 非空时 `--json` 输出只保留指定字段并打 `meta.truncated_by_json_keys: true`。
+    pub json_keys: Vec<String>,
+    /// FixG10 L-2：URL `#N-M` 锚点范围裁剪——命中时仅输出文本 [line_start, line_end]，
+    /// 上下各扩 N 行作为上下文；meta.anchor_crop_range: [start, end]。
+    pub anchor_pad_lines: usize,
+}
+
+impl Default for FetchOpts {
+    fn default() -> Self {
+        Self {
+            json: false,
+            proxy: None,
+            allow_private: false,
+            include: None,
+            markdown: false,
+            max_chars: 50_000,
+            timeout_secs: 10,
+            retry: 0,
+            json_keys: Vec::new(),
+            anchor_pad_lines: 0,
+        }
+    }
 }
 
 /// scheme 前缀校验（大小写不敏感）。非 http(s) 一律拒（fetch 子命令的契约定位 = 互联网只读）。
@@ -244,7 +277,32 @@ fn is_binary_content_type(ct: &str) -> bool {
         )
 }
 
+/// 决定是否应该重试：纯函数（FixG10 J-1：把 retry 判定拆出便于单测）。
+/// - 确定性错误（私网 / scheme / 二进制 Content-Type）→ false
+/// - HTTP 4xx（除 408/429）→ false（客户端错不会因等待修复）
+/// - 其余（含 5xx / 网络超时 / DNS 失败）→ true（重试 budget 允许时）
+fn should_retry(err_msg: &str, has_budget: bool) -> bool {
+    if !has_budget {
+        return false;
+    }
+    let permanent = err_msg.contains("拒绝")
+        || err_msg.contains("fetch 仅支持")
+        || err_msg.contains("PDF")
+        || err_msg.contains("二进制内容")
+        || err_msg.contains("私网");
+    if permanent {
+        return false;
+    }
+    // 4xx（除 408/429）客户端错不重试
+    if err_msg.contains("HTTP 4") && !err_msg.contains("HTTP 408") && !err_msg.contains("HTTP 429") {
+        return false;
+    }
+    true
+}
+
 /// 单 URL 拉取 + 提取（不含输出）。批量与单条共用；每 URL 独立过 SSRF 门（含重定向每跳）。
+/// FixG10 J-1：失败重试 loop——仅对网络/超时错误重试；HTTP 4xx 立即放弃（5xx 也重试，
+/// 因为 502/503/504 服务端瞬时错误常抖几下就好）。每次重试 stderr 一行 backoff + 提示。
 async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
     if !http_or_https_scheme(url) {
         return Err(anyhow!("fetch 仅支持 http/https URL（拒绝: {url}）"));
@@ -260,8 +318,46 @@ async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
             "fetch 仅支持 https：公网明文 http 已禁用（防降级与重定向 SSRF 中转）。--allow-private 仅放行内网 http，对公网地址无效；如该站有 https 地址请改用 https: {url}"
         ));
     }
-    let client = build_client(opts.proxy.as_deref(), allow, Duration::from_secs(FETCH_TIMEOUT_SECS))?;
+    // FixG10 J-1：--timeout 注入；clamp 上限 300s（防止误传 86400 把 fetch 跑挂）。
+    let timeout_secs = opts.timeout_secs.clamp(1, FETCH_TIMEOUT_MAX_SECS);
+    let retry = opts.retry.min(FETCH_RETRY_MAX);
+    let total_attempts = retry + 1; // 含首次 = retry+1 次
 
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..total_attempts {
+        if attempt > 0 {
+            // backoff：1s, 2s, 4s（第 N 次等待 2^(N-1) 秒）
+            let delay_secs = 1u64 << (attempt - 1);
+            // ponytail: backoff 写死 1s/2s/4s——任务约束第 N/总 N 次重试即可，更精细可改 jitter。
+            eprintln!(
+                "第 {attempt}/{total_attempts} 次重试（{delay_secs}s 后）: {url}"
+            );
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        }
+        match fetch_one_attempt(url, opts, timeout_secs, allow).await {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                let has_budget = attempt < total_attempts - 1;
+                if !should_retry(&msg, has_budget) {
+                    return Err(e);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("fetch 重试耗尽")))
+}
+
+/// 单次 fetch 尝试（不含重试 loop）：抓响应 → 提取 → 组装 Fetched。
+/// 拆出便于 J-1 重试 loop 包裹；其余逻辑（SSRF / scheme / Content-Type / 累积）保持不动。
+async fn fetch_one_attempt(
+    url: &str,
+    opts: &FetchOpts,
+    timeout_secs: u64,
+    allow: bool,
+) -> Result<FetchOne> {
+    let client = build_client(opts.proxy.as_deref(), allow, Duration::from_secs(timeout_secs))?;
     let resp = client
         .get(url)
         .send()
@@ -310,43 +406,77 @@ async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
         }
     }
     drop(stream);
-    let html = String::from_utf8_lossy(&buf).into_owned();
+    let mut html = String::from_utf8_lossy(&buf).into_owned();
+    let mut json_projected = false;
+    // FixG10 J-2：--json-keys 在 process_html 前投影——先把 body 按 JSONPath 缩成小子集，
+    // 再交给 cap_chars_json 走 brace 边界截断；不投影直接走 5000 字符截断会切到 JSON
+    // 中段变非法（crates.io API 实测 395KB categories 后 max_version 永远拿不到）。
+    // 仅非 HTML 且 body 是合法 JSON 时投影；HTML / 非 JSON / 路径错误走原路径。
+    if !is_html && !opts.json_keys.is_empty() {
+        match project_json_body(&html, &opts.json_keys) {
+            Ok(Some(projected)) => {
+                html = projected;
+                json_projected = true;
+            }
+            Ok(None) => {} // body 非 JSON 或路径无命中：原样保留，让 cap_chars_json 走兜底
+            Err(e) => {
+                // 投影失败：把错误绑进 Fetched（后续 meta.truncated_by_json_keys 用不上时也透出）
+                // 不强行报错——投影是 best-effort 加速，失败时退回到原始大文本。
+                eprintln!("--json-keys 投影失败（{e:#}）；按原始 body 走");
+            }
+        }
+    }
 
     let limit = opts.max_chars;
     let mut fetched = process_html(url, &html, is_html, limit);
+    fetched.truncated_by_json_keys = json_projected;
     fetched.github_comment_hint = github_thread_comment_gap(url);
     // xih：--markdown 在剥标签前的原始 HTML 上转换（保表格/标题/链接结构），text 字段换源；
     // 非 HTML（text/plain / JSON / md 源文）本就是文本，原样保留。
     if opts.markdown && is_html {
-        let (md, t, o) = cap_chars(&crate::convert::html_to_markdown(&html)?, limit);
+        let (md, t, o, off) = cap_chars(&crate::convert::html_to_markdown(&html)?, limit);
         fetched.text = md;
         fetched.truncated = t;
         fetched.omitted = o;
+        fetched.truncated_at_offset = t.then_some(off);
         fetched.markdown = true;
     }
     // --include：命中容器则用容器内 HTML 重新提取正文（title 仍取页面级）；未命中回退全文提取。
     if let Some(include) = &opts.include {
         fetched.include_hit = Some(false);
         if is_html
-            && let Some(inner) = extract_with_include(&html, include)?
+            && let Some((inner, hits)) = extract_with_include(&html, include)?
         {
             let raw = if opts.markdown {
                 crate::convert::html_to_markdown(&inner)?
             } else {
                 extract_text(&inner)
             };
-            let (text, t, o) = cap_chars(&raw, limit);
+            let (text, t, o, off) = cap_chars(&raw, limit);
             fetched = Fetched {
                 url: fetched.url,
                 title: fetched.title,
                 text,
                 truncated: t,
                 omitted: o,
+                truncated_at_offset: t.then_some(off),
                 include_hit: Some(true),
+                include_hits: Some(hits),
                 markdown: opts.markdown,
                 github_comment_hint: fetched.github_comment_hint,
+                anchor_crop_range: None,
+                truncated_by_json_keys: false,
             };
         }
+    }
+    // FixG10 L-2：URL `#N-M` 锚点裁剪——命中时按行号裁 text + 扩 pad 行上下文，meta 记实际范围。
+    // 必须在 cap_chars 之后（用最终 text 行号）且在 cap_chars_json 之前（裁后才做 cap；裁后短文无需 cap）。
+    if let Some((start, end)) = parse_anchor_range(url) {
+        let pad = opts.anchor_pad_lines;
+        let (cropped, actual) = crop_text_lines(&fetched.text, start, end, pad);
+        fetched.text = cropped;
+        fetched.anchor_crop_range = Some(actual);
+        // anchor crop 不引入新截断（crop 本身就是用户精确请求的子集）
     }
     // 字节上限触发的截断：meta.truncated=true；omitted 仅作下界（实际丢多少未知，至少 FETCH_BODY_LIMIT 已读）
     if truncated {
@@ -394,6 +524,19 @@ pub async fn cmd_fetch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> {
     let code = cmd_fetch_batch(urls, opts).await?;
     flush_stdout();
     Ok(code)
+}
+
+/// FixG10 J-2：把 body 按 --json-keys 路径投影成只含指定字段的 JSON。
+/// 返回 Ok(Some(投影后 JSON 串)) / Ok(None)（body 非 JSON 走原路径）/ Err（路径错误）。
+/// 失败不强行 bail——调用方按 best-effort 走 stderr 一行 + 原 body。
+fn project_json_body(body: &str, keys: &[String]) -> Result<Option<String>> {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    let projected = project_json_paths(&parsed, keys)?;
+    let serialized = serde_json::to_string(&projected).context("投影结果序列化失败")?;
+    Ok(Some(serialized))
 }
 
 /// P1 fetch redirect 0 字节修：stdout 在 redirect（`> file`）下走全缓冲而非
@@ -485,6 +628,9 @@ fn github_thread_comment_gap(url: &str) -> Option<String> {
 
 /// 单条 JSON 载荷（url/title/text/meta{truncated, omitted, content_untrusted}）。
 /// meta.include_hit 仅在用过 --include 时出现——不带 flag 的老输出结构不变。
+/// FixG10 J-2：非空 --json-keys 时顶层只保留指定字段并打 `meta.truncated_by_json_keys: true`；
+/// J-3：--include 多选器命中数写入 meta.include_hits；
+/// L-2：URL `#N-M` 锚点裁剪范围写入 meta.anchor_crop_range。
 fn fetched_json(f: &Fetched) -> serde_json::Value {
     let mut meta = serde_json::json!({
         "truncated": f.truncated,
@@ -494,12 +640,26 @@ fn fetched_json(f: &Fetched) -> serde_json::Value {
     if let Some(hit) = f.include_hit {
         meta["include_hit"] = serde_json::json!(hit);
     }
+    if let Some(n) = f.include_hits {
+        meta["include_hits"] = serde_json::json!(n);
+    }
     if f.markdown {
         meta["format"] = serde_json::json!("markdown");
     }
     if let Some(hint) = &f.github_comment_hint {
         meta["github_comments_missing"] = serde_json::json!(true);
         meta["github_comments_hint"] = serde_json::json!(hint);
+    }
+    if let Some((start, end)) = f.anchor_crop_range {
+        meta["anchor_crop_range"] = serde_json::json!([start, end]);
+    }
+    // FixG10 J-2：--json-keys 投影信号（仅用过 flag 才出键；默认输出结构不变）。
+    if f.truncated_by_json_keys {
+        meta["truncated_by_json_keys"] = serde_json::json!(true);
+    }
+    // 9jx：截断字节偏移（truncated=true 时填，缺席=未截断）。
+    if let Some(off) = f.truncated_at_offset {
+        meta["truncated_at_offset"] = serde_json::json!(off);
     }
     serde_json::json!({
         "url": f.url,
@@ -516,18 +676,143 @@ struct Fetched {
     text: String,
     truncated: bool,
     omitted: usize,
+    /// 9jx：截断点在源里的字节偏移（与 truncated/omitted 同语义——truncated=true 时才有值，
+    /// 缺席 = 未截断；与 read/browse 路径的 meta.truncated_at_offset 一致）。
+    truncated_at_offset: Option<usize>,
     /// --include 状态：None=未用 --include；Some(true)=selector 命中容器；Some(false)=未命中回退全文。
     include_hit: Option<bool>,
+    /// FixG10 J-3：--include 多选器累计命中容器数；未用 --include 时为 None（默认输出逐键不变）。
+    include_hits: Option<usize>,
     /// text 字段是否已是 markdown（--json 据此写 meta.format）。
     markdown: bool,
     /// GitHub issue/PR 页的评论区缺失信号（None = 非 thread 页，键缺席）。
     github_comment_hint: Option<String>,
+    /// FixG10 L-2：URL `#N-M` 锚点裁剪范围（1-based 行号，含端点）；未命中锚点 None。
+    anchor_crop_range: Option<(usize, usize)>,
+    /// FixG10 J-2：--json-keys 命中标记；true 时 meta.truncated_by_json_keys 出现。
+    truncated_by_json_keys: bool,
 }
 
 /// 单 URL fetch 结果：Done = 正文已提取；JsShell = JS 壳需渲染（单条 exit 1 / 批量记 error）。
 enum FetchOne {
     Done(Fetched),
     JsShell,
+}
+
+/// FixG10 L-2：从 URL fragment 提取 `#N-M` 行号范围。返回 (start, end) 1-based inclusive。
+/// 仅匹配纯数字范围形态（`#2709-2714` / `#2709`）；命名锚点 / 单行号（无范围）返回 None。
+/// 盲测九 L 实测 docs.rs 锚点形态：`https://docs.rs/.../de.rs.html#2709-2714`。
+fn parse_anchor_range(url: &str) -> Option<(usize, usize)> {
+    let hash = url.rfind('#')?;
+    let frag = &url[hash + 1..];
+    // 仅在 fragment 是 `N-M` 或 `N` 形态时尝试；其它字符（含命名锚点、混合）一律不裁剪
+    // （agent 用 fragment 命名锚点是另一类用法，不该误伤）。
+    let dash = frag.find('-')?;
+    let start_s = &frag[..dash];
+    let end_s = &frag[dash + 1..];
+    let start: usize = start_s.parse().ok()?;
+    let end: usize = end_s.parse().ok()?;
+    if start == 0 || end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// FixG10 L-2：按行号范围裁剪文本——保留 [start-pad, end+pad]（clamp 到文本边界）；
+/// 范围超过文本行数则裁到末尾。返回 (裁后文本, (实际起, 实际终))。
+/// pad=0 即严格端点；pad>0 给上下扩 N 行作为上下文（盲测九 L 上下 N 行作参考）。
+fn crop_text_lines(text: &str, start: usize, end: usize, pad: usize) -> (String, (usize, usize)) {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let total = lines.len();
+    let s0 = start.saturating_sub(1 + pad); // 1-based → 0-based，再扣 pad
+    let s1 = (end + pad).min(total);
+    if s0 >= total {
+        return (String::new(), (start.min(total), end.min(total)));
+    }
+    let actual_start = s0 + 1; // 回 1-based 给 meta 标注
+    let actual_end = s1;
+    (lines[s0..s1].join("\n"), (actual_start, actual_end))
+}
+
+/// FixG10 J-2：JSONPath 风格路径解析 + 投影。
+/// 支持 `.field` 段与 `[N]` 段（数组下标），不支持复杂查询（递归 `..` / 通配符 / 过滤）。
+/// 解析失败 → 整体失败（Err），不静默吞掉（agent 拼错了要报错）。
+/// 空 paths → 原样返回（不做投影）。
+fn project_json_paths(v: &serde_json::Value, paths: &[String]) -> Result<serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for path in paths {
+        let segments = parse_json_path(path)?;
+        let cur = v;
+        let mut node: &serde_json::Value = cur;
+        for seg in &segments {
+            node = match seg {
+                Segment::Field(name) => node.get(name).ok_or_else(|| {
+                    anyhow!("json-keys 路径无此字段: {path:?}（在 {name:?} 处失败）")
+                })?,
+                Segment::Index(i) => node.get(*i).ok_or_else(|| {
+                    anyhow!("json-keys 数组下标越界: {path:?}（[{i}] 失败）")
+                })?,
+            };
+        }
+        // 把路径末段名作为 key（数组下标则用 `[N]` 形态）
+        let key = match segments.last().expect("至少一段") {
+            Segment::Field(n) => n.clone(),
+            Segment::Index(i) => format!("[{i}]"),
+        };
+        out.insert(key, node.clone());
+    }
+    Ok(serde_json::Value::Object(out))
+}
+
+enum Segment {
+    Field(String),
+    Index(usize),
+}
+
+/// 解析 `crate.max_version` / `.crate.max_version` / `[0]` / `versions[5].tag` 等形态。
+/// 顶段 `.field` / `[N]` / 裸字段名均可；空段 / 不支持语法 → Err。
+fn parse_json_path(path: &str) -> Result<Vec<Segment>> {
+    let mut segs: Vec<Segment> = Vec::new();
+    let mut s = path.trim();
+    if s.is_empty() {
+        anyhow::bail!("json-keys 路径不能为空");
+    }
+    // 主循环：每轮处理一段（首段允许裸字段名，无 `.` 前缀；后续段必须有 `.` / `[` 前缀）。
+    loop {
+        if s.starts_with('[') {
+            let close = s[1..].find(']').map(|c| c + 1)
+                .ok_or_else(|| anyhow!("json-keys 路径 `[` 未闭合: {path:?}"))?;
+            let n: usize = s[1..close].parse()
+                .map_err(|_| anyhow!("json-keys 数组下标必须为非负整数: {path:?}"))?;
+            segs.push(Segment::Index(n));
+            s = &s[close + 1..];
+        } else {
+            // 字段段：剥前导 `.`（首段可省略），字段名到下一个 `.` / `[` / 末尾
+            let after_dot = s.strip_prefix('.');
+            let (rest, required_dot) = match after_dot {
+                Some(r) => (r, true),
+                None => {
+                    if !segs.is_empty() {
+                        anyhow::bail!("json-keys 路径段必须以 `.` 或 `[` 起首: {path:?}");
+                    }
+                    (s, false)
+                }
+            };
+            let end = rest.find(['.', '[']).unwrap_or(rest.len());
+            let name = &rest[..end];
+            if name.is_empty() {
+                if required_dot {
+                    anyhow::bail!("json-keys 路径空字段段（连续 `.`）: {path:?}");
+                }
+                anyhow::bail!("json-keys 路径首段字段名为空: {path:?}");
+            }
+            segs.push(Segment::Field(name.to_string()));
+            s = &rest[end..];
+        }
+        if s.is_empty() {
+            return Ok(segs);
+        }
+    }
 }
 
 /// 纯函数：html → 提取 + 截断（limit 注入，离线单测不碰配置）。
@@ -545,8 +830,21 @@ fn process_html(url: &str, html: &str, is_html: bool, limit: usize) -> Fetched {
     // P1 fetch JSON 截断修复：GitHub API 等 JSON 源按字节截断会出半截 JSON，
     // json.loads 直接 UnclosedBraceError（G 盲测八实锤）。检测文本以 `{`/`[`
     // 开头 → 截断时回退到最后一个完整 `}`/`]` 边界；非 JSON 形态走原 cap_chars。
-    let (text, truncated, omitted) = cap_chars_json(&raw, limit);
-    Fetched { url: url.to_string(), title, text, truncated, omitted, include_hit: None, markdown: false, github_comment_hint: None }
+    let (text, truncated, omitted, off) = cap_chars_json(&raw, limit);
+    Fetched {
+        url: url.to_string(),
+        title,
+        text,
+        truncated,
+        omitted,
+        truncated_at_offset: truncated.then_some(off),
+        include_hit: None,
+        include_hits: None,
+        markdown: false,
+        github_comment_hint: None,
+        anchor_crop_range: None,
+        truncated_by_json_keys: false,
+    }
 }
 
 /// JS 壳判定：正文 < 500 字符 **且** html 含 SPA 挂载点标记（root/app/__next 等）。
@@ -637,20 +935,26 @@ fn collapse_blank(s: String) -> String {
     out.trim().to_string()
 }
 
-/// --include：逗号分隔 selector 依序试（scraper 解析），返回首个命中元素的 inner_html；全未命中 → None。
+/// --include：逗号分隔 selector 依序试（scraper 解析），FixG10 J-3 累加所有命中容器（多选器全要），
+/// 返回 (拼接后的 inner_html, 命中数)；全未命中 → (None, 0)。命中容器间以 `\n\n---\n\n` 分隔，
+/// 让 agent 能识别不同 selector 块的边界。
 /// selector 语法错误 → Err：用户显式输入拼错了要报错，静默跳过会伪装成"未命中回退全文"。
-fn extract_with_include(html: &str, include: &str) -> Result<Option<String>> {
+fn extract_with_include(html: &str, include: &str) -> Result<Option<(String, usize)>> {
     let doc = Html::parse_document(html);
+    let mut collected: Vec<String> = Vec::new();
     for sel in include.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         // day：scraper 的 Display 泄漏内部变体名（EmptySelector/Please report...），映射成用户可操作的文案
         let selector = Selector::parse(sel).map_err(|_| {
             anyhow!("CSS selector 无效: {sel:?}（语法错误，应为合法 CSS 选择器如 \"#main, article\"）")
         })?;
-        if let Some(el) = doc.select(&selector).next() {
-            return Ok(Some(el.inner_html()));
+        for el in doc.select(&selector) {
+            collected.push(el.inner_html());
         }
     }
-    Ok(None)
+    if collected.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((collected.join("\n\n---\n\n"), collected.len())))
 }
 
 #[cfg(test)]
@@ -662,14 +966,42 @@ mod tests {
     fn extract_with_include_hits_and_falls_back() {
         let html = "<html><head><title>T</title></head><body>\
                     <nav>菜单 链接</nav><main><h1>正文标题</h1><p>第一段</p></main></body></html>";
-        // article 不存在 → 依序命中 main：只取容器内正文
-        let got = extract_with_include(html, "article,main").unwrap().unwrap();
+        // article 不存在 → main 命中容器：只取容器内正文
+        let (got, hits) = extract_with_include(html, "article,main").unwrap().unwrap();
+        assert_eq!(hits, 1, "article 不存在、main 命中 1 个");
         assert!(got.contains("正文标题") && got.contains("第一段"), "got: {got}");
         assert!(!got.contains("菜单"), "nav 内容不应混入: {got}");
-        // 全未命中 → None（调用方回退全文）
+        // 全未命中 → None
         assert!(extract_with_include(html, "article,aside").unwrap().is_none());
         // selector 语法错误 → Err（不伪装成"未命中"）
         assert!(extract_with_include(html, "main[").is_err());
+    }
+
+    /// FixG10 J-3：--include 多选器累加——同一 selector 多个命中按文档序拼接，不同 selector 也累加，
+    /// 命中容器间以 `\n\n---\n\n` 分隔。盲测九 J 实测：releases 列表页 `.release-entry` 仅取首个断章。
+    #[test]
+    fn extract_with_include_multi_selector_accumulates() {
+        // 多 release entries + nav：nav 不会被命中、3 个 release 全部进入 text
+        let html = "<html><body><nav>菜单</nav>\
+                    <section class='release-entry'><h2>1.5.0</h2><p>首次发布</p></section>\
+                    <section class='release-entry'><h2>1.4.0</h2><p>上一个版本</p></section>\
+                    <section class='release-entry'><h2>1.3.0</h2><p>远古版本</p></section>\
+                    </body></html>";
+        let (got, hits) = extract_with_include(html, ".release-entry").unwrap().unwrap();
+        assert_eq!(hits, 3, "3 个 release entries 应全部命中: got_hits={hits}");
+        assert!(got.contains("1.5.0") && got.contains("1.4.0") && got.contains("1.3.0"), "got: {got}");
+        assert!(!got.contains("菜单"), "nav 不应混入: {got}");
+        // 拼接分隔符：让 agent 能识别 selector 块边界
+        assert!(got.contains("\n\n---\n\n"), "多命中应加分隔符: {got}");
+        // 跨 selector 累加：releases + markdown-body 都命中，拼接成两段
+        let html2 = "<html><body>\
+                     <article class='markdown-body'>正文</article>\
+                     <section class='release-entry'><h2>1.0.0</h2></section>\
+                     <section class='release-entry'><h2>0.9.0</h2></section>\
+                     </body></html>";
+        let (got2, hits2) = extract_with_include(html2, ".markdown-body,.release-entry").unwrap().unwrap();
+        assert_eq!(hits2, 3, "1 markdown-body + 2 release-entry");
+        assert!(got2.contains("正文") && got2.contains("1.0.0") && got2.contains("0.9.0"));
     }
 
     /// extract_text：script/style 连内容删除、标签剥壳、块级换行、空白规整。
@@ -970,17 +1302,186 @@ mod tests {
             text: "body".into(),
             truncated: false,
             omitted: 0,
+            truncated_at_offset: None,
             include_hit: None,
+            include_hits: None,
             markdown: false,
             github_comment_hint: github_thread_comment_gap("https://github.com/tokio-rs/tokio/issues/7787"),
+            anchor_crop_range: None,
+            truncated_by_json_keys: false,
         };
         let v = fetched_json(&f);
         assert_eq!(v["meta"]["github_comments_missing"], serde_json::json!(true));
         assert!(v["meta"]["github_comments_hint"].as_str().unwrap().contains("api.github.com"));
 
-        let f2 = Fetched { url: "https://e.test/".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, include_hit: None, markdown: false, github_comment_hint: None };
+        let f2 = Fetched { url: "https://e.test/".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false };
         let v2 = fetched_json(&f2);
         assert!(v2["meta"].get("github_comments_missing").is_none(), "非 thread 页不得出键");
         assert!(v2["meta"].get("github_comments_hint").is_none());
+    }
+
+    /// FixG10 J-2：truncated_by_json_keys=true 时 meta 出键；默认输出结构不变。
+    #[test]
+    fn fetched_json_truncated_by_json_keys_flag() {
+        // true：键出
+        let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: true };
+        let v = fetched_json(&f);
+        assert_eq!(v["meta"]["truncated_by_json_keys"], serde_json::json!(true));
+        // false：键缺席
+        let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false };
+        let v2 = fetched_json(&f2);
+        assert!(v2["meta"].get("truncated_by_json_keys").is_none(), "默认不得出键");
+    }
+
+    /// 9jx：fetch meta.truncated_at_offset——truncated=true 时出键且值非零，None 时键缺席。
+    /// 与 read/browse 路径同契约（缺席 = 未截断，offset 是 cap_chars 返回的截断字节位置）。
+    #[test]
+    fn fetched_json_truncated_at_offset_emits_when_truncated() {
+        // truncated=true + Some(off) → meta 出键
+        let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: true, omitted: 100, truncated_at_offset: Some(3000), include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false };
+        let v = fetched_json(&f);
+        assert_eq!(v["meta"]["truncated_at_offset"], serde_json::json!(3000));
+        // truncated=true + None → 键缺席（不与 truncated 键语义重叠）
+        let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: true, omitted: 100, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false };
+        let v2 = fetched_json(&f2);
+        assert!(v2["meta"].get("truncated_at_offset").is_none());
+        // truncated=false → 键缺席
+        let f3 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false };
+        let v3 = fetched_json(&f3);
+        assert!(v3["meta"].get("truncated_at_offset").is_none());
+    }
+
+    /// 9jx：cap_chars 触发的 truncated_at_offset 真实流转——process_html 走 cap_chars_json
+    /// 路径，超限时 Fetched.truncated_at_offset 应为 Some(non-zero)。
+    #[test]
+    fn process_html_threads_truncated_at_offset() {
+        // JSON 源：超限 → cap_chars_json 走 brace 边界回退；offset 应等于截后文本字节长度
+        let long_json = r#"{"items":[1,2,3,4,5,6,7,8,9,10],"junk":"x"}"#;
+        let f = process_html("https://e.test/a", long_json, false, 8);
+        assert!(f.truncated, "应被 cap_chars_json 截断");
+        let off = f.truncated_at_offset.expect("truncated=true 时 truncated_at_offset 应为 Some");
+        assert!(off > 0, "offset 必须非零: {off}");
+        // HTML 源：超限 → cap_chars_json 走非 JSON 兜底（仍以 `{` 起首但不裁 brace）走硬截，
+        // offset 仍非零
+        let html = "<html><body><p>一段很长的中文文本用于触发 cap_chars 截断。".repeat(50)
+            + "</p></body></html>";
+        let f2 = process_html("https://e.test/b", &html, true, 30);
+        assert!(f2.truncated);
+        assert!(f2.truncated_at_offset.is_some());
+    }
+
+    /// FixG10 J-2：project_json_body 投影 raw body；非 JSON 静默返回 None。
+    #[test]
+    fn project_json_body_returns_projection_or_none() {
+        // 命中：投影
+        let body = r#"{"crate":{"max_version":"1.40.0","max_stable_version":"1.39.2","junk":[1,2,3]}}"#;
+        let out = project_json_body(body, &["crate.max_stable_version".into()]).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["max_stable_version"], serde_json::json!("1.39.2"));
+        // 非 JSON：None
+        let out2 = project_json_body("<html>not json</html>", &["crate.max_stable_version".into()]).unwrap();
+        assert!(out2.is_none());
+        // 路径错误：Err（best-effort 由调用方打 stderr）
+        assert!(project_json_body(body, &["crate.nonexistent".into()]).is_err());
+    }
+
+    /// FixG10 L-2：parse_anchor_range 解析 URL `#N-M` 数字范围；命名锚点 / 单值无 `-` / 颠倒起终 → None。
+    #[test]
+    fn parse_anchor_range_handles_numeric_range_only() {
+        // 命中
+        assert_eq!(parse_anchor_range("https://docs.rs/x/y.html#2709-2714"), Some((2709, 2714)));
+        assert_eq!(parse_anchor_range("https://docs.rs/x/y.html#1-1"), Some((1, 1)));
+        // 颠倒起终（end < start）→ None
+        assert_eq!(parse_anchor_range("https://docs.rs/x.html#10-5"), None);
+        // 无 anchor
+        assert_eq!(parse_anchor_range("https://docs.rs/x/y.html"), None);
+        // 命名锚点（如 GitHub 主题 #foo）→ None（不该误伤）
+        assert_eq!(parse_anchor_range("https://github.com/o/r/issues/1#issuecomment-123"), None);
+        // 起 0 → None（行号 1-based）
+        assert_eq!(parse_anchor_range("https://x.com/y#0-5"), None);
+    }
+
+    /// FixG10 L-2：crop_text_lines 按 1-based 范围裁切 + pad 上下文。
+    #[test]
+    fn crop_text_lines_crops_with_padding() {
+        let text = "a\nb\nc\nd\ne\nf\ng"; // 7 行
+        // pad=0：第 3-4 行精确取
+        let (crop, range) = crop_text_lines(text, 3, 4, 0);
+        assert_eq!(crop, "c\nd");
+        assert_eq!(range, (3, 4));
+        // pad=1：扩上下 1 行（2-5）
+        let (crop, range) = crop_text_lines(text, 3, 4, 1);
+        assert_eq!(crop, "b\nc\nd\ne");
+        assert_eq!(range, (2, 5));
+        // 越界：end 超过总行数 → 截到末尾
+        let (crop, range) = crop_text_lines(text, 5, 100, 0);
+        assert_eq!(crop, "e\nf\ng");
+        assert_eq!(range, (5, 7));
+        // 起始越界：start 超过总行数 → 空
+        let (crop, _range) = crop_text_lines(text, 100, 200, 0);
+        assert!(crop.is_empty());
+    }
+
+    /// FixG10 J-2：project_json_paths 投影到指定字段；支持 .field 与 [N]；路径错误 Err。
+    #[test]
+    fn project_json_paths_filters_to_selected_fields() {
+        let payload = serde_json::json!({
+            "crate": {
+                "max_version": "1.40.0",
+                "max_stable_version": "1.39.2",
+                "newest_version": "1.40.0",
+                "categories": ["a","b","c","d","e","f","g","h","i","j"],
+                "downloads": 99999999,
+            },
+            "versions": [
+                {"num": "1.39.2", "yanked": false},
+                {"num": "1.39.1", "yanked": true},
+            ],
+        });
+        // 裸首段（无前导 .）：合法
+        let out = project_json_paths(&payload, &["crate.max_stable_version".into()]).unwrap();
+        assert_eq!(out["max_stable_version"], serde_json::json!("1.39.2"));
+        assert_eq!(out.as_object().unwrap().len(), 1);
+        // 多字段 + 数组下标
+        let out = project_json_paths(&payload, &["crate.max_version".into(), "versions[0].num".into()]).unwrap();
+        assert_eq!(out["max_version"], serde_json::json!("1.40.0"));
+        // versions[0].num 的末段是 Field("num") → key 名为 "num"
+        assert_eq!(out["num"], serde_json::json!("1.39.2"));
+        // 仅数组下标（直接 `[0]`）→ key 用 `[0]` 形态
+        let out2 = project_json_paths(&payload, &["versions[0]".into()]).unwrap();
+        assert_eq!(out2["[0]"], serde_json::json!({"num": "1.39.2", "yanked": false}));
+        // 字段不存在 → Err（不静默吞掉）
+        assert!(project_json_paths(&payload, &["crate.nonexistent".into()]).is_err());
+        // 数组下标越界 → Err
+        assert!(project_json_paths(&payload, &["versions[99].num".into()]).is_err());
+        // 前导 . 形式仍兼容
+        let out3 = project_json_paths(&payload, &[".crate.max_version".into()]).unwrap();
+        assert_eq!(out3["max_version"], serde_json::json!("1.40.0"));
+    }
+
+    /// FixG10 J-1：should_retry 决策矩阵——确定性错误 / 4xx / 5xx / 网络错 / budget 用尽。
+    #[test]
+    fn should_retry_decision_matrix() {
+        // 确定性错误（私网门拒）：不重试
+        assert!(!should_retry("fetch 拒绝私网地址", true));
+        assert!(!should_retry("fetch 仅支持 https", true));
+        assert!(!should_retry("PDF 二进制内容", true));
+        assert!(!should_retry("二进制内容", true));
+        // 4xx 客户端错（除 408/429）：不重试
+        assert!(!should_retry("HTTP 404 Not Found", true));
+        assert!(!should_retry("HTTP 403 Forbidden", true));
+        // 4xx 但 408/429：仍可重试
+        assert!(should_retry("HTTP 408 Request Timeout", true));
+        assert!(should_retry("HTTP 429 Too Many Requests", true));
+        // 5xx：重试
+        assert!(should_retry("HTTP 502 Bad Gateway", true));
+        assert!(should_retry("HTTP 503 Service Unavailable", true));
+        assert!(should_retry("HTTP 504 Gateway Timeout", true));
+        // 网络错（无 HTTP 字样）：重试
+        assert!(should_retry("请求失败: connection refused", true));
+        assert!(should_retry("error sending request", true));
+        // budget 用尽：不重试
+        assert!(!should_retry("HTTP 503 Service Unavailable", false));
+        assert!(!should_retry("请求失败: timeout", false));
     }
 }
