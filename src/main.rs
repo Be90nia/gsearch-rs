@@ -189,7 +189,7 @@ enum Command {
     Fetch {
         #[arg(required = true, num_args = 1..)]
         url: Vec<String>,
-        /// 逗号分隔 CSS selector（如 "main,article"）：FixG10 J-3 多选器累加——所有命中容器
+        /// 逗号分隔 CSS selector（如 "main,article"）：所有命中容器的正文都保留——
         /// inner_html 用 `\n\n---\n\n` 拼接；未命中回退全文提取，--json 在 meta.include_hit=false 标注。
         #[arg(long)]
         include: Option<String>,
@@ -210,16 +210,17 @@ enum Command {
         /// 正文字符预算（text 字段上限；超限截断并在 meta.truncated/omitted 如实标注）。
         #[arg(long, default_value_t = 50_000, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=10_000_000))]
         max_chars: usize,
-        /// FixG10 J-1：单请求超时（秒）；默认 10、范围 1..=300。
-        /// 用于 GitHub 抖动下给单 URL 留更长的握手/读体窗口；与 --retry 配合使用。
-        #[arg(long, default_value_t = 10, value_parser = clap::builder::RangedI64ValueParser::<u64>::from(1..=300))]
+        /// 单请求超时（秒）；默认 30、范围 1..=300。
+        /// 慢站（如 GitHub 偶发握手慢）给单 URL 留更长的握手/读体窗口；与 --retry 配合使用。
+        #[arg(long, default_value_t = 30, value_parser = clap::builder::RangedI64ValueParser::<u64>::from(1..=300))]
         timeout: u64,
-        /// FixG10 J-1：失败重试次数（不含首次）；默认 0 = 不重试（行为不变）；范围 0..=3。
+        /// 失败重试次数（不含首次）；默认 1、范围 0..=3。
         /// backoff 1s/2s/4s（第 N 次重试前等 2^(N-1) 秒）；stderr 一行「第 N/总 N 次重试」提示。
-        /// 私网门拒 / scheme 错 / PDF 等确定性错误不重试；HTTP 4xx（除 408/429）不重试。
-        #[arg(long, default_value_t = 0, value_parser = clap::builder::RangedI64ValueParser::<u32>::from(0..=3))]
+        /// 私网门拒 / scheme 错 / PDF 等确定性错误不重试；HTTP 4xx（除 408/429）也不重试——客户端错不会因等待修复。
+        /// 默认 1 次：网络抖动一次自愈；确定性错误即使重试也会立即短路，无副作用。
+        #[arg(long, default_value_t = 1, value_parser = clap::builder::RangedI64ValueParser::<u32>::from(0..=3))]
         retry: u32,
-        /// FixG10 J-2：JSONPath 投影（逗号分隔多路径）——text 为 JSON 时只保留指定字段。
+        /// JSONPath 投影（逗号分隔多路径）——text 为 JSON 时只保留指定字段。
         /// 例：`--json-keys "crate.max_version,crate.max_stable_version"` 命中后 text 换源为
         /// `{"max_version":"...","max_stable_version":"..."}`，meta.truncated_by_json_keys=true。
         /// text 非 JSON 时静默跳过（不动 text）。
@@ -256,13 +257,12 @@ struct SearchArgs {
     /// `site:` 等查询语法原样透传，无专属参数。
     #[arg(long, value_enum)]
     recency: Option<RecencyArg>,
-    /// `--read N`（FixG10 L-1）：从搜索结果中只取前 N 条的 snippet 进输出（纯 HTTP 路径，不启动浏览器）。
-    /// 原 `--read N` 的"启动 Chrome 读网页正文"语义改名为 `--browse N`；本 flag 不触发浏览器、纯 snippet。
-    /// 与 `--open / --dl / --browse` 互斥（clap group "post"）；1..——0 视为非法。
+    /// `--read N`：从搜索结果中只取前 N 条的 snippet 进输出（纯 HTTP 路径，不启动浏览器）。
+    /// "启动 Chrome 读网页正文"的语义在 `--browse N`；本 flag 不触发浏览器、纯 snippet。
+    /// 与 `--open / --dl / --browse` 互斥；1..——0 视为非法。
     #[arg(long, group = "post", value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..))]
     read: Option<usize>,
-    /// `--browse N`（FixG10 L-1：原 `--read N` 启浏览器读网页正文的语义改名到此）：
-    /// 用 Chrome 渲染前 N 条结果的 URL、取页面正文（AdaptiveRead），仍走浏览器 launch 链。
+    /// `--browse N`：用 Chrome 渲染前 N 条结果的 URL、取页面正文（AdaptiveRead）。
     /// 与 `--open / --dl / --read` 互斥；1..。
     #[arg(long, group = "post", value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..))]
     browse: Option<usize>,
@@ -271,8 +271,8 @@ struct SearchArgs {
     #[arg(long, group = "post")]
     open: Option<usize>,
     /// 跳过搜索前的 warmup（Wikipedia/GitHub/HN 随机访问 + 滚动）+ 指纹补丁。
-    /// isatty 自动档（盲测六拍板）：stdout 是 TTY（人）默认开；管道/agent 调用默认关（快档，
-    /// 实测省 80s+）。显式 --humanize / --no-humanize 恒覆盖自动档。
+    /// isatty 自动档：stdout 是 TTY（人）默认开；管道/agent 调用默认关（快档，实测省 80s+）。
+    /// 显式 --humanize / --no-humanize 恒覆盖自动档。
     #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "no_humanize")]
     humanize: bool,
     /// 显式关闭 humanize（覆盖 TTY 自动档；管道/agent 调用自动档已是关，通常无需传）。
@@ -1689,12 +1689,14 @@ mod tests {
         assert!(Cli::try_parse_from(["gsearch", "similar"]).is_err());
     }
 
-    /// help 文本不得泄漏内部 issue 代号（盲测七受试者可见 cxa/l6o/3gw/M9/6dp）。
-    /// 渲染顶层级与全部子命令 help，断言已知代号零命中；泄漏时报出具体行便于定位。
+    /// help 文本不得泄漏内部代号与开发史术语。两层守门：
+    /// ① 已知内部短码（历史盲测受试者可见的 cxa/l6o/3gw 等）；
+    /// ② 开发史术语模式：FixG\d+、盲测+序号（阿拉伯或中文数字）、[JKLM]-\d、P0-\d。
+    /// 渲染顶层级与全部子命令 help，泄漏时报出具体行便于定位。
     #[test]
     fn help_text_free_of_internal_issue_codes() {
         use clap::CommandFactory;
-        let codes = [
+        const CODES: [&str; 19] = [
             "cxa", "l6o", "3gw", "M9", "6dp", "n76", "xih", "pkp", "kda", "dsg",
             "nx4", "e1i", "cw8", "fve", "e7c", "q34", "i9a", "745", "ptb",
         ];
@@ -1704,22 +1706,65 @@ mod tests {
             texts.push(sub.render_help().to_string());
         }
         for text in &texts {
-            for code in codes {
-                let leak = text.lines().find(|l| l.contains(code));
-                assert!(leak.is_none(), "help 泄漏内部代号 {code}: {:?}", leak);
+            for line in text.lines() {
+                let kind = CODES.iter().find(|c| line.contains(*c)).map(|_| "内部短码")
+                    .or_else(|| help_jargon_kind(line));
+                assert!(kind.is_none(), "help 泄漏内部行话({kind:?}): {line}");
             }
         }
+    }
+
+    /// 开发史术语模式检测（守门测试辅助）。逐字节窗口扫描，不引 regex 依赖。
+    /// 返回 Some(类别) = 命中行话；None = 干净。
+    fn help_jargon_kind(line: &str) -> Option<&'static str> {
+        const CN_NUMERALS: [char; 10] = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
+        let b = line.as_bytes();
+        // FixG\d+
+        if b.len() >= 5 {
+            for w in b.windows(5) {
+                if &w[..4] == b"FixG" && w[4].is_ascii_digit() {
+                    return Some("FixG<N> 行话");
+                }
+            }
+        }
+        // P0-\d
+        if b.len() >= 4 {
+            for w in b.windows(4) {
+                if &w[..3] == b"P0-" && w[3].is_ascii_digit() {
+                    return Some("P0-<N> 行话");
+                }
+            }
+        }
+        // [JKLM]-\d
+        if b.len() >= 3 {
+            for w in b.windows(3) {
+                if matches!(w[0], b'J' | b'K' | b'L' | b'M') && w[1] == b'-' && w[2].is_ascii_digit() {
+                    return Some("[JKLM]-<N> 行话");
+                }
+            }
+        }
+        // 盲测+序号（阿拉伯或中文数字）
+        let mut rest = line;
+        while let Some(i) = rest.find("盲测") {
+            if let Some(c) = rest[i + "盲测".len()..].chars().next()
+                && (c.is_ascii_digit() || CN_NUMERALS.contains(&c))
+            {
+                return Some("盲测<N> 行话");
+            }
+            rest = &rest[i + "盲测".len()..];
+        }
+        None
     }
 
     /// FixG10 J-1/J-2：fetch 新 flag 解析——--timeout 1..=300、--retry 0..=3、--json-keys 逗号分隔。
     /// FixG10 L-1：fetch 命令解析不挂 --read/--browse（那是 search 的 flag）。
     #[test]
     fn fetch_new_flags_parse_with_ranges() {
-        // --timeout 默认 10、范围 1..=300
+        // FixG11：--timeout 默认 30、--retry 默认 1（盲测十 P0-3：GitHub 抖动自愈）
         let cli = Cli::try_parse_from(["gsearch", "fetch", "https://e.test/"]).unwrap();
         let Command::Fetch { timeout, retry, json_keys, .. } = cli.cmd else { panic!("expected fetch") };
-        assert_eq!(timeout, 10, "默认 timeout 10");
-        assert_eq!(retry, 0, "默认 retry 0");
+        assert_eq!(timeout, 30, "默认 timeout 30");
+        assert_eq!(retry, 1, "默认 retry 1");
         assert!(json_keys.is_empty(), "默认 json-keys 空");
         // --timeout 30 + --retry 2 命中
         let cli = Cli::try_parse_from(["gsearch", "fetch", "https://e.test/", "--timeout", "30", "--retry", "2"]).unwrap();
