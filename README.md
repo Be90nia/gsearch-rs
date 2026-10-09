@@ -115,7 +115,8 @@ gsearch fetch --json-keys "crate.max_version,crate.max_stable_version" \
 - **批量**：多位置参数并发抓取，默认 JSON 裸数组（元素含 `url/title/text/meta/status`，单条失败 `status=private_blocked|error` 不阻塞其他）；退出码 `0` 全成功 / `1` 部分失败 / `2` 全失败；每条 URL 独立过私网门
 - **`--include <selector>`**（J-3 多选器累加）：逗号分隔 CSS selector，**所有命中容器**的 `inner_html` 用 `\n\n---\n\n` 拼接；命中时跳过 JS 壳判定，`meta.include_hit=true` + `meta.include_hits=N`（命中数）；未命中回退全文并打 `meta.include_hit=false`。selector 语法错直接 Err（不伪装成"未命中"）
 - **`--max-chars <N>`（默认 50000）**：`text` 字段字符预算——超限截断并在 `meta.truncated=true` / `meta.omitted` 如实标注（n76：大页面是 token 放血口，agent 按预算取数）
-- **`--timeout <secs>`（默认 10，范围 1..=300）+ `--retry <n>`（默认 0，范围 0..=3）**：J-1 GitHub 抖动下给握手留更长窗口；失败时 backoff 1s/2s/4s 重试，stderr 一行 `第 N/总 N 次重试（Xs 后）: <url>`。确定性错误（私网门拒 / scheme / PDF / 二进制）不重试；HTTP 4xx（除 408/429）也不重试——客户端错不会因等待修复
+- **`--timeout <secs>`（FixG11 默认 30，范围 1..=300）+ `--retry <n>`（FixG11 默认 1，范围 0..=3）**：J-1 GitHub 抖动下给握手留更长窗口；失败时 backoff 1s/2s/4s 重试，stderr 一行 `第 N/总 N 次重试（Xs 后）: <url>`。确定性错误（私网门拒 / scheme / PDF / 二进制）不重试；HTTP 4xx（除 408/429）也不重试——客户端错不会因等待修复。FixG11 把默认 10s/0 改成 30s/1：盲测十 P0-3 实测 GitHub .diff / tag 页偶发握手失败吃满 10s 才退，1 次重试对真错误零影响
+- **host 级默认 include**（FixG11）：未传 `--include` 时按 host 自动路由——`github.com` 走 skeleton 容器优先级链 + nav 剥离（命中后 `meta.auto_include_applied="github"`），`docs.rs` 走 `<main>`（命中后 `meta.auto_include_applied="docs.rs"`）。用户显式 `--include "..."` 时 host 路由不覆盖；host 未命中 / 容器未匹配 → 退回 process_html 默认提取，`auto_include_applied` 键缺席
 - **`--json-keys <paths>`（逗号分隔多路径）**：J-2 JSONPath 投影——body 是 JSON 时按 `.field` / `[N]` 路径缩成只含指定字段的子集（典型场景：crates.io API 的 5KB `categories` 后藏 `max_version`，不投影会被字符预算截掉）。`meta.truncated_by_json_keys=true` 标注；body 非 JSON 或路径错误静默走原路径（投影失败 stderr 一行提示后保留原 body）
 - **URL `#N-M` 锚点裁剪**（L-2）：URL 含纯数字行号范围时，`text` 字段裁到 `[start, end]`（1-based 含端点），`meta.anchor_crop_range=[actual_start, actual_end]` 标注实际裁到的行号范围；命名锚点 / 单行号 / 颠倒起终不裁剪（不误伤 GitHub `#issuecomment-` 等命名锚点 URL）
 

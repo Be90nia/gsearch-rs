@@ -19,7 +19,8 @@ use scraper::{Html, Node, Selector};
 
 use crate::postproc::{cap_chars, cap_chars_json};
 
-/// fetch 总超时默认（FixG10 J-1：--timeout 默认值，封装在 FetchOpts::default，便于 main 复用）。
+/// fetch 总超时默认（FixG10 J-1 + FixG11：--timeout 默认值封装在 FetchOpts::default，便于 main 复用；
+/// FixG11 把 10s→30s 给 GitHub 抖动自愈留余量）。
 /// JS 壳判定阈值：剥标签后正文低于此字符数 → 大概率是渲染型页面。
 const SHELL_MIN_CHARS: usize = 500;
 /// redirect 跟随上限（reqwest 默认同款，显式声明防歧义）。
@@ -51,10 +52,14 @@ pub struct FetchOpts {
     pub markdown: bool,
     /// 正文字符预算（text 上限；超限截断，meta.truncated/omitted 如实标注）。CLI 默认 50000。
     pub max_chars: usize,
-    /// FixG10 J-1：单请求超时（秒）；默认 10（与 FetchOpts::default 行为一致）；CLI 默认 10，范围 1..=300。
+    /// FixG10 J-1 + FixG11：单请求超时（秒）；CLI 默认 30（盲测十 P0-3 GitHub 抖动自愈），
+    /// 范围 1..=300。改默认是 breaking：理由是 GitHub .diff / tag 页偶发握手失败吃满 10s 才退，
+    /// 真实场景 fetch 公网静态页几乎不会真有 30s 慢响应——放宽预算换抖动自愈。
     pub timeout_secs: u64,
-    /// FixG10 J-1：失败重试次数（不含首次）；默认 0 = 不重试（行为不变）；CLI 默认 0，范围 0..=3。
-    /// backoff：1s, 2s, 4s（第 N 次等待 2^(N-1) 秒）。每次重试 stderr 一行提示「第 N/总 N 次重试」。
+    /// FixG10 J-1 + FixG11：失败重试次数（不含首次）；CLI 默认 1（盲测十 P0-3 公网抖动 1 次自愈），
+    /// 范围 0..=3。backoff：1s, 2s, 4s（第 N 次等待 2^(N-1) 秒）。每次重试 stderr 一行提示。
+    /// 改默认是 breaking：旧默认 0 等价「失败立即返回」——用户首次碰到 GitHub 5xx 必挂，
+    /// 1 次重试 + 抖动 1s 几乎无感（确定性错误私网门拒 / scheme / PDF / 二进制仍不重试）。
     pub retry: u32,
     /// FixG10 J-2：JSONPath 投影（例：`.crate.max_version,.crate.max_stable_version`）；
     /// 非空时 `--json` 输出只保留指定字段并打 `meta.truncated_by_json_keys: true`。
@@ -73,8 +78,8 @@ impl Default for FetchOpts {
             include: None,
             markdown: false,
             max_chars: 50_000,
-            timeout_secs: 10,
-            retry: 0,
+            timeout_secs: 30,
+            retry: 1,
             json_keys: Vec::new(),
             anchor_pad_lines: 0,
         }
@@ -441,6 +446,21 @@ async fn fetch_one_attempt(
         fetched.truncated_at_offset = t.then_some(off);
         fetched.markdown = true;
     }
+    // FixG11 host 路由：用户未传 --include 时按 host 给默认 selector——github 走 skeleton
+    // 容器链 + nav 剥离（盲测十 P0-1），docs.rs 走 <main>（盲测十 P0-2 全站侧栏绕过）。
+    // 必须在 markdown 转换之后（与 --include 同位置，互不冲突：opts.include.is_none 时才走 host 路由）。
+    if opts.include.is_none()
+        && let Some(label) = host_route_applies(opts.include.as_deref(), url)
+    {
+        let applied = match label {
+            "github" => apply_github_host_route(&mut fetched, &html, opts.markdown, limit)?,
+            "docs.rs" => apply_docsrs_host_route(&mut fetched, &html, is_html, opts.markdown, limit)?,
+            _ => false,
+        };
+        if applied {
+            fetched.auto_include_applied = Some(label.to_string());
+        }
+    }
     // --include：命中容器则用容器内 HTML 重新提取正文（title 仍取页面级）；未命中回退全文提取。
     if let Some(include) = &opts.include {
         fetched.include_hit = Some(false);
@@ -466,6 +486,7 @@ async fn fetch_one_attempt(
                 github_comment_hint: fetched.github_comment_hint,
                 anchor_crop_range: None,
                 truncated_by_json_keys: false,
+                auto_include_applied: fetched.auto_include_applied,
             };
         }
     }
@@ -657,6 +678,11 @@ fn fetched_json(f: &Fetched) -> serde_json::Value {
     if f.truncated_by_json_keys {
         meta["truncated_by_json_keys"] = serde_json::json!(true);
     }
+    // FixG11：host 级默认 include 路由生效信号——label="github"/"docs.rs" 仅在 host 路由
+    // 实际改写 body 时出现；用户显式 --include / host 未命中 / 容器未匹配 → 键缺席（默认输出结构不变）。
+    if let Some(label) = &f.auto_include_applied {
+        meta["auto_include_applied"] = serde_json::json!(label);
+    }
     // 9jx：截断字节偏移（truncated=true 时填，缺席=未截断）。
     if let Some(off) = f.truncated_at_offset {
         meta["truncated_at_offset"] = serde_json::json!(off);
@@ -691,6 +717,11 @@ struct Fetched {
     anchor_crop_range: Option<(usize, usize)>,
     /// FixG10 J-2：--json-keys 命中标记；true 时 meta.truncated_by_json_keys 出现。
     truncated_by_json_keys: bool,
+    /// FixG11：host 级默认 include 是否实际生效——Some(label) 表示 host 路由改写了 body
+    /// （label="github" 走 skeleton::github_comment_html 容器链+nav 剥离；"docs.rs" 走
+    /// --include="main"）；None = 未生效（用户显式 --include 或 host 未命中或 host 命中但容器未匹配）。
+    /// meta.auto_include_applied 仅在 Some 时出键，默认输出结构不变。
+    auto_include_applied: Option<String>,
 }
 
 /// 单 URL fetch 结果：Done = 正文已提取；JsShell = JS 壳需渲染（单条 exit 1 / 批量记 error）。
@@ -815,6 +846,113 @@ fn parse_json_path(path: &str) -> Result<Vec<Segment>> {
     }
 }
 
+/// FixG11 host 路由默认 selector（盲测十 P0-1/P0-2）：
+///
+/// - github.com → skeleton 容器优先级链（markdown-body/issue-body/article/.markdown-body + 旧回退
+///   .js-comment-body/.comment-body）；命中后再按 SEL_GITHUB_NAV 剥 nav（Platform/Solutions/Resources）
+/// - docs.rs → `<main>`（rustdoc 文档主体）
+///
+/// 返回 (label, selector)；调用方按 label 决定是用 selector 走 extract_with_include 路径（docs.rs）
+/// 还是直接调 skeleton::github_comment_html 预处理 HTML（github，因 nav 剥离无法用 selector 表达）。
+///
+/// 纯函数：只比对 host，不发起网络，离线单测覆盖。
+fn host_default_include(url: &str) -> Option<(&'static str, &'static str)> {
+    let lower = url.trim_start().to_ascii_lowercase();
+    // host 前缀匹配（path 必须非空——裸 host 不算内容页，避免对首页误命中）；
+    // 大小写不敏感（先 to_ascii_lowercase）。
+    let (rest, label) = if let Some(r) = lower
+        .strip_prefix("https://github.com/")
+        .or_else(|| lower.strip_prefix("http://github.com/"))
+    {
+        (r, "github")
+    } else {
+        let r = lower
+            .strip_prefix("https://docs.rs/")
+            .or_else(|| lower.strip_prefix("http://docs.rs/"))?;
+        (r, "docs.rs")
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let selector = match label {
+        "github" => GITHUB_CONTAINER_CHAIN,
+        "docs.rs" => "main",
+        _ => unreachable!("label 闭集：仅 github/docs.rs 两值"),
+    };
+    Some((label, selector))
+}
+
+/// GitHub 容器优先级链（与 skeleton::SEL_GITHUB_NEW 同款 + 旧回退）；host_default_include
+/// 返回给调用方的 selector——但调用方对 github 走 skeleton::github_comment_html 预处理而非
+/// 本 selector（nav 剥离无法用 CSS 选择器表达），此常量仅用于标注「host 路由想命中这里」。
+const GITHUB_CONTAINER_CHAIN: &str =
+    r#"[data-testid="markdown-body"], [data-testid="issue-body"], [role="article"], .markdown-body, .js-comment-body, .comment-body"#;
+
+/// host 路由生效判定——用户未传 --include 且 host 命中已知默认值时返回 label。
+/// 抽出便于单测：用户显式 --include 必须不被 host 路由覆盖（盲测十 P0-4 验收）。
+fn host_route_applies(opts_include: Option<&str>, url: &str) -> Option<&'static str> {
+    if opts_include.is_some() {
+        return None;
+    }
+    host_default_include(url).map(|(label, _)| label)
+}
+
+/// FixG11 host 路由：github 走 skeleton::github_comment_html 同时获得容器链命中 + nav 剥离；
+/// 返回 Ok(true) 表示改写了 fetched.text，Ok(false) 表示无容器命中（releases/blob/repo 首页等）
+/// 退回 process_html 输出，None = 不设 auto_include_applied。
+fn apply_github_host_route(
+    fetched: &mut Fetched,
+    html: &str,
+    markdown: bool,
+    limit: usize,
+) -> Result<bool> {
+    let cleaned = match gsearch::skeleton::github_comment_html(html) {
+        Some(c) => c,
+        None => return Ok(false),
+    };
+    let raw = if markdown {
+        crate::convert::html_to_markdown(&cleaned)?
+    } else {
+        extract_text(&cleaned)
+    };
+    let (text, t, o, off) = cap_chars(&raw, limit);
+    fetched.text = text;
+    fetched.truncated = t;
+    fetched.omitted = o;
+    fetched.truncated_at_offset = t.then_some(off);
+    Ok(true)
+}
+
+/// FixG11 host 路由：docs.rs 走 --include="main" 等价路径（extract_with_include 同款）；
+/// 非 HTML 或无 <main> → 退回 process_html 输出。
+fn apply_docsrs_host_route(
+    fetched: &mut Fetched,
+    html: &str,
+    is_html: bool,
+    markdown: bool,
+    limit: usize,
+) -> Result<bool> {
+    if !is_html {
+        return Ok(false);
+    }
+    let Some((inner, hits)) = extract_with_include(html, "main")? else {
+        return Ok(false);
+    };
+    let raw = if markdown {
+        crate::convert::html_to_markdown(&inner)?
+    } else {
+        extract_text(&inner)
+    };
+    let (text, t, o, off) = cap_chars(&raw, limit);
+    fetched.text = text;
+    fetched.truncated = t;
+    fetched.omitted = o;
+    fetched.truncated_at_offset = t.then_some(off);
+    fetched.include_hit = Some(true);
+    fetched.include_hits = Some(hits);
+    Ok(true)
+}
+
 /// 纯函数：html → 提取 + 截断（limit 注入，离线单测不碰配置）。
 /// 非 HTML（text/plain 等）不剥标签不判壳也不实体解码——markdown/JSON 源文保真，
 /// 字面 `&`/`&#20013;` 原样保留（agent 取原文场景）。
@@ -844,6 +982,7 @@ fn process_html(url: &str, html: &str, is_html: bool, limit: usize) -> Fetched {
         github_comment_hint: None,
         anchor_crop_range: None,
         truncated_by_json_keys: false,
+        auto_include_applied: None,
     }
 }
 
@@ -1309,12 +1448,13 @@ mod tests {
             github_comment_hint: github_thread_comment_gap("https://github.com/tokio-rs/tokio/issues/7787"),
             anchor_crop_range: None,
             truncated_by_json_keys: false,
+            auto_include_applied: None,
         };
         let v = fetched_json(&f);
         assert_eq!(v["meta"]["github_comments_missing"], serde_json::json!(true));
         assert!(v["meta"]["github_comments_hint"].as_str().unwrap().contains("api.github.com"));
 
-        let f2 = Fetched { url: "https://e.test/".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false };
+        let f2 = Fetched { url: "https://e.test/".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None };
         let v2 = fetched_json(&f2);
         assert!(v2["meta"].get("github_comments_missing").is_none(), "非 thread 页不得出键");
         assert!(v2["meta"].get("github_comments_hint").is_none());
@@ -1324,11 +1464,11 @@ mod tests {
     #[test]
     fn fetched_json_truncated_by_json_keys_flag() {
         // true：键出
-        let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: true };
+        let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: true, auto_include_applied: None };
         let v = fetched_json(&f);
         assert_eq!(v["meta"]["truncated_by_json_keys"], serde_json::json!(true));
         // false：键缺席
-        let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false };
+        let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None };
         let v2 = fetched_json(&f2);
         assert!(v2["meta"].get("truncated_by_json_keys").is_none(), "默认不得出键");
     }
@@ -1338,15 +1478,15 @@ mod tests {
     #[test]
     fn fetched_json_truncated_at_offset_emits_when_truncated() {
         // truncated=true + Some(off) → meta 出键
-        let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: true, omitted: 100, truncated_at_offset: Some(3000), include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false };
+        let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: true, omitted: 100, truncated_at_offset: Some(3000), include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None };
         let v = fetched_json(&f);
         assert_eq!(v["meta"]["truncated_at_offset"], serde_json::json!(3000));
         // truncated=true + None → 键缺席（不与 truncated 键语义重叠）
-        let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: true, omitted: 100, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false };
+        let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: true, omitted: 100, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None };
         let v2 = fetched_json(&f2);
         assert!(v2["meta"].get("truncated_at_offset").is_none());
         // truncated=false → 键缺席
-        let f3 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false };
+        let f3 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None };
         let v3 = fetched_json(&f3);
         assert!(v3["meta"].get("truncated_at_offset").is_none());
     }
@@ -1483,5 +1623,208 @@ mod tests {
         // budget 用尽：不重试
         assert!(!should_retry("HTTP 503 Service Unavailable", false));
         assert!(!should_retry("请求失败: timeout", false));
+    }
+
+    // ── FixG11 host 路由 / auto_include_applied ────────────────────────────────
+
+    /// FixG11 P0-1/P0-2：host_default_include 按 host 分发——github → 容器链 selector；
+    /// docs.rs → "main"；裸 host（无路径）跳过；未知 host → None。host 比较大小写不敏感。
+    #[test]
+    fn host_default_include_dispatches_by_host() {
+        // github 内容页：返回 (label=github, selector=容器链)
+        let (label, sel) = host_default_include("https://github.com/tokio-rs/tokio/issues/8065").unwrap();
+        assert_eq!(label, "github");
+        assert!(sel.contains("markdown-body"), "容器链含 markdown-body 优先级: {sel}");
+        assert!(sel.contains("js-comment-body"), "旧回退 selector 也在链里: {sel}");
+        // 大小写不敏感
+        assert_eq!(
+            host_default_include("HTTPS://GITHUB.COM/o/r").map(|(l, _)| l),
+            Some("github")
+        );
+        // docs.rs 内容页：返回 (label=docs.rs, selector=main)
+        let (label, sel) = host_default_include("https://docs.rs/serde_json/latest/serde_json/fn.from_str.html").unwrap();
+        assert_eq!(label, "docs.rs");
+        assert_eq!(sel, "main");
+        // 裸 host（https://github.com/）→ None（不算内容页）
+        assert_eq!(host_default_include("https://github.com/"), None);
+        assert_eq!(host_default_include("https://docs.rs/"), None);
+        // 未知 host → None
+        assert_eq!(host_default_include("https://example.com/x"), None);
+        assert_eq!(host_default_include("https://crates.io/api/v1/crates/tokio"), None);
+        // http 形态也命中（fetch 路径 http 公网会被拒，但 host 路由先于 scheme 门）
+        assert_eq!(host_default_include("http://github.com/o/r").map(|(l, _)| l), Some("github"));
+    }
+
+    /// FixG11 P0-4：用户显式 --include 时 host 路由必须不覆盖（host_route_applies 返回 None）。
+    /// 用户未传 + host 命中 → 路由生效；用户未传 + host 未命中 → None。
+    #[test]
+    fn host_route_applies_user_explicit_include_not_overridden() {
+        // 用户显式 --include → host 路由不覆盖（即使 host 命中）
+        assert_eq!(host_route_applies(Some("article"), "https://github.com/foo/bar"), None);
+        assert_eq!(host_route_applies(Some("main"), "https://docs.rs/crate/x.html"), None);
+        // 用户未传 + github host 命中 → 路由生效
+        assert_eq!(host_route_applies(None, "https://github.com/o/r/issues/1"), Some("github"));
+        // 用户未传 + docs.rs host 命中 → 路由生效
+        assert_eq!(host_route_applies(None, "https://docs.rs/serde_json"), Some("docs.rs"));
+        // 用户未传 + 未知 host → 无路由
+        assert_eq!(host_route_applies(None, "https://crates.io/api/v1/crates/x"), None);
+    }
+
+    /// FixG11 P0-1：github host 路由——命中 markdown-body 容器时按 SEL_GITHUB_NAV 剥 nav；
+    /// P0-1 验收：text 不含 Platform / Solutions / Resources。命中后设 auto_include_applied="github"。
+    #[test]
+    fn apply_github_host_route_strips_nav_and_marks_label() {
+        // 模拟盲测十实测的 GitHub issue 页（head 巨大 + nav 占 7KB + markdown-body 真容器）
+        let junk = "x".repeat(20_000);
+        let html = format!(
+            "<html><head><meta>{junk}</meta></head><body>\
+             <nav class='Header'><a>Platform</a><a>Solutions</a><a>Resources</a></nav>\
+             <div data-testid='markdown-body'>\
+             <p>actual issue content paragraph one</p>\
+             <p>actual issue content paragraph two</p>\
+             </div></body></html>"
+        );
+        let mut fetched = Fetched {
+            url: "https://github.com/o/r/issues/1".into(),
+            title: "Issue 1".into(),
+            text: "原 process_html 输出（含 nav 噪声）".into(),
+            truncated: false,
+            omitted: 0,
+            truncated_at_offset: None,
+            include_hit: None,
+            include_hits: None,
+            markdown: false,
+            github_comment_hint: None,
+            anchor_crop_range: None,
+            truncated_by_json_keys: false,
+            auto_include_applied: None,
+        };
+        let applied = apply_github_host_route(&mut fetched, &html, false, 50_000).unwrap();
+        assert!(applied, "github 容器命中应改写 body");
+        // 调用方（fetch_one_attempt）负责在 applied=true 时设 auto_include_applied；
+        // 单测镜像调用方行为以锁定契约。
+        if applied {
+            fetched.auto_include_applied = Some("github".to_string());
+        }
+        assert_eq!(fetched.auto_include_applied.as_deref(), Some("github"));
+        // nav 已剥离（盲测十 P0-1 验收）
+        assert!(!fetched.text.contains("Platform"), "nav Platform 剥离: {}", fetched.text);
+        assert!(!fetched.text.contains("Solutions"), "nav Solutions 剥离: {}", fetched.text);
+        assert!(!fetched.text.contains("Resources"), "nav Resources 剥离: {}", fetched.text);
+        assert!(!fetched.text.contains(&junk), "head 噪声不进 body: {}", fetched.text);
+        // 正文保留
+        assert!(fetched.text.contains("actual issue content paragraph"), "正文保留: {}", fetched.text);
+    }
+
+    /// FixG11 P0-1 反向：github 页面无容器命中（releases/blob/repo 首页）→ host 路由不改 body，
+    /// auto_include_applied 保持 None（不误标）。
+    #[test]
+    fn apply_github_host_route_no_container_match_keeps_body() {
+        let html = "<html><body><h1>Plain page</h1><p>no markdown-body here</p></body></html>";
+        let mut fetched = Fetched {
+            url: "https://github.com/o/r".into(),
+            title: "Repo".into(),
+            text: "process_html 原始输出".into(),
+            truncated: false,
+            omitted: 0,
+            truncated_at_offset: None,
+            include_hit: None,
+            include_hits: None,
+            markdown: false,
+            github_comment_hint: None,
+            anchor_crop_range: None,
+            truncated_by_json_keys: false,
+            auto_include_applied: None,
+        };
+        let applied = apply_github_host_route(&mut fetched, html, false, 50_000).unwrap();
+        assert!(!applied, "无容器命中 → applied=false");
+        assert!(fetched.auto_include_applied.is_none(), "不改写 body → 不设 label");
+        assert_eq!(fetched.text, "process_html 原始输出", "body 不被改写");
+    }
+
+    /// FixG11 P0-2：docs.rs host 路由——命中 <main> 时改写 body + 设 auto_include_applied="docs.rs"；
+    /// 同时打 include_hit/include_hits（与 --include 行为对齐）。
+    #[test]
+    fn apply_docsrs_host_route_uses_main_and_marks_label() {
+        // 模拟 docs.rs 函数页：<main> 内是函数签名 + 描述 + Errors；外层 nav 是全站侧栏
+        let html = "<html><body>\
+                    <nav>crates.io search box</nav>\
+                    <aside>left sidebar with module list</aside>\
+                    <main>\
+                    <h1>Function from_str</h1>\
+                    <pre><code>pub fn from_str&lt;'a, T&gt;(s: &amp;'a str) -&gt; Result&lt;T&gt;</code></pre>\
+                    <p>Deserializes a string of JSON into T.</p>\
+                    <h2>Errors</h2>\
+                    <p>This function will return an error if the input is not valid JSON.</p>\
+                    </main>\
+                    <footer>site-wide footer</footer>\
+                    </body></html>";
+        let mut fetched = Fetched {
+            url: "https://docs.rs/serde_json/latest/serde_json/fn.from_str.html".into(),
+            title: "from_str".into(),
+            text: "全站 nav + sidebar + footer + main 一起的输出（含噪声）".into(),
+            truncated: false,
+            omitted: 0,
+            truncated_at_offset: None,
+            include_hit: None,
+            include_hits: None,
+            markdown: false,
+            github_comment_hint: None,
+            anchor_crop_range: None,
+            truncated_by_json_keys: false,
+            auto_include_applied: None,
+        };
+        let applied = apply_docsrs_host_route(&mut fetched, html, true, false, 50_000).unwrap();
+        assert!(applied, "docs.rs <main> 命中应改写 body");
+        // 调用方负责设 auto_include_applied（与 fetch_one_attempt 行为一致）
+        if applied {
+            fetched.auto_include_applied = Some("docs.rs".to_string());
+        }
+        assert_eq!(fetched.auto_include_applied.as_deref(), Some("docs.rs"));
+        assert_eq!(fetched.include_hit, Some(true));
+        assert_eq!(fetched.include_hits, Some(1));
+        // 侧栏/页脚/导航不应混入
+        assert!(!fetched.text.contains("search box"), "nav 不进 body: {}", fetched.text);
+        assert!(!fetched.text.contains("sidebar"), "aside 不进 body: {}", fetched.text);
+        assert!(!fetched.text.contains("site-wide footer"), "footer 不进 body: {}", fetched.text);
+        // 主内容保留
+        assert!(fetched.text.contains("from_str"), "main 标题保留: {}", fetched.text);
+        assert!(fetched.text.contains("Errors"), "Errors 段保留: {}", fetched.text);
+        assert!(fetched.text.contains("Deserializes"), "描述段保留: {}", fetched.text);
+    }
+
+    /// FixG11 P0-5：fetched_json 在 auto_include_applied=Some 时出 meta 键；
+    /// None 时键缺席（默认输出结构不变，与 include_hit 同款缺席语义）。
+    #[test]
+    fn fetched_json_auto_include_applied_emits_when_set() {
+        // Some("github")：meta 出键
+        let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: Some("github".into()) };
+        let v = fetched_json(&f);
+        assert_eq!(v["meta"]["auto_include_applied"], serde_json::json!("github"));
+        // Some("docs.rs")：meta 出键
+        let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: Some("docs.rs".into()) };
+        let v2 = fetched_json(&f2);
+        assert_eq!(v2["meta"]["auto_include_applied"], serde_json::json!("docs.rs"));
+        // None：键缺席（默认输出逐键不变）
+        let f3 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None };
+        let v3 = fetched_json(&f3);
+        assert!(v3["meta"].get("auto_include_applied").is_none(), "默认不得出键");
+    }
+
+    /// FixG11：FetchOpts::default() 改 timeout=30 retry=1（盲测十 P0-3：GitHub 抖动自愈）。
+    /// 其他字段保持原 FixG10 默认（max_chars=50000、json=false、markdown=false 等）。
+    #[test]
+    fn fetch_opts_default_timeout_30_retry_1() {
+        let opts = FetchOpts::default();
+        assert_eq!(opts.timeout_secs, 30, "默认 timeout 30（FixG11 给 GitHub 抖动自愈留余量）");
+        assert_eq!(opts.retry, 1, "默认 retry 1（FixG11 公网抖动 1 次自愈）");
+        assert_eq!(opts.max_chars, 50_000);
+        assert!(!opts.json);
+        assert!(!opts.markdown);
+        assert!(opts.include.is_none());
+        assert!(opts.json_keys.is_empty());
+        assert_eq!(opts.anchor_pad_lines, 0);
+        assert!(opts.proxy.is_none());
+        assert!(!opts.allow_private);
     }
 }
