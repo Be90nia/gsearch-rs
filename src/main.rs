@@ -268,8 +268,12 @@ struct SearchArgs {
     /// 与 `--open / --dl / --read` 互斥；1..。
     #[arg(long, group = "post", value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..))]
     browse: Option<usize>,
+    /// `--dl N`：用浏览器 profile 下载第 N 条结果的文件到当前目录（文件名经 sanitize）。
+    /// 与 `--open / --read / --browse` 互斥；1..。
     #[arg(long, group = "post")]
     dl: Option<usize>,
+    /// `--open N`：用系统默认浏览器打开第 N 条结果 URL（Windows: cmd /c start）。
+    /// 与 `--dl / --read / --browse` 互斥；1..。
     #[arg(long, group = "post")]
     open: Option<usize>,
     /// 跳过搜索前的 warmup（Wikipedia/GitHub/HN 随机访问 + 滚动）+ 指纹补丁。
