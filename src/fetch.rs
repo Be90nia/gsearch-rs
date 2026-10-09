@@ -801,12 +801,14 @@ fn crop_text_lines(text: &str, start: usize, end: usize, pad: usize) -> (String,
 /// 支持 `.field` 段与 `[N]` 段（数组下标），不支持复杂查询（递归 `..` / 通配符 / 过滤）。
 /// 解析失败 → 整体失败（Err），不静默吞掉（agent 拼错了要报错）。
 /// 空 paths → 原样返回（不做投影）。
+/// FixG14：多路径末段名冲突（`items.0.title` / `items.1.title` 都要写 key "title"）时，
+/// 冲突 key 改用全路径形态输出，不再静默 last-write-wins；单路径/无冲突保持末段短名。
 fn project_json_paths(v: &serde_json::Value, paths: &[String]) -> Result<serde_json::Value> {
-    let mut out = serde_json::Map::new();
+    // 先求值全部路径，再统一定 key 形态（边插边定无法回头改名）。
+    let mut resolved: Vec<(String, serde_json::Value)> = Vec::with_capacity(paths.len());
     for path in paths {
         let segments = parse_json_path(path)?;
-        let cur = v;
-        let mut node: &serde_json::Value = cur;
+        let mut node: &serde_json::Value = v;
         for seg in &segments {
             node = match seg {
                 Segment::Field(name) => node.get(name).ok_or_else(|| {
@@ -822,7 +824,27 @@ fn project_json_paths(v: &serde_json::Value, paths: &[String]) -> Result<serde_j
             Segment::Field(n) => n.clone(),
             Segment::Index(i) => format!("[{i}]"),
         };
-        out.insert(key, node.clone());
+        resolved.push((key, node.clone()));
+    }
+    // 冲突检测：路径数是个位数，O(n²) 两两比对足够
+    let mut conflicted = vec![false; resolved.len()];
+    for i in 0..resolved.len() {
+        for j in 0..i {
+            if resolved[i].0 == resolved[j].0 {
+                conflicted[i] = true;
+                conflicted[j] = true;
+            }
+        }
+    }
+    let mut out = serde_json::Map::new();
+    for (i, (key, value)) in resolved.into_iter().enumerate() {
+        // 冲突 key → 全路径形态（用户路径规范化：去首尾空白与前导点）
+        let final_key = if conflicted[i] {
+            paths[i].trim().trim_start_matches('.').to_string()
+        } else {
+            key
+        };
+        out.insert(final_key, value);
     }
     Ok(serde_json::Value::Object(out))
 }
@@ -1137,11 +1159,26 @@ fn tree_text(doc: &Html) -> String {
                 }
                 let sep = if is_block_boundary(el.name()) { '\n' } else { ' ' };
                 if matches!(el.name(), "pre" | "code") {
-                    // FixG13：pre/code 内空白是内容（签名 where 缩进 4 空格、from_&lt;a&gt;str
-                    // / println!&lt;/span&gt;( 的元素边界不注入空格）——子树文本原样输出，
-                    // \0 哨兵段由 collapse_preserving_code 跳过规整；整树收集不再递归入主栈。
-                    out.push(sep);
+                    // FixG13：pre/code 内空白是内容——子树文本原样输出，\0 哨兵段由
+                    // collapse_preserving_code 跳过规整；整树收集不再递归入主栈。
+                    // FixG14：边界分隔符必须放进哨兵段内——哨兵段外 prose 段首尾空白会被
+                    // collapse_blank trim，放外面必丢（"byT"/"Result<T>where" 盲测十三实锤）。
+                    let block = is_block_boundary(el.name()); // pre=块级, code=行内
+                    // 前置：块级一律 '\n'（文档起始除外）；行内按 out 尾形态——块边界续
+                    // '\n'、文本节点自带空白续 ' '、紧贴字符/哨兵不加（"by<code>"→"byT" 正确）
+                    let lead = if block {
+                        (!out.is_empty()).then_some('\n')
+                    } else {
+                        match out.chars().last() {
+                            Some('\n') => Some('\n'),
+                            Some(c) if c.is_whitespace() => Some(' '),
+                            _ => None,
+                        }
+                    };
                     out.push('\u{0}');
+                    if let Some(c) = lead {
+                        out.push(c);
+                    }
                     let mut sub: Vec<_> = node.children().rev().collect();
                     while let Some(n) = sub.pop() {
                         match n.value() {
@@ -1152,13 +1189,66 @@ fn tree_text(doc: &Html) -> String {
                                     "script" | "style" | "noscript" | "template"
                                 ) =>
                             {
+                                // FixG14：哨兵段内块级子元素（div.where/br）注入 '\n'——
+                                // docs.rs 签名 "Result<T><div>where" 无文本换行可依赖
+                                if is_block_boundary(e.name()) {
+                                    out.push('\n');
+                                }
                                 sub.extend(n.children().rev());
                             }
                             _ => {}
                         }
                     }
+                    if block {
+                        out.push('\n');
+                    } else {
+                        // 行内后置：按下一可见节点形态补——紧贴正文（", for"）不加；空白起头
+                        // 文本（" is"）或空白后续行内元素补 ' '；块级元素补 '\n'。真实 HTML
+                        // 里这些空白落在后 prose 段首，collapse_blank 会 trim 掉。
+                        let mut trail = None;
+                        let mut ws_pending = false;
+                        for n in stack.iter().rev() {
+                            match n.value() {
+                                Node::Text(t) => {
+                                    if ws_pending {
+                                        trail = Some(' ');
+                                        break;
+                                    }
+                                    if t.starts_with(char::is_whitespace) {
+                                        if t.trim_start().is_empty() {
+                                            ws_pending = true; // 纯空白文本，继续看其后
+                                        } else {
+                                            trail = Some(' '); // " is"：同段续文
+                                            break;
+                                        }
+                                    } else {
+                                        break; // 紧贴正文（", for"）：正确渲染就是无分隔
+                                    }
+                                }
+                                Node::Element(e)
+                                    if matches!(
+                                        e.name(),
+                                        "script" | "style" | "noscript" | "template" | "wbr"
+                                    ) => {}
+                                Node::Element(e) => {
+                                    trail = if is_block_boundary(e.name()) {
+                                        Some('\n')
+                                    } else if ws_pending {
+                                        Some(' ')
+                                    } else {
+                                        None
+                                    };
+                                    break;
+                                }
+                                Node::Comment(_) => {} // 注释不贡献输出，穿透再探
+                                _ => break,
+                            }
+                        }
+                        if let Some(c) = trail {
+                            out.push(c);
+                        }
+                    }
                     out.push('\u{0}');
-                    out.push(sep);
                     continue;
                 }
                 out.push(sep);
@@ -2289,5 +2379,84 @@ mod tests {
         assert!(hit.text.contains("Skip to content"), "用户容器原样保留: {}", hit.text);
         assert_eq!(hit.include_hit, Some(true));
         assert_eq!(hit.include_hits, Some(1));
+    }
+
+    /// FixG14 bug1：行内 code 前置空格——文本节点自带的空格落在 prose 段尾会被
+    /// collapse_blank trim，移进哨兵段后 "by <code>T</code>," 不再粘连成 "byT"。
+    #[test]
+    fn inline_code_leading_space_preserved() {
+        let text =
+            extract_text("<p>expected by <code>T</code>, for example</p>");
+        assert!(text.contains("expected by T, for example"), "got: {text:?}");
+        assert!(!text.contains("byT"), "got: {text:?}");
+    }
+
+    /// FixG14 bug1：行内 code 后置空格——"T is" 空白落在后 prose 段首会被 trim，
+    /// 按 peek 下一节点形态补进哨兵段，"ifTis" 类粘连不再出现。
+    #[test]
+    fn inline_code_trailing_space_preserved() {
+        let text = extract_text("<p>if <code>T</code> is required</p>");
+        assert!(text.contains("if T is required"), "got: {text:?}");
+        assert!(!text.contains("ifT"), "got: {text:?}");
+        assert!(!text.contains("Tis"), "got: {text:?}");
+    }
+
+    /// FixG14：行内 code 紧贴标点/紧邻行内元素不注入多余空格（"T, for" 正确、
+    /// `<code>a</code><code>b</code>` → "ab" 与浏览器渲染一致）。
+    #[test]
+    fn inline_code_tight_adjacency_no_extra_space() {
+        let text = extract_text("<p>by <code>T</code>, for</p>");
+        assert!(text.contains("T, for"), "got: {text:?}");
+        assert!(!text.contains("T ,"), "got: {text:?}");
+        let text2 = extract_text("<p><code>a</code><code>b</code> c</p>");
+        assert!(text2.contains("ab c"), "got: {text2:?}");
+    }
+
+    /// FixG14：行内 code 紧跟块级边界——块 sep 进哨兵段后换行保留且不重复
+    ///（"para\nT starts"，而非 "paraT…" 或 "para\n\nT…"）。
+    #[test]
+    fn inline_code_after_block_boundary_keeps_single_newline() {
+        let text = extract_text("<p>para</p><p><code>T</code> starts</p>");
+        assert!(text.contains("para\nT starts"), "got: {text:?}");
+    }
+
+    /// FixG14 bug2（边界半边）：pre 块前后换行移进哨兵段——不再被相邻 prose 段
+    /// 首尾 trim 吃掉，代码块与正文正确分行。
+    #[test]
+    fn pre_block_boundaries_preserved() {
+        let text = extract_text("<p>before</p><pre>line1\n  line2</pre><p>after</p>");
+        assert!(text.contains("before\nline1\n  line2\nafter"), "got: {text:?}");
+    }
+
+    /// FixG14 bug2（核心半边）：pre 内块级子元素（div.where）注入 '\n'——docs.rs
+    /// 签名真实结构 `Result&lt;T&gt;<div>where` 无文本换行可依赖，旧代码出
+    /// "Result<T>where"（粘贴不可编译）。
+    #[test]
+    fn pre_inner_block_element_gets_newline() {
+        let text = extract_text(
+            "<pre><code>pub fn f() -&gt; Result&lt;T&gt;\
+             <div class=\"where\">where\n    T: X</div></code></pre>",
+        );
+        assert!(text.contains("Result<T>\nwhere"), "got: {text:?}");
+        assert!(!text.contains("Result<T>where"), "got: {text:?}");
+    }
+
+    /// FixG14 bug3：--json-keys 多路径末段同名——冲突 key 全路径化，两条都保留
+    ///（旧代码静默 last-write-wins 丢数据）；单路径输出形态零变化。
+    #[test]
+    fn project_json_paths_conflicting_keys_use_full_path() {
+        let payload = serde_json::json!({"items": [{"title": "a"}, {"title": "b"}]});
+        let out = project_json_paths(
+            &payload,
+            &["items.0.title".into(), "items.1.title".into()],
+        )
+        .unwrap();
+        assert_eq!(out["items.0.title"], serde_json::json!("a"));
+        assert_eq!(out["items.1.title"], serde_json::json!("b"));
+        assert_eq!(out.as_object().unwrap().len(), 2, "两条都保留");
+        // 单路径/无冲突：末段短名形态与旧版一致
+        let single = project_json_paths(&payload, &["items.0.title".into()]).unwrap();
+        assert_eq!(single["title"], serde_json::json!("a"));
+        assert_eq!(single.as_object().unwrap().len(), 1);
     }
 }
