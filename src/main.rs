@@ -224,8 +224,10 @@ enum Command {
         /// 例：`--json-keys "crate.max_version,crate.max_stable_version"` 命中后 text 换源为
         /// `{"max_version":"...","max_stable_version":"..."}`（--json 下即原生 JSON 对象/数组，
         /// 免二次解析），meta.truncated_by_json_keys=true。
-        /// 数组支持：`0.field` 取单元素（GitHub comments 等顶层数组响应）、`[*].field`
-        /// 通配全部元素（输出数组形态），如 `--json-keys "[*].tag_name,0.body"`。
+        /// 数组支持：`0.field` 取单元素（GitHub comments 等顶层数组响应）；`[*].field`
+        /// 对数组每个元素取 field，输出为**按字段分组的并列数组**（如
+        /// {"tag_name":["v1.0.0",...]}，多字段按下标对齐；单字段/多字段均此形态），
+        /// 如 `--json-keys "[*].tag_name,0.body"`。
         /// text 非 JSON 时静默跳过（不动 text）。
         #[arg(long, value_delimiter = ',')]
         json_keys: Vec<String>,
@@ -695,6 +697,8 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         provider: provider.into(),
         recency: recency.map(|r| r.as_str().into()),
         site_warn: site_warn_for(&query),
+        truncated_detail: (results.len() >= args.limit)
+            .then(|| gsearch::types::TRUNCATED_RESULTS_CAPPED.to_string()),
     };
     // o1p：stderr 诊断行与 run.status 同源——run move 进信封后仍需在空结果分支打 stderr
     let stderr_diag = (results.is_empty() && !run_message.is_empty()).then(|| run_message.clone());
@@ -838,6 +842,8 @@ async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode>
         provider: "searxng".into(),
         recency: None,
         site_warn: site_warn_for(&derived_query),
+        truncated_detail: (hits.len() >= limit)
+            .then(|| gsearch::types::TRUNCATED_RESULTS_CAPPED.to_string()),
     };
     let envelope = gsearch::types::OutputEnvelope { meta, run, results: &hits };
     let mut doc = serde_json::to_value(&envelope)?;
@@ -914,6 +920,8 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
                 provider: "searxng".into(),
                 recency: recency.map(|r| r.as_str().into()),
                 site_warn: site_warn_for(&query),
+                truncated_detail: (results.len() >= args.limit)
+                    .then(|| gsearch::types::TRUNCATED_RESULTS_CAPPED.to_string()),
             };
             gsearch::types::BatchEntry {
                 query,
@@ -1026,6 +1034,7 @@ fn emit_captcha_timeout_json(
         provider: "google".into(),
         recency: recency.map(|r| r.as_str().into()),
         site_warn: site_warn_for(query),
+        truncated_detail: None,
     };
     let run = gsearch::types::RunStatusInfo {
         status: gsearch::types::RunStatus::CaptchaTimeout,
@@ -1064,6 +1073,7 @@ fn emit_searxng_degraded_json(
         provider: "searxng".into(),
         recency: recency.map(|r| r.as_str().into()),
         site_warn: site_warn_for(query),
+        truncated_detail: None,
     };
     let run = gsearch::types::RunStatusInfo {
         status: gsearch::types::RunStatus::SearxngDegraded,

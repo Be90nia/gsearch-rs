@@ -36,6 +36,7 @@ gsearch search "..." --open 1
   - `domain_class`：URL host 启发式（docs/github/wikipedia/blog/forum/video/news/qa/other），可按类筛权威源
 - 顶层 `run.status`：`ok / captcha_required / captcha_timeout / searxng_degraded / filtered_empty / no_results / error`——零结果三态分立（o1p）：`searxng_degraded` = 源故障/熔断（跑 doctor），`filtered_empty` = recency 过滤后空、源健康（去掉 --recency 或换时间窗），`no_results` = 查询无果、源健康（换词重试）
 - `meta` 键缺席语义：`truncated:false`、空 `message`、`captcha_solved:false` 均不占键；`results_count` 已移除（`len(results)` 可推导）；`browser_path` / `browser_kind` 已移除（环境噪声，浏览器信息走 `gsearch doctor`）
+- `meta.truncated`（search 路径）= **结果数触及 `--limit` 上限**（可能还有更多被裁），与正文/snippet 截断无关；`truncated:true` 时附 `meta.truncated_detail: "results_capped_by_limit"` 自解释键（fetch/browse 路径的 truncated 仍是正文/响应体截断，语义见下文各节）
 - `--compact-meta`（opt-in）：meta 裁到 query/limit/elapsed_ms/provider/recency 等少量键（`--verbose debug` 时强制全量排障）
 
 #### read 失败显式化
@@ -120,7 +121,7 @@ gsearch fetch --json-keys "crate.max_version,crate.max_stable_version" \
 - **host 级默认 include**：未传 `--include` 时按 host 自动路由——`github.com` 走 skeleton 容器优先级链 + nav 剥离（命中后 `meta.auto_include_applied="github"`），`docs.rs` 走 `<main>`（命中后 `meta.auto_include_applied="docs.rs"`）。用户显式 `--include "..."` 不被覆盖，但 host 判定恒保留：`auto_include_applied` 仍标注 host 想命中的 label + `meta.include_overridden_by_user=true` 标注覆盖事实，且用户 selector 未命中的回退全文仍走 host 剥离；host 未命中（未知 host / 裸 host）→ ...
 - **`<summary>` 折叠按钮文本剥离**：fetch 提取路径全局剥 `<summary>…</summary>`（docs.rs 的 "Expand description" 等折叠按钮文本不进正文；非 HTML 源文保真不碰）
 - **GitHub PR/issue 标题栏兜底**：容器链命中的正文头部缺页面标题时补 `# {页面title}\n\n` 前缀（GitHub 页 title 含 PR/issue 标题），caller 一眼可辨在看哪条 PR；正文已含标题则不重复
-- **`--json-keys <paths>`（逗号分隔多路径）**：JSONPath 投影——body 是 JSON 时按 `.field` / `[N]` / 裸字段名 / 裸数字段（=`[N]`，顶层数组如 GitHub comments API 的 `0.user.login`）/ `[*]` 数组通配（`[*].tag_name` 对每个元素取该字段，值为数组形态）路径缩成只含指定字段的子集（典型场景：crates.io API 的 5KB `categories` 后藏 `max_version`，不投影会被字符预算截掉）。多路径末段同名冲突时（如 `items.0.title,items.1.title`）冲突 key 自动改用全路径形态，两条都保留不丢数据；单路径/无冲突保持末段短名。`meta.truncated_by_json_keys=true` 标注；body 非 JSON 或路径错误静默走原路径（投影失败 stderr 一行提示后保留原 body，顶层数组误用裸字段路径时错误信息附 `0.field` / `[*]` 语法教学）。投影命中（`meta.truncated_by_json_keys=true`）时 `--json` 的 `text` 即投影 JSON 本身（对象/数组原生形态，免二次 parse）；投影产物超预算被截或回退原 body 时恒为 string
+- **`--json-keys <paths>`（逗号分隔多路径）**：JSONPath 投影——body 是 JSON 时按 `.field` / `[N]` / 裸字段名 / 裸数字段（=`[N]`，顶层数组如 GitHub comments API 的 `0.user.login`）/ `[*]` 数组通配（`[*].tag_name` 对每个元素取该字段，输出为**按字段分组的并列数组**如 `{"tag_name":[...]}`，多字段按下标对齐，单字段/多字段均此形态）路径缩成只含指定字段的子集（典型场景：crates.io API 的 5KB `categories` 后藏 `max_version`，不投影会被字符预算截掉）。多路径末段同名冲突时（如 `items.0.title,items.1.title`）冲突 key 自动改用全路径形态，两条都保留不丢数据；单路径/无冲突保持末段短名。`meta.truncated_by_json_keys=true` 标注；body 非 JSON 或路径错误静默走原路径（投影失败 stderr 一行提示后保留原 body，顶层数组误用裸字段路径时错误信息附 `0.field` / `[*]` 语法教学）。投影命中（`meta.truncated_by_json_keys=true`）时 `--json` 的 `text` 即投影 JSON 本身（对象/数组原生形态，免二次 parse）；投影产物超预算被截或回退原 body 时恒为 string
 - **URL `#N-M` 锚点裁剪**：URL 含纯数字行号范围时，`text` 字段裁到 `[start, end]`（1-based 含端点），`meta.anchor_crop_range=[actual_start, actual_end]` 标注实际裁到的行号范围；命名锚点 / 单行号 / 颠倒起终不裁剪（不误伤 GitHub `#issuecomment-` 等命名锚点 URL）
 
 - **无需浏览器**：纯 reqwest GET，秒取静态页（换机可用性兜底）。

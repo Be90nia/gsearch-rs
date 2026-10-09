@@ -730,9 +730,16 @@ fn fetched_json(f: &Fetched) -> serde_json::Value {
     } else {
         f.text.clone().into()
     };
+    // FixG17：投影命中且投影含 title 时顶层 title 回填投影值——顶层 title 原是页面级
+    // <title>（JSON API 响应取不到，恒空串），与 text.title 并存造成首读困惑。
+    // 无 title 路径 / 投影值非字符串 / 顶层数组 → 维持页面级 title（现状）。
+    let title = match text.get("title") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        _ => f.title.clone(),
+    };
     serde_json::json!({
         "url": f.url,
-        "title": f.title,
+        "title": title,
         "text": text,
         "meta": meta,
     })
@@ -1431,7 +1438,8 @@ fn render_include_blocks(blocks: &[String], markdown: bool) -> Result<String> {
         let raw = if markdown {
             crate::convert::clean_markdown(crate::convert::html_to_markdown(b)?)
         } else {
-            extract_text(b)
+            // FixG17：非 markdown 路径同样剥 rustdoc 标题锚点 §（与 --markdown 的 clean_markdown 对称）
+            crate::convert::clean_text_anchors(extract_text(b))
         };
         parts.push(raw.trim().to_string());
     }
@@ -1517,6 +1525,23 @@ mod tests {
         assert!(segs.next().unwrap().starts_with("pub fn"));
         assert!(segs.next().unwrap().starts_with("use serde;"));
         assert!(!text.contains("间隔噪音"), "未选中容器不混入: {text:?}");
+    }
+
+    /// FixG17：--include 非 markdown 渲染剥行首 § 锚点（docs.rs 标题自链 `<a>§</a>标题`
+    /// 经 extract_text 胶成 "§标题"，与 --markdown 的 clean_markdown 对称）；行中引用 § 保留。
+    #[test]
+    fn render_include_blocks_text_mode_strips_section_anchor() {
+        let html = "<html><body>\
+                    <h4 id=\"example\"><a class=\"doc-anchor\" href=\"#example\">§</a>Example</h4>\
+                    <p>正文引用 §3.2 保持原样</p>\
+                    </body></html>";
+        let (blocks, _) = extract_with_include(html, "h4,p").unwrap().unwrap();
+        let out = render_include_blocks(&blocks, false).unwrap();
+        assert!(out.starts_with("Example"), "h4 行首锚点 § 应剥除: {out:?}");
+        assert!(out.contains("正文引用 §3.2"), "行中引用 § 保留: {out:?}");
+        // markdown 模式行为不变（clean_markdown 已剥 [§](#anchor) 形态）
+        let md = render_include_blocks(&blocks, true).unwrap();
+        assert!(!md.contains("[§]("), "markdown 模式锚点链接剥除: {md:?}");
     }
 
     /// FixG15：`[*]` 通配段解析——与 Field/Index 并存（`data.items[*].name`）。
@@ -1959,6 +1984,37 @@ mod tests {
         // 非投影路径恒为 string
         let plain = fetched_json(&mk(false, r#"{"tag_name":"v1.53.2"}"#));
         assert!(plain["text"].is_string(), "非投影 text 恒为 string: {plain}");
+    }
+
+    /// FixG17：投影命中且投影含 title（字符串）→ 顶层 title 回填投影值（页面级 <title>
+    /// 对 JSON API 恒空串，与 text.title 并存首读困惑）；投影无 title / 顶层数组 → 维持现状。
+    #[test]
+    fn fetched_json_backfills_title_from_projection() {
+        let mk = |truncated_by_json_keys: bool, title: &str, text: &str| Fetched {
+            url: "u".into(),
+            title: title.into(),
+            text: text.into(),
+            truncated: false,
+            omitted: 0,
+            truncated_at_offset: None,
+            include_hit: None,
+            include_hits: None,
+            markdown: false,
+            github_comment_hint: None,
+            anchor_crop_range: None,
+            truncated_by_json_keys,
+            auto_include_applied: None,
+            include_overridden_by_user: false,
+        };
+        // 对象投影含 title → 顶层回填投影值
+        let hit = fetched_json(&mk(true, "", r#"{"title":"tokio issue","state":"open"}"#));
+        assert_eq!(hit["title"], serde_json::json!("tokio issue"), "投影 title 应回填顶层: {hit}");
+        // 投影无 title 路径 → 维持页面级 title（空串现状）
+        let no_title = fetched_json(&mk(true, "", r#"{"state":"open"}"#));
+        assert_eq!(no_title["title"], serde_json::json!(""), "无 title 路径维持现状: {no_title}");
+        // 顶层数组投影（[*]）取不出字符串 title → 维持页面级
+        let arr = fetched_json(&mk(true, "page title", r#"[{"title":"a"},{"title":"b"}]"#));
+        assert_eq!(arr["title"], serde_json::json!("page title"), "数组投影不回填: {arr}");
     }
 
     /// 9jx：fetch meta.truncated_at_offset——truncated=true 时出键且值非零，None 时键缺席。

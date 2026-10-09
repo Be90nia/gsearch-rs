@@ -62,7 +62,16 @@ pub struct MetaOutput {
     /// 缺席语义与 proxy/recency 同（仅 search 路径可能填值）。
     #[serde(skip_serializing_if = "skip_compact_absent_opt")]
     pub site_warn: Option<String>,
+    /// FixG17：truncated 语义自解释——search 路径 truncated=true 时填
+    /// "results_capped_by_limit"（结果数触及 --limit 上限，可能还有更多；与正文/snippet
+    /// 截断无关）。truncated=false 或非搜索路径缺席（8lp 缺席=正常，默认输出结构不变）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated_detail: Option<String>,
 }
+
+/// FixG17：search `truncated=true` 时 `meta.truncated_detail` 的值——结果数触及
+/// `--limit` 上限（可能还有更多被裁），与正文/snippet 截断无关。
+pub const TRUNCATED_RESULTS_CAPPED: &str = "results_capped_by_limit";
 
 // 6dp：`--compact-meta` 压缩开关。skip 判定读进程级标志——serde 的 skip_serializing_if
 // 拿不到 self，全局 AtomicBool 是最小改动（构造方零改动、保留字段 JSON 顺序不变）。
@@ -238,6 +247,7 @@ mod tests {
             provider: "google".into(),
             recency: None,
             site_warn: None,
+            truncated_detail: None,
         }
     }
 
@@ -418,6 +428,23 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"score\":1.5"), "score 应透传: {s}");
         assert!(s.ends_with(r#""domain_class":"other"}"#), "domain_class 应仍是末键: {s}");
+    }
+
+    /// FixG17：search truncated=true 时 meta.truncated_detail 出键且值自解释（结果数被
+    /// --limit 裁剪）；None 缺席=正常（默认输出结构不变，8lp 缺席语义）。
+    #[test]
+    fn truncated_detail_emits_only_when_set() {
+        let mut m = sample_meta();
+        m.truncated = true;
+        m.truncated_detail = Some(TRUNCATED_RESULTS_CAPPED.to_string());
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(
+            s.contains(concat!("\"truncated_detail\":\"", "results_capped_by_limit", "\"")),
+            "truncated=true 应出自解释键: {s}"
+        );
+        let plain = sample_meta();
+        let s2 = serde_json::to_string(&plain).unwrap();
+        assert!(!s2.contains("truncated_detail"), "缺席=正常不得出键: {s2}");
     }
 
     /// nx4 契约：v2 信封顶层 meta{n_total,n_ok,n_fail,elapsed_ms} 只出一层；

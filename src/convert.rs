@@ -34,6 +34,21 @@ pub(crate) fn clean_markdown(md: String) -> String {
     out.replace("\\_", "_")
 }
 
+/// FixG17：--include 纯文本提取路径的 rustdoc 标题锚点清洗——docs.rs 标题自链的 § 与
+/// 标题文本经 extract_text 胶成行首 "§Example"（--markdown 路径已由 clean_markdown 覆盖）。
+/// 只剥行首孤立 §：正文引用（"见 §3.2"）的行中 § 不动；Rust 代码不会以 § 开头，代码块免疫。
+/// 仅 render_include_blocks 提取漏斗调用（--include 命中与 docs.rs host route 共用）。
+pub(crate) fn clean_text_anchors(text: String) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line.strip_prefix('§').unwrap_or(line));
+    }
+    out
+}
+
 /// pre>code 保真化（盲测七 0bh）：rustdoc 类文档页的 code 块内含 span 高亮 / a 链接 /
 /// div where 等结构，htmd 的 span 行尾修剪会折叠换行（#[derive] 与 struct 合行）、
 /// a 转成 markdown 链接语法（代码块内注入链接）、div 块级边界注入伪影空行——三处
@@ -231,5 +246,16 @@ mod tests {
     fn clean_markdown_strips_section_anchor() {
         assert_eq!(clean_markdown("## [§](#errors)Errors".into()), "## Errors");
         assert_eq!(clean_markdown("[§](#unclosed".into()), "[§](#unclosed");
+    }
+
+    /// FixG17：纯文本路径剥行首孤立 §（extract_text 把标题自链 § 与标题文本胶成
+    /// 行首 "§Example"）；行中引用（"见 §3.2"）与无 § 行逐字节保真。
+    #[test]
+    fn clean_text_anchors_strips_line_leading_only() {
+        assert_eq!(clean_text_anchors("§Example\n§Errors\nPanics".into()), "Example\nErrors\nPanics");
+        assert_eq!(clean_text_anchors("见 §3.2 章节说明".into()), "见 §3.2 章节说明");
+        assert_eq!(clean_text_anchors("no anchors here".into()), "no anchors here");
+        // 行首 § 独立成行（链接文本单独成段）同样剥除
+        assert_eq!(clean_text_anchors("§\nExample".into()), "\nExample");
     }
 }
