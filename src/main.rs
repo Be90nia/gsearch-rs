@@ -118,10 +118,15 @@ enum Command {
         /// 6dp：meta 压缩（仅 --json --full 信封生效；debug 日志强制全量）
         #[arg(long, default_value_t = false)]
         compact_meta: bool,
-        /// xih：正文以 markdown 输出（渲染后 HTML 转换，保表格/标题/链接；隐含全文模式，与 --headings-only 互斥）。
+        /// xih：正文以 markdown 输出（渲染后 HTML 转换，隐含全文模式，与 --headings-only 互斥）。
         /// --json 时 content_text 字段换源为 markdown，meta.format="markdown" 标注。
         #[arg(long, default_value_t = false, conflicts_with = "headings_only")]
         markdown: bool,
+        /// pkp：放行私网地址（loopback / RFC1918 / link-local / 云 metadata），语义与 fetch 对齐。
+        /// 默认拒（SSRF 门）：browse 的 URL 可能来自 LLM 输出（搜索结果/页面内容间接注入），
+        /// 私网地址默认不渲染；非 http/https scheme（file:///javascript:/data: 等）一律拒绝，无 flag 可绕。
+        #[arg(long, default_value_t = false)]
+        allow_private: bool,
         #[arg(long, value_enum, default_value_t = BrowserArg::Auto)]
         /// 选择浏览器（M11）
         browser: BrowserArg,
@@ -319,7 +324,7 @@ async fn main() -> ExitCode {
     gsearch::types::set_compact_meta(compact_requested && !debug_logging);
     let result: Result<ExitCode> = match cli.cmd {
         Command::Search(args) => cmd_search(args, proxy.clone()).await,
-        Command::Browse { url, full, human, from, headings_only, compact_meta: _, markdown, browser, .. } => {
+        Command::Browse { url, full, human, from, headings_only, compact_meta: _, markdown, browser, allow_private, .. } => {
             let opts = general::BrowseOpts {
                 full,
                 // 3gw：--json 已是默认，--human 才切人读
@@ -329,6 +334,7 @@ async fn main() -> ExitCode {
                 markdown,
                 browser: browser.into(),
                 proxy: proxy.clone(),
+                allow_private,
             };
             general::cmd_browse(&url, &opts).await
         }
@@ -361,10 +367,30 @@ async fn main() -> ExitCode {
     }
 }
 
+/// o1p：空串/纯空白 query 前置拒绝——单查与 batch 两入口共用（cmd_search 开头统一拦），
+/// 不发起任何网络。返回首个非法 query 供报错（与 qbw similar 闸同型一行报错）。
+fn first_blank_query(queries: &[String]) -> Option<&str> {
+    queries.iter().map(String::as_str).find(|q| q.trim().is_empty())
+}
+
 async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode> {
+    // o1p：空 query 在客户端可知即非法——前置拒绝，不再白烧 6-11s 完整回退链
+    if let Some(q) = first_blank_query(&args.query) {
+        eprintln!("error: query 不能为空或纯空白（收到 {q:?}）；请给出搜索词");
+        return Ok(ExitCode::from(2));
+    }
     // batch 多查询：并发 searxng、单条失败不阻塞、禁浏览器回退（issue gsearch-rs-doh）
     if args.query.len() > 1 {
         return cmd_search_batch(args).await;
+    }
+    // d3u：--read N 的静态可判越界（N > --limit）在发起搜索前拒绝——结果数 ≤ limit 恒成立，
+    // N > limit 必越界，参数校验阶段 rc=2，零网络零浏览器。运行时越界（N ≤ limit 但返回不足）
+    // 仍在搜索完成后、浏览器 launch 前校验（post 块）。
+    if let Some(n) = args.read
+        && n > args.limit
+    {
+        eprintln!("error: --read {n} 越界：结果数上限为 --limit {}，请求前即可判定", args.limit);
+        return Ok(ExitCode::from(2));
     }
     let started = std::time::Instant::now();
     let browser_kind = browser_arg_to_kind(args.browser);
@@ -381,17 +407,25 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     // zc6：SearXNG 单次尝试四态——Results 直接用；CircuitBroken 熔断早退；
     // NotConfigured/FallbackGoogle 走原 Google 链（IP 正常时行为与旧版一致）。
     let searxng = gsearch::search::try_searxng(&cfg).await;
-    if matches!(searxng, gsearch::search::SearxngAttempt::CircuitBroken) {
+    if let gsearch::search::SearxngAttempt::CircuitBroken(reason) = &searxng {
         if json_mode {
             // stderr 诊断行已由 try_searxng 打（豁免未来任何静默策略）
-            emit_searxng_degraded_json(&query, &args, proxy.clone(), recency, started.elapsed().as_millis());
+            emit_searxng_degraded_json(&query, &args, proxy.clone(), recency, started.elapsed().as_millis(), reason);
         }
         // 人读模式 stdout 不打假结果；退出码 2 = 无结果语义族
         return Ok(ExitCode::from(2));
     }
-    // yq6：记下主源失败——若 Google 回退也空，run.status 统一打 searxng_degraded
-    //（此前该分支 exit 2 且信封无状态标记，agent 无从区分「没资料」与「源降级」）。
-    let searxng_fell_back = matches!(searxng, gsearch::search::SearxngAttempt::FallbackGoogle);
+    // yq6 + o1p：记下主源状态——FallbackGoogle(Some) = SearXNG 故障（回退空 → searxng_degraded）；
+    // FallbackGoogle(None)/HealthyEmpty = SearXNG 源健康零结果（回退空 → filtered_empty/no_results）。
+    let searxng_fallback_reason = match &searxng {
+        gsearch::search::SearxngAttempt::FallbackGoogle(r) => r.clone(),
+        _ => None,
+    };
+    let searxng_source_healthy = matches!(
+        searxng,
+        gsearch::search::SearxngAttempt::HealthyEmpty
+            | gsearch::search::SearxngAttempt::FallbackGoogle(None)
+    );
     let (mut results, captcha_solved, provider) = match searxng {
         gsearch::search::SearxngAttempt::Results(
             gsearch::search::SearchOutcome::Results { results, captcha_solved, provider },
@@ -463,8 +497,21 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     for r in &mut results {
         r.snippet = gsearch::output::truncate_snippet(&r.snippet, args.snippet_len);
     }
-    // yq6：主源降级且回退也空——如实证状态，防 agent 把基础设施问题当「话题无资料」
-    let degraded = results.is_empty() && searxng_fell_back;
+    // yq6 + o1p：主源降级且回退也空 → searxng_degraded（真因透传）；主源健康空 →
+    // filtered_empty（recency 过滤后）/ no_results（查询无果）——防把「没新鲜结果」当基础设施故障。
+    let degraded = results.is_empty() && searxng_fallback_reason.is_some();
+    let healthy_empty = results.is_empty() && searxng_source_healthy;
+    let (run_status, run_message) = if degraded {
+        let reason = searxng_fallback_reason.as_deref().unwrap_or_default();
+        (gsearch::types::RunStatus::SearxngDegraded, gsearch::search::circuit_diag(reason))
+    } else if healthy_empty {
+        let (s, m) = gsearch::search::SearxFail::empty_status(recency);
+        (s, m.to_string())
+    } else if captcha_solved {
+        (gsearch::types::RunStatus::Ok, "本次搜索经过了人工 CAPTCHA 验证".into())
+    } else {
+        (gsearch::types::RunStatus::Ok, String::new())
+    };
     // 0mf：--json + --read 时 read 产物并入单一 JSON 文档——envelope 延后装配，stdout 只出
     // 一份可解析 JSON（旧行为 envelope 先打 + read raw 追加 = json.loads 崩）。
     // b95：--headings-only 连 SERP 集都不进输出（text 模式同样跳过 print_text）。
@@ -483,21 +530,13 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         provider: provider.into(),
         recency: recency.map(|r| r.as_str().into()),
     };
+    // o1p：stderr 诊断行与 run.status 同源——run move 进信封后仍需在空结果分支打 stderr
+    let stderr_diag = (results.is_empty() && !run_message.is_empty()).then(|| run_message.clone());
     let run = gsearch::types::RunStatusInfo {
-        // yq6：searxng 主源失败且回退也空 → 与熔断同款 degraded 标记（零结果 ≠ Ok）
-        status: if degraded {
-            gsearch::types::RunStatus::SearxngDegraded
-        } else {
-            gsearch::types::RunStatus::Ok
-        },
+        // yq6 + o1p：degraded / filtered_empty / no_results 三态零结果语义分立（零结果 ≠ Ok）
+        status: run_status,
         captcha_solved,
-        message: if captcha_solved {
-            "本次搜索经过了人工 CAPTCHA 验证".into()
-        } else if degraded {
-            gsearch::search::SEARXNG_CIRCUIT_MSG.into()
-        } else {
-            String::new()
-        },
+        message: run_message,
     };
     let envelope = gsearch::types::OutputEnvelope { meta, run, results: &results };
     if !read_solo_json {
@@ -507,12 +546,18 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             gsearch::output::print_text(&results);
         }
     }
-    // M4 后处理（PLAN §3.4）：clap ArgGroup \"post\" 保证 --open/--read/--dl 互斥；仅剩运行时分发。
+    // M4 后处理（PLAN §3.4）：clap ArgGroup "post" 保证 --open/--read/--dl 互斥；仅剩运行时分发。
     let post = async {
         if let Some(n) = args.open {
             postproc::open(&results, n)?;
         }
         if let Some(n) = args.read {
+            // d3u：越界是静态可判的——结果数在搜索完成时已知，检查前移到浏览器 launch
+            // 之前（纯参数校验阶段拒绝），免白起一次完整 Chrome（~1-2s）。错误信息与
+            // postproc::pick 内层检查同款（read_error 输出契约不变）。
+            if n > results.len() {
+                anyhow::bail!("--read {n} 越界（结果数 {}）", results.len());
+            }
             // M17 惰性：SearXNG 命中时浏览器尚未启动，--read/--dl 首次用到才 launch(headless)
             let browser = ensure_search_browser(&mut browser_opt, &mut h_slot, browser_kind, proxy.clone()).await?;
             let opts = postproc::ReadOpts {
@@ -572,6 +617,10 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         }
     }
     if results.is_empty() {
+        // o1p：stderr 诊断行与 run.status 同步（degraded/filtered_empty/no_results 各自一行）
+        if let Some(d) = &stderr_diag {
+            eprintln!("{d}");
+        }
         eprintln!("未找到结果");
         Ok(ExitCode::from(2))
     } else {
@@ -603,6 +652,15 @@ async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode>
         }
         return Ok(ExitCode::SUCCESS);
     }
+    // 1az：快乐路径信封自洽——有结果且 rc=0 → status=ok；run.message 带 provider/结果数摘要
+    //（原 default() 是 status=error，与 rc=0/results 非空三信号互相打架）。
+    // hits 空不可达：searxng_collect Ok 恒非空（零结果走 Err 分支）。
+    let run = gsearch::types::RunStatusInfo {
+        status: gsearch::types::RunStatus::Ok,
+        captcha_solved: false,
+        // 先组装 message（derived_query 随后 move 进 meta.query）
+        message: format!("searxng 派生查询命中 {} 条（查询: {derived_query}）", hits.len()),
+    };
     let meta = gsearch::types::MetaOutput {
         tool: "gsearch",
         version: env!("CARGO_PKG_VERSION"),
@@ -616,7 +674,6 @@ async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode>
         provider: "searxng".into(),
         recency: None,
     };
-    let run = gsearch::types::RunStatusInfo::default();
     let envelope = gsearch::types::OutputEnvelope { meta, run, results: &hits };
     let mut doc = serde_json::to_value(&envelope)?;
     if let Some(obj) = doc.as_object_mut() {
@@ -659,7 +716,19 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
                     "batch 无浏览器路径，CaptchaTimeout 不应出现".into(),
                     vec![],
                 ),
-                Err(reason) => (gsearch::types::RunStatus::Error, reason, vec![]),
+                // o1p：源健康零结果按 recency 定态（filtered_empty/no_results），不再一律 error；
+                // 故障真因仍按旧格式进 error message（存量契约不破）
+                Err(fail) => match &fail {
+                    gsearch::search::SearxFail::HealthyEmpty => {
+                        let (s, m) = gsearch::search::SearxFail::empty_status(recency);
+                        (s, m.to_string(), vec![])
+                    }
+                    gsearch::search::SearxFail::SourceError(reason) => (
+                        gsearch::types::RunStatus::Error,
+                        format!("SearXNG 查询失败（{reason}）；batch 模式禁浏览器回退"),
+                        vec![],
+                    ),
+                },
             };
             // cw8/3gw：snippet 封顶与单查询同规则
             for r in &mut results {
@@ -722,8 +791,11 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
             println!("=== [{}/{}] {} ===", i + 1, entries.len(), e.query);
             if e.status == gsearch::types::RunStatus::Error {
                 println!("  出错: {}", e.message);
-            } else {
+            } else if e.status == gsearch::types::RunStatus::Ok {
                 gsearch::output::print_text(&e.results);
+            } else {
+                // o1p：三态非 Ok 状态（filtered_empty/no_results/degraded）透出诊断行
+                println!("  {}", e.message);
             }
         }
     }
@@ -799,12 +871,14 @@ fn emit_captcha_timeout_json(
 
 /// zc6：SearXNG 熔断输出——status=searxng_degraded（元审计硬约束值）、provider 照实标
 /// searxng、results 空；message 带诊断行让 Agent 无需解析 stderr。
+/// o1p：真因（HTTP 错误码等）透传进 message，与 stderr 诊断行同源（circuit_diag）。
 fn emit_searxng_degraded_json(
     query: &str,
     args: &SearchArgs,
     proxy: Option<String>,
     recency: Option<gsearch::search::Recency>,
     elapsed_ms: u128,
+    reason: &str,
 ) {
     let meta = gsearch::types::MetaOutput {
         tool: "gsearch",
@@ -823,7 +897,7 @@ fn emit_searxng_degraded_json(
     let run = gsearch::types::RunStatusInfo {
         status: gsearch::types::RunStatus::SearxngDegraded,
         captcha_solved: false,
-        message: gsearch::search::SEARXNG_CIRCUIT_MSG.into(),
+        message: gsearch::search::circuit_diag(reason),
     };
     let envelope: gsearch::types::OutputEnvelope<Vec<()>> =
         gsearch::types::OutputEnvelope { meta, run, results: vec![] };
@@ -1190,7 +1264,7 @@ async fn fetch_public_ip() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::check_exit_ip_drift;
-    use super::{Cli, Command, RecencyArg};
+    use super::{first_blank_query, Cli, Command, RecencyArg};
     use clap::Parser;
 
     /// 5a5：首跑无记录→None 且落盘；同 IP→静默；换 IP→WARN 文案含新旧 IP。
@@ -1212,6 +1286,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+
+    /// o1p：空串/纯空白 query 前置拒绝——单查与 batch 两入口共用的入口校验纯函数。
+    #[test]
+    fn blank_query_gate_detects_whitespace_only() {
+        assert_eq!(first_blank_query(&["".into()]), Some(""));
+        assert_eq!(first_blank_query(&["   ".into(), "\t\n".into()]), Some("   "));
+        assert_eq!(first_blank_query(&["rust async".into(), "  ".into()]), Some("  "));
+        assert_eq!(first_blank_query(&["rust async".into(), "tokio".into()]), None);
+    }
 
     /// M18：humanize 默认 true（人用保留 warmup），加 --no-humanize 跳过。
     #[test]

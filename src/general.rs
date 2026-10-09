@@ -42,6 +42,46 @@ pub struct BrowseOpts {
     pub browser: Option<BrowserKind>,
     /// M12 浏览器代理；None = 走直连
     pub proxy: Option<String>,
+    /// pkp：放行私网地址（仅 browse 子命令挂此 flag；语义与 fetch --allow-private 对齐）。
+    pub allow_private: bool,
+}
+
+/// pkp：浏览器入口 scheme 白名单（http/https）——非白名单（file:///javascript:/data: 等）
+/// 快失败；无 scheme 的裸 host 按浏览器默认语义补 https://。返回规范化 URL 供 goto 消费。
+/// rationale（I9 威胁模型）：入口 URL 可能来自 LLM 输出（搜索结果/页面内容间接注入），
+/// file:// 可把本地文件内容带进 agent 上下文外泄，javascript:/data: 是注入向量。
+pub(crate) fn browsable_scheme_ok(url: &str) -> Result<String> {
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    // 无 :// 但以已知 scheme 词头开头的（javascript:alert(1) / data:text/html / file:C:/x）
+    //——不得落入补全分支变成 https://javascript:…。
+    const BLOCKED_SCHEMES: [&str; 6] = ["javascript:", "data:", "file:", "blob:", "vbscript:", "view-source:"];
+    if trimmed.is_empty() {
+        anyhow::bail!("URL 不能为空")
+    } else if lower.starts_with("http://") || lower.starts_with("https://") {
+        Ok(trimmed.to_string())
+    } else if trimmed.contains("://") || BLOCKED_SCHEMES.iter().any(|s| lower.starts_with(s)) {
+        anyhow::bail!("拒绝非 http/https URL（file:///javascript:/data: 等 scheme 不安全或无意义；URL 可能来自不可信来源）: {url}")
+    } else {
+        // 裸 host（含 host:port，如 localhost:3000）→ 浏览器默认语义补 https://
+        Ok(format!("https://{trimmed}"))
+    }
+}
+
+/// pkp：browse 入口完整门 = scheme 白名单 + 私网门（SSRF 对齐 fetch，私网判定同源 classify_url）。
+/// login/dl 仅走 scheme 白名单（browsable_scheme_ok）——内网登录页/内网下载是既有合法场景。
+pub(crate) fn ensure_browsable_url(url: &str, allow_private: bool) -> Result<String> {
+    let normalized = browsable_scheme_ok(url)?;
+    let (host, ip, private) = crate::fetch::classify_url(&normalized)?;
+    if private && !allow_private {
+        anyhow::bail!("browse 拒绝私网地址 {ip}（host={host}）。如确需内网页面，请传 --allow-private");
+    }
+    Ok(normalized)
+}
+
+/// 7z0：dl -o/--output-file 相对路径禁 .. 穿越段（防静默落盘出 CWD）；绝对路径显式放行。
+fn has_parent_traversal(p: &Path) -> bool {
+    !p.is_absolute() && p.components().any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
 /// `browse <url>`：headless 渲染 → 默认 AdaptiveRead（M9），`--full` 纯 innerText（50000 cap，
@@ -53,6 +93,15 @@ pub struct BrowseOpts {
 /// jp4：html 过 read_max_chars 硬截断，--json 在 meta 字段标注 truncated/omitted/content_untrusted。
 pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
     use crate::postproc;
+    // pkp：scheme 白名单 + 私网门（--allow-private 放行）——快失败不启动 Chrome
+    let url = match ensure_browsable_url(url, opts.allow_private) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    let url = url.as_str(); // 规范化后仍按 &str 流转，后续代码零改动
     let started = std::time::Instant::now();
     let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
     let result: Result<()> = async {
@@ -158,6 +207,15 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
 /// 不判 CAPTCHA（登录页是真人登录页，PLAN §3.5）。
 /// H2+M2：launch 后所有 ? 早返回由外层 graceful_close 收尾。
 pub async fn cmd_login(url: &str, browser: Option<BrowserKind>, proxy: Option<String>) -> Result<ExitCode> {
+    // pkp：scheme 白名单（login 无 --allow-private，私网不设门——内网登录页是合法场景）
+    let url = match browsable_scheme_ok(url) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    let url = url.as_str(); // 规范化后仍按 &str 流转
     let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
     let result: Result<bool> = async {
         let (browser_inst, handler) = launch_with_kind_proxy(false, browser, proxy).await?;
@@ -244,6 +302,24 @@ pub(crate) async fn browser_alive(browser: &chromiumoxide::Browser) -> bool {
 /// 渲染型 URL（普通网页，Chrome 不触发下载）回退页内 fetch 落盘（PLAN §3.5 raw-file 路径，同源 cookie）。
 pub async fn cmd_dl(url: &str, output: Option<&Path>, output_file: Option<&Path>, browser: Option<BrowserKind>, proxy: Option<String>) -> Result<ExitCode> {
     use crate::postproc;
+    // pkp：scheme 白名单（与 browse/login 同门快失败；dl 私网不设门——内网下载走既有 browser 回退路径）
+    let url = match browsable_scheme_ok(url) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    let url = url.as_str(); // 规范化后仍按 &str 流转
+    // 7z0：相对路径禁 .. 穿越段（防静默落盘出 CWD，URL/文件名可能来自不可信上下文）；
+    // 绝对路径 = 用户显式指定，放行。
+    if let Some(p) = [output, output_file].into_iter().flatten().find(|p| has_parent_traversal(p)) {
+        eprintln!(
+            "error: dl -o/--output-file 相对路径不允许包含 ..（防穿越 CWD 落盘）；确需外部路径请用绝对路径: {}",
+            p.display()
+        );
+        return Ok(ExitCode::from(2));
+    }
     let (dir, file_target) = resolve_dl_target(output, output_file)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
     // v97 直链快路径；direct 一旦进入下载阶段失败 → Err 冒泡（不伪装回退，半截文件留给用户判断重试）。
@@ -492,6 +568,68 @@ mod tests {
         assert!(!is_gate_dns_error(&anyhow::anyhow!(
             "fetch 拒绝私网地址 127.0.0.1（host=localhost）"
         )));
+    }
+
+    /// pkp：scheme 白名单表——http/https 放行；file:///javascript:/data:/ftp:/chrome: 拒；
+    /// 无 scheme 裸 host 按浏览器默认语义补 https://（含空白 trim）。
+    #[test]
+    fn browsable_scheme_whitelist_table() {
+        // 白名单原样放行
+        assert_eq!(browsable_scheme_ok("https://example.com").unwrap(), "https://example.com");
+        assert_eq!(browsable_scheme_ok("http://example.com/a?b=1").unwrap(), "http://example.com/a?b=1");
+        assert_eq!(browsable_scheme_ok("  HTTPS://Example.com  ").unwrap(), "HTTPS://Example.com");
+        // 无 scheme → 补 https://（goto 前规范化，Chrome 语义一致）
+        assert_eq!(browsable_scheme_ok("example.com/page").unwrap(), "https://example.com/page");
+        // 非白名单快失败
+        for bad in [
+            "file:///D:/gsbt5/secret.html",
+            "file:///C:/Windows/win.ini",
+            "javascript:alert(1)",
+            "data:text/html,<script>x</script>",
+            "ftp://example.com/f.bin",
+            "chrome://settings",
+            "file:C:/x/y.html",
+            "JAVASCRIPT:alert(1)",
+        ] {
+            assert!(browsable_scheme_ok(bad).is_err(), "{bad} 应被拒");
+        }
+        // host:port 裸形态放行补全（与 javascript: 区分）
+        assert_eq!(browsable_scheme_ok("localhost:3000/app").unwrap(), "https://localhost:3000/app");
+        assert!(browsable_scheme_ok("   ").is_err(), "空 URL 应被拒");
+    }
+
+    /// pkp：私网门判定表（字面 IP 不走 DNS）——loopback/RFC1918/link-local/::1 默认拒，
+    /// --allow-private 放行；公网字面 IP 过；scheme 白名单先于私网门（file:// 即使放行也拒）。
+    #[test]
+    fn browsable_private_gate_table() {
+        for url in [
+            "http://127.0.0.1:8888/",
+            "http://10.0.0.5/x",
+            "http://172.16.1.1/a",
+            "http://192.168.89.249:8888/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:8888/",
+        ] {
+            assert!(ensure_browsable_url(url, false).is_err(), "{url} 默认应拒");
+            assert!(ensure_browsable_url(url, true).is_ok(), "{url} --allow-private 应放行");
+        }
+        assert!(ensure_browsable_url("http://93.184.216.34/", false).is_ok(), "公网字面 IP 应过私网门");
+        // scheme 白名单先行：file:// 无 flag 可绕
+        assert!(ensure_browsable_url("file:///C:/Windows/win.ini", true).is_err());
+        // 错误文案带 --allow-private 指引（browse 语义，非 fetch 文案）
+        let err = ensure_browsable_url("http://127.0.0.1:1/", false).unwrap_err().to_string();
+        assert!(err.contains("--allow-private") && err.contains("browse"), "{err}");
+    }
+
+    /// 7z0：dl -o/--output-file 相对路径 .. 穿越段拒绝；绝对路径（含 ..）显式放行。
+    #[test]
+    fn dl_output_parent_traversal_table() {
+        assert!(has_parent_traversal(std::path::Path::new("../upone.bin")));
+        assert!(has_parent_traversal(std::path::Path::new("a/../../b.bin")));
+        assert!(has_parent_traversal(std::path::Path::new("..")));
+        assert!(!has_parent_traversal(std::path::Path::new("sub/out.bin")));
+        assert!(!has_parent_traversal(std::path::Path::new("D:/out/x.bin")));
+        assert!(!has_parent_traversal(std::path::Path::new("D:/out/../x.bin")), "绝对路径显式放行");
     }
 
     /// i9a：-o 末段带扩展名 = 文件；纯目录名 = 目录；--output-file 优先；都缺省 = CWD 目录。

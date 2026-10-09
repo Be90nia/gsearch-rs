@@ -108,9 +108,10 @@ pub(crate) fn allow_private_requested(flag: bool) -> bool {
             .unwrap_or(false)
 }
 
-/// 私网门判定核心：URL → host → IP → 私网判定。返回 (host, ip, 是否私网)。
-/// allow_private=true 时仍解析返回——调用方需要私网性决定是否放行内网明文 http。
-pub(crate) fn gate_check(url: &str, allow_private: bool) -> Result<(String, IpAddr, bool)> {
+/// URL → host → IP → 私网判定（pkp 拆分：无调用方文案的纯判定层）。
+/// 返回 (host, ip, 是否私网)。私网性始终返回——调用方结合 allow_private 决定拒/放行，
+/// 错误文案由调用方（fetch / browse 门）各自包装，避免 browse 场景打出「fetch 拒绝」。
+pub(crate) fn classify_url(url: &str) -> Result<(String, IpAddr, bool)> {
     let scheme_end = url.find("://").ok_or_else(|| anyhow!("URL 无 scheme: {url}"))?;
     let after_scheme = &url[scheme_end + 3..];
     // host 提取：IPv6 字面量（[...]）vs 主机名（首个 '/?#:' 截断）
@@ -127,12 +128,19 @@ pub(crate) fn gate_check(url: &str, allow_private: bool) -> Result<(String, IpAd
     };
     let ip = resolve_host(host)?;
     let private = is_private_ip(ip);
-    if private && !allow_private {
-        return Err(anyhow!(
-            "fetch 拒绝私网地址 {ip}（host={host}）。如确需内网，请传 --allow-private 或设置 GSEARCH_FETCH_ALLOW_PRIVATE=1"
-        ));
-    }
     Ok((host.to_string(), ip, private))
+}
+
+/// 私网门判定核心：URL → host → IP → 私网判定。返回 (host, ip, 是否私网)。
+/// allow_private=true 时仍解析返回——调用方需要私网性决定是否放行内网明文 http。
+pub(crate) fn gate_check(url: &str, allow_private: bool) -> Result<(String, IpAddr, bool)> {
+    let (host, ip, private) = classify_url(url)?;
+    if private && !allow_private {
+        anyhow::bail!(
+            "fetch 拒绝私网地址 {ip}（host={host}）。如确需内网，请传 --allow-private 或设置 GSEARCH_FETCH_ALLOW_PRIVATE=1"
+        );
+    }
+    Ok((host, ip, private))
 }
 
 /// 响应体累积（Important-3 字节上限）：把 chunk 接进 buf，超 limit 即截断到 limit 并报告 hit。
@@ -245,8 +253,9 @@ async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
     // 公网明文 http 一律拒（防降级 + 重定向中转 SSRF）；私网 http 仅在显式放行时允许
     // （内网端点常见 http-only，allow_private 即「自担风险进内网」的完整语义）。
     if url.trim_start().to_ascii_lowercase().starts_with("http://") && !(allow && is_priv) {
+        // 7z0：这是 https 门不是私网门——--allow-private 对公网无效，文案不得误导推荐
         return Err(anyhow!(
-            "fetch 仅支持 https：公网明文 http 已禁用（防降级与重定向 SSRF 中转）。如确需内网 http 页面，请传 --allow-private 或设置 GSEARCH_FETCH_ALLOW_PRIVATE=1: {url}"
+            "fetch 仅支持 https：公网明文 http 已禁用（防降级与重定向 SSRF 中转）。--allow-private 仅放行内网 http，对公网地址无效；如该站有 https 地址请改用 https: {url}"
         ));
     }
     let client = build_client(opts.proxy.as_deref(), allow, Duration::from_secs(FETCH_TIMEOUT_SECS))?;

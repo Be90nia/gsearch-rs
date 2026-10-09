@@ -2,7 +2,7 @@
 
 **AI-first** 搜索 + 通用浏览器代理 CLI：单 exe、零扩展、零运行时依赖（有 Chrome 即可）。输出契约默认为**紧凑 JSON**——软件的唯一消费者是 AI/agent（LLM 下游），token 是一等成本；人要人读输出加 `--human`。移植自 plsearch（Python/Playwright）的核心能力。
 
-> 输出契约（3gw 翻转，v0.2.9+）：所有顶层命令默认输出**单行紧凑 JSON**；存量脚本的 `--json` flag 仍可解析但已无效果（JSON 本就是默认）；`--human` 切回人读文本。缺席语义：`message:""`、`truncated:false`、`captcha_solved:false` 等**正常态字段直接缺席**（缺席 = 正常，出现 = 有新闻）。
+> 输出契约（3gw 翻转，v0.2.9+）：所有顶层命令默认输出**单行紧凑 JSON**；存量脚本的 `--json` flag 仍可解析但已无效果（JSON 本就是默认）；`--human` 切回人读文本。缺席语义：`message:""`、`truncated:false`、`captcha_solved:false` 等**正常态字段直接缺席**（缺席 = 正常，出现 = 有新闻）。**人读豁免（ago 实测修正）**：`dl` 与 `update` 与 `login` 输出人读文本而非 JSON——`dl` 报 `mode: …` 与落盘路径、`update` 报版本比对结论、`login` 报登录过程提示；agent 消费这三个命令的 stdout 请按文本处理（`json.loads` 不适用）。`search` / `similar` / `fetch` / `verify` / `browse` / `doctor` 是 JSON 契约通道（doctor 默认结构化 JSON，`--human` 才是人读表）。
 
 ## 用法
 
@@ -12,7 +12,7 @@
 gsearch search "python asyncio" --limit 10        # 默认输出紧凑 JSON（单行无缩进）
 gsearch search "fastapi tutorial" --human         # 人读文本模式（旧格式）
 gsearch search "rust release" --recency week      # 时间过滤 day|week|month|year
-gsearch search "..." --humanize=false             # 跳过搜索前 warmup（agent 高频调用建议）
+gsearch search "..." --no-humanize                # 跳过搜索前 warmup（agent 高频调用建议）
 gsearch search "..." --read 1
 gsearch search "..." --dl 1
 gsearch search "..." --open 1
@@ -20,18 +20,18 @@ gsearch search "..." --open 1
 
 `--humanize` 默认启用：Google 搜索前随机访问 Wikipedia/GitHub/HN，滚动并短暂停留；指纹补丁仅用于 search，不改变 browse/login。agent 反复调用建议加 `--no-humanize`。
 
-`--recency day|week|month|year` 时间过滤多 provider 生效：SearXNG 请求追加 `time_range`，Google SERP URL 追加 `tbs=qdr:d/w/m/y`，DDG html 表单追加 `df=d/w/m/y`；不传时请求 URL 与旧版逐字节一致。`site:` 等查询语法原样透传，无专属参数。batch 多查询同样生效（batch 仅 SearXNG 源）。`meta.recency` 回显本次过滤值（未传时键缺席）。
+`--recency day|week|month|year` 时间过滤多 provider 生效：SearXNG 请求追加 `time_range`，Google SERP URL 追加 `tbs=qdr:d/w/m/y`，DDG html 表单追加 `df=d/w/m/y`；不传时请求 URL 与旧版逐字节一致。`site:` 等查询语法原样透传，无专属参数。batch 多查询同样生效（batch 仅 SearXNG 源）。`meta.recency` 回显本次过滤值；`meta.proxy` 回显代理——两者未传时**键真缺席**（ago：缺席语义执行到底，不输出 `null`）。
 
-参数护栏：`--limit` 取 1..=100（SearXNG 单查最多 10 页×10 条，更大只会翻页白耗时）；`--read N` 取 N≥1（`--read 0` 直接被 clap 拒绝，不再白起浏览器）。
+参数护栏：`--limit` 取 1..=100（SearXNG 单查最多 10 页×10 条，更大只会翻页白耗时）；`--read N` 取 N≥1（`--read 0` 直接被 clap 拒绝，不再白起浏览器）；`--read N` 的 N > `--limit` 时在**发起搜索前**静态拒绝（结果数 ≤ limit 恒成立，参数校验 rc=2，d3u：零网络零浏览器）。空串/纯空白 query 在**发起任何网络前**拒绝（rc=2，单查询与 batch 两入口同拦，o1p）。
 
 #### JSON 输出契约（默认）
 
 - **紧凑单行**（无缩进——缩进对 LLM 是纯 token 税）
 - 每条结果：`title / url / snippet / score / domain_class`
   - `snippet` 默认 160 字符截断（`--snippet-len N` 可调，1..=100000）
-  - `score` 为 SearXNG 内部相关性分透传（agent 可按分筛序）；DDG html 用返回序等价分（首条 = n 递减到 1，返回序即相关性序）；Google 等无分来源此键缺席
+  - `score` 为 SearXNG 内部相关性分透传（agent 可按分筛序）；DDG html 用 **SERP 页位置分**——DDG 首页返回序去重后打分，SERP 第 1 位 = 10.0，每降一位 -1.0（`--limit` 截断不改变分数，故 limit=3 实测得 `[10,9,8]`，ago 实测修正）；**跨 provider 量纲不同，不可直比**（SearXNG 内部分与 DDG 位置分无换算关系）；Google 等无分来源此键缺席
   - `domain_class`：URL host 启发式（docs/github/wikipedia/blog/forum/video/news/qa/other），可按类筛权威源
-- 顶层 `run.status`：`ok / captcha_required / captcha_timeout / searxng_degraded / error`
+- 顶层 `run.status`：`ok / captcha_required / captcha_timeout / searxng_degraded / filtered_empty / no_results / error`——零结果三态分立（o1p）：`searxng_degraded` = 源故障/熔断（跑 doctor），`filtered_empty` = recency 过滤后空、源健康（去掉 --recency 或换时间窗），`no_results` = 查询无果、源健康（换词重试）
 - `meta` 键缺席语义：`truncated:false`、空 `message`、`captcha_solved:false` 均不占键；`results_count` 已移除（`len(results)` 可推导）；`browser_path` / `browser_kind` 已移除（环境噪声，浏览器信息走 `gsearch doctor`）
 - `--compact-meta`（opt-in）：meta 裁到 query/limit/elapsed_ms/provider/recency 等少量键（`--verbose debug` 时强制全量排障）
 
@@ -46,13 +46,19 @@ gsearch search "rust async runtime" "tokio tutorial" --limit 3
 ```
 
 多位置参数 = batch 模式：并发走 SearXNG、单条失败不阻塞其他、**禁浏览器回退**（浏览器单例不可并发），
-默认输出裸数组（紧凑 JSON），元素含 `query / status / meta / results`（ok 条目 `message` 缺席，error 条目携带原因）。
-退出码：`0` 全成功 / `1` 部分失败 / `2` 全部失败。单查询模式行为不变（SearXNG → DDG → Google 回退链完整保留）。
+默认输出裸数组（紧凑 JSON），元素含 `query / status / meta / results`（ok 条目 `message` 缺席；error 条目携带真因，含 SearXNG HTTP 错误码；源健康零结果条目标 `filtered_empty` / `no_results` 而非 error，o1p）。
+退出码：`0` 全成功 / `1` 部分失败 / `2` 全部失败。单查询模式行为不变（SearXNG → DDG → Google 回退链完整保留）。空串/纯空白 query 在发起任何网络前整体拒绝（rc=2）。
 
-#### SearXNG 熔断与降级标记（searxng_degraded）
+#### SearXNG 熔断与零结果三态（searxng_degraded / filtered_empty / no_results）
 
 单查询回退链为 **SearXNG → DDG html → Google**：SearXNG 挂/零结果时先试 DDG html 直连（纯 HTTP 免浏览器，命中时 `meta.provider=duckduckgo`、stderr 一行接管提示）；DDG 也空才做 Google 直连预检（TCP 1.5s）：不通则**熔断**——跳过回退秒级返回，`run.status=searxng_degraded`、exit 2、stderr 一行诊断（基础设施降级 ≠ 查询无资料，agent 应换短 query / `doctor` / 直接 `fetch` 已知源，而非当空结果处理）。
-IP 可达时回退 Google 直爬；**若回退也零结果，信封 `run.status` 同样标 `searxng_degraded`**（此前该路径 exit 2 但无状态标记，agent 无从区分「没资料」与「源降级」）。DDG 被风控（anomaly challenge）时 stderr 显式报 challenge 而非静默算零结果。**已实测限制（2026-10-09）**：reqwest 的 TLS/头指纹在共享代理出口下会被 DDG anomaly 风控拦截（curl/.NET 同出口 200），出口 IP 信誉被拉黑的场景 DDG 直连层救「SearXNG 容器死」不救「出口黑」。
+IP 可达时回退 Google 直爬；**若回退也零结果，按 SearXNG 主源健康度定态（o1p 三态，stderr 诊断行与 `run.status`/`run.message` 同步）**：
+
+- SearXNG **故障**（HTTP 4xx/5xx、超时、解析失败）→ `run.status=searxng_degraded`，message 尾部透传真因（如 `HTTP 400 Bad Request`）
+- SearXNG **健康**（HTTP 200 但零结果）+ `--recency` → `run.status=filtered_empty`（「过滤后空」≠ 基础设施故障；去掉 `--recency` / 换时间窗即可）
+- SearXNG **健康** + 无 `--recency` → `run.status=no_results`（查询真无果，换词重试）
+
+此前「recency 过滤后零结果」被误标 `searxng_degraded`，agent 会跑 doctor 排障——现已分立。DDG 被风控（anomaly challenge）时 stderr 显式报 challenge 而非静默算零结果。**已实测限制（2026-10-09）**：reqwest 的 TLS/头指纹在共享代理出口下会被 DDG anomaly 风控拦截（curl/.NET 同出口 200），出口 IP 信誉被拉黑的场景 DDG 直连层救「SearXNG 容器死」不救「出口黑」。
 
 #### similar（启发式相似页，e7c）
 
@@ -60,7 +66,7 @@ IP 可达时回退 Google 直爬；**若回退也零结果，信封 `run.status`
 gsearch similar "https://docs.rs/serde" --limit 3
 ```
 
-从 URL 提取 host 与 path 末段关键词派生查询（`docs.rs/serde` → 查 `serde`；纯域名退化 `site:<host>`），走 SearXNG 单查（超采样 limit×3，8..=15 条），按 **title 词重合 ×2 + 同域 ×1** 加权 stable 重排。**启发式派生查询，非 exa 神经 findSimilar**——预期管理：同主题词命中与同站相关页，不是语义相似。输入必须是 URL 形态：无 scheme 时接受 `docs.rs/serde` 这类 host/path 形态；明显非 URL（含空白、无点分 host 又无 path，如 `not-a-url`）**发起搜索前直接拒绝**（stderr 一行报错 + 退出码 2），不产出垃圾派生查询。输出 = 常规搜索信封 + 每条 `similarity` 标注（启发来源，如 `title=serde; site=docs.rs`）+ 顶层 `similar_of`（源 URL）与 `note`。需配置 SearXNG（`searxng_url` / `GSEARCH_SEARXNG_URL`），不参与 Google/DDG 回退链。`meta.provider=searxng`、`meta.query` 回显派生查询。
+从 URL 提取 host 与 path 末段关键词派生查询（`docs.rs/serde` → 查 `serde`；纯域名退化 `site:<host>`），走 SearXNG 单查（超采样 limit×3，8..=15 条），按 **title 词重合 ×2 + 同域 ×1** 加权 stable 重排。**启发式派生查询，非 exa 神经 findSimilar**——预期管理：同主题词命中与同站相关页，不是语义相似。输入必须是 URL 形态：无 scheme 时接受 `docs.rs/serde` 这类 host/path 形态；明显非 URL（含空白、无点分 host 又无 path，如 `not-a-url`）**发起搜索前直接拒绝**（stderr 一行报错 + 退出码 2），不产出垃圾派生查询。输出 = 常规搜索信封 + 每条 `similarity` 标注（启发来源，如 `title=serde; site=docs.rs`）+ 顶层 `similar_of`（源 URL）与 `note`。**有结果时 `run.status=ok`、`run.message` 携带 provider/结果数摘要**（1az：信 rc/status/results 三信号一致，不再 status=error）。需配置 SearXNG（`searxng_url` / `GSEARCH_SEARXNG_URL`），不参与 Google/DDG 回退链。`meta.provider=searxng`、`meta.query` 回显派生查询。
 
 ### read / browse 输出契约（供 agent 消费）
 
@@ -116,7 +122,7 @@ gsearch fetch https://docs-site/page --markdown # 正文 markdown（表格/标�
 |---|---|
 | 0 | 成功（batch = 全部条目成功；doctor = 全 PASS 或仅 WARN；verify 批量 = 全部 URL OK） |
 | 1 | 命令执行错误（error 链）/ batch 部分失败 / **search --read 读失败（JSON 顶层 read_error）** / **verify 批量部分失败** / doctor 有 FAIL / **fetch JS 壳（预期行为，stderr 提示换 browse）** / **fetch 私网门拒（stderr 提示加 --allow-private）** |
-| 2 | 无结果 / batch 全部失败 / **verify 批量全部失败 / verify 单 URL HTTP 4xx/5xx（verdict=http_error）** / search SearXNG 熔断或回退后仍空（run.status=searxng_degraded） / 启动早期错误（参数、配置、浏览器缺失）/ **similar 输入非 URL 形态** |
+| 2 | 无结果（含 `run.status=filtered_empty` / `no_results`）/ **search 空 query 前置拒绝** / **search --read N > --limit 静态拒绝（d3u）** / batch 全部失败 / **verify 批量全部失败 / verify 单 URL HTTP 4xx/5xx（verdict=http_error）** / search SearXNG 熔断或回退后仍空（run.status=searxng_degraded）/ 启动早期错误（参数、配置、浏览器缺失）/ **similar 输入非 URL 形态** / **browse 非 http/https scheme 拒绝 / browse 私网默认拒** / **dl -o 相对路径含 `..` 拒绝（7z0）** |
 | 3 | search：CAPTCHA 亲解超时（约 120s，profile 已养熟重试可跳过）；**verify 特例**：SSL 握手失败 |
 | 4 | 仅 verify：DNS 解析失败（curl exit 6） |
 | 5 | 仅 verify：请求超时（curl exit 28；`--timeout` 可调，默认 5s） |
@@ -137,12 +143,14 @@ gsearch dl    https://.../file.pdf -o DIR       # 下载到指定目录（不存
 gsearch dl    https://.../file.pdf -o a.bin --output-file b.bin  # -o 含扩展名=文件语义；--output-file 显式文件
 ```
 
+- **URL 门（pkp，I9 威胁模型：入口 URL 可能来自 LLM 输出——搜索结果/页面内容间接注入）**：`browse` / `login` / `dl` 三入口强制 **scheme 白名单 http/https**——`file:///`（本地文件内容会进 agent 上下文外泄）、`javascript:`、`data:` 等一律 rc=2 快失败，**不启动 Chrome**；无 scheme 的裸 host（`example.com`、`localhost:3000`）按浏览器默认语义补 `https://`。`browse` 另设**私网门**（SSRF 对齐 fetch）：loopback / RFC1918 / link-local / 云 metadata 默认 rc=2 拒绝，`--allow-private` 显式放行（语义与 fetch 同名 flag 对齐）；login/dl 不设私网门（内网登录页/内网下载是合法场景，dl 私网 URL 走既有 browser 回退路径）
 - **browse**：headless 渲染取正文；遇 CAPTCHA 报错退出并提示用 `login` 手工验证后重试
 - **login**：有头窗 + 不限时轮询，人关窗（或关页签）即认为登录完成，cookie 随 profile 落盘；不判 CAPTCHA
 - **dl**：先 reqwest HEAD 预检分流——纯静态直链（无 Set-Cookie 且非 HTML）直接流式下载（输出 `mode: direct`，不启动 Chrome），有登录墙嫌疑才走 Chrome 老路径（`mode: browser`）；
   CDP `Browser.setDownloadBehavior` 走 Chrome 原生下载（登录态、重定向、大文件均支持）；
   渲染型 URL（普通网页不触发下载）自动回退页内 fetch 落盘（同源 cookie），默认存当前目录；
   `-o` 末段含 `.` 按文件处理，纯目录名按目录处理，`--output-file` 恒为文件语义；
+  `-o`/`--output-file` **相对路径不允许包含 `..` 穿越段**（防静默落盘出 CWD，rc=2；绝对路径 = 用户显式指定，放行，7z0）；
   落盘 `.pdf` 时 stderr 一行提示（本地不解析文本，agent 用外部工具提取；三条下载路径均提示）
 
 ### shell（交互模式，可选）

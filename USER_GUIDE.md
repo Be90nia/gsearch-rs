@@ -28,20 +28,26 @@ cargo build --release
 
 ```bash
 gsearch --version
-# gsearch 0.1.0
+# gsearch 0.2.9
 ```
 
 ---
 
 ## 2. 五个常见场景
 
-### 2.1 基础搜索
+### 2.1 基础搜索（默认输出单行紧凑 JSON）
 
 ```bash
 gsearch search "fastapi tortoise orm tutorial" --limit 5
 ```
 
-输出形如：
+输出形如（**默认就是紧凑 JSON**，单行无缩进；`--human` 才是下方的人读文本）：
+
+```json
+{"meta":{...},"run":{"status":"ok"},"results":[{"title":"Tortoise ORM FastAPI Tutorial","url":"https://...","snippet":"...","domain_class":"docs"}]}
+```
+
+人读文本模式（`--human`）：
 
 ```
 1. Tortoise ORM FastAPI Tutorial
@@ -55,22 +61,9 @@ gsearch search "fastapi tortoise orm tutorial" --limit 5
 ...
 ```
 
-### 2.2 `--json` 给下游程序
+### 2.2 `--json` 兼容占位（不再是开关）
 
-```bash
-gsearch search "rust tokio" --limit 3 --json
-```
-
-```json
-[
-  {
-    "title": "Tokio - An asynchronous runtime for Rust",
-    "url": "https://tokio.rs/",
-    "snippet": "Tokio is an asynchronous runtime..."
-  },
-  ...
-]
-```
+v0.2.9 起**所有顶层命令默认输出单行紧凑 JSON**，`--json` 仅作存量脚本兼容占位（解析接受、无任何效果）。要切回人读文本用 `--human`。
 
 ### 2.3 `--read N` 直读结果正文（不必点开链接）
 
@@ -78,7 +71,7 @@ gsearch search "rust tokio" --limit 3 --json
 gsearch search "rust tokio tutorial" --limit 3 --read 1
 ```
 
-输出：目录 + 摘要 + 段落索引（M9 AdaptiveRead 智能选择短/中/长文策略）。
+默认输出结构化 JSON（summary_paragraphs / paragraph_index / headings）；`--human` 才是人读格式（目录 + 摘要 + 段落索引）：
 
 ```
 === https://tokio.rs/ | Tokio ===
@@ -93,7 +86,7 @@ gsearch search "rust tokio tutorial" --limit 3 --read 1
 2. Tokio 提供异步 I/O、定时器、信道...
 ```
 
-加 `--full` 拿纯 innerText，`--headings-only` 只输出目录，`--json` 拿结构化 JSON。
+加 `--full` 拿全文、`--headings-only` 只输出目录。`--read N` 的 N 不能超过 `--limit`（搜索前即拒绝，rc=2）。
 
 ### 2.4 `--dl N` 下载链接带 profile 登录态
 
@@ -119,6 +112,8 @@ gsearch search "github" --limit 1 --open 1
 ```bash
 gsearch browse https://example.com
 ```
+
+只接受 `http/https` URL（`file:///javascript:` 等一律 rc=2 拒绝，不启动 Chrome）；私网地址默认拒，`--allow-private` 放行——URL 可能来自 LLM 输出，门是对二次注入的底线防护。
 
 ### 3.2 `login <url>` ——有头窗人工登录
 
@@ -211,15 +206,15 @@ GSEARCH_PROXY=socks5://127.0.0.1:1080 gsearch search "..." --limit 5
 
 支持 HTTP / SOCKS5（Chrome 协议）。
 
-### 6.2 `--humanize`（opt-in）
+### 6.2 `--no-humanize`（默认启用 warmup）
 
-新 profile / 裸搜可能撞码时启用：装 10 个 fingerprint 补丁 + 访问 Wikipedia/GitHub warmup。
+搜索前默认启用 warmup（随机访问 Wikipedia/GitHub/HN + 滚动 + 10 个指纹补丁）——人用保留，**agent 反复调用建议加 `--no-humanize` 跳过**：
 
 ```bash
-gsearch --humanize search "..." --limit 5
+gsearch search "..." --limit 5 --no-humanize
 ```
 
-**注意**：`--humanize` 默认 off——保护已有 profile 用户不被污染。
+**注意**：flag 是 `--no-humanize`（SetFalse），`--humanize=false` / `--humanize` 都不存在，传入会 rc=2。
 
 ---
 
@@ -244,13 +239,15 @@ GSEARCH_CHROME=/path/to/chrome.exe gsearch search "..."
 ## 8. doctor 子命令
 
 ```bash
-gsearch doctor
+gsearch doctor        # 默认输出结构化 JSON（agent/CI 消费）
+gsearch doctor --human  # 人读检查表
 ```
 
-输出 6 项检查：
+默认 JSON：`{checks:[{name,status,message?/value?}...], elapsed_ms, fail_count, warn_count}`（status: ok/warn/fail/skip）。
+`--human` 输出人读表（逐项 `[ OK ]/[WARN]/[FAIL]/[SKIP]`）：
 
 ```
-gsearch doctor
+gsearch doctor --human
 [ OK ] Chrome: C:\Program Files\Google\Chrome\Application\chrome.exe
 [ OK ] Edge:   C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
 [ OK ] profile 可写: C:\Users\You\.gsearch\profiles\default
@@ -286,9 +283,12 @@ gsearch --verbose gsearch::search=debug search "..."
 
 | 退出码 | 含义 |
 |---|---|
-| 0 | 成功 / 仅有 WARN |
-| 1 | 出错（启动失败 / 配置错误）|
-| 2 | 搜索无结果 |
+| 0 | 成功 / doctor 仅有 WARN / batch·verify 批量全部成功 |
+| 1 | 命令执行错误（error 链）/ batch·verify 批量部分失败 / `search --read` 读失败（JSON 顶层 `read_error`）/ doctor 有 FAIL / fetch 私网门拒 |
+| 2 | 搜索无结果（含 `run.status=filtered_empty` / `no_results` / `searxng_degraded`）/ 空串·纯空白 query 前置拒绝 / 参数错误（`--limit 0`、`--read N > --limit` 等）/ similar 输入非 URL / browse 非 http/https scheme 或私网默认拒 / dl `-o` 相对路径含 `..` |
+| 3 | 仅 search：CAPTCHA 亲解超时（约 120s，profile 养熟后重试可跳过） |
+| 4 | 仅 verify：DNS 解析失败 |
+| 5 | 仅 verify：请求超时（`--timeout` 可调，默认 5s） |
 
 ---
 

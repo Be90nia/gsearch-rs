@@ -104,10 +104,12 @@ pub async fn run_search(
     // 重复查询（否则 SearXNG 双失败会打两遍回退 warn、白跑两轮 HTTP）。
     match try_searxng(&cfg).await {
         SearxngAttempt::Results(outcome) => return Ok(outcome),
-        // zc6：熔断（SearXNG 空 + Google:443 预检不通）。shell 没有结构化 status 可标，
-        // 报错文案带同款诊断行，不再空耗浏览器 30s 超时。
-        SearxngAttempt::CircuitBroken => return Err(anyhow!("{SEARXNG_CIRCUIT_MSG}")),
-        SearxngAttempt::NotConfigured | SearxngAttempt::FallbackGoogle => {}
+        // zc6：熔断（SearXNG 故障 + Google:443 预检不通）。shell 没有结构化 status 可标，
+        // 报错文案带同款诊断行（o1p：真因透传），不再空耗浏览器 30s 超时。
+        SearxngAttempt::CircuitBroken(reason) => return Err(anyhow!("{}", circuit_diag(&reason))),
+        // o1p：源健康零结果（兜底全空 + Google 不可达）——shell 无结构化信封，报可读诊断
+        SearxngAttempt::HealthyEmpty => return Err(anyhow!("{NO_RESULTS_MSG}")),
+        SearxngAttempt::NotConfigured | SearxngAttempt::FallbackGoogle(_) => {}
     }
     let page = browser::open_page(browser).await?;
     run_search_on_page(browser, cfg, page, h_slot, human_solved).await
@@ -247,6 +249,9 @@ pub async fn run_search_on_page(
 ///
 /// af9：回退链插层为 SearXNG → DDG html → Google——SearXNG 失败先试 DDG 纯 HTTP
 ///（免浏览器），DDG 命中时 Results 携 provider="duckduckgo"；batch 不走此层（仍 SearXNG-only）。
+///
+/// o1p：失败分类为 SearxFail{HealthyEmpty, SourceError}——源健康零结果与源故障分立，
+/// FallbackGoogle/CircuitBroken 携带 SearXNG 真因（HTTP 错误码透传进诊断行）。
 #[derive(Debug)]
 pub enum SearxngAttempt {
     /// 未配置 searxng_url——用户没要 SearXNG，直接 Google 直爬（不预检）。
@@ -254,14 +259,65 @@ pub enum SearxngAttempt {
     /// SearXNG 出结果（provider=searxng）。
     Results(SearchOutcome),
     /// SearXNG 空/失败，但 Google 预检通过——按老行为回退（回退 warn 已打）。
-    FallbackGoogle,
-    /// 熔断：SearXNG 空 + Google 预检不通——回退必然空耗，直接返回（诊断行已打 stderr）。
-    CircuitBroken,
+    /// Some(真因) = SearXNG 故障（Google 回退也空时据此标 searxng_degraded）；
+    /// None = SearXNG 健康但零结果（Google 回退也空时按 filtered_empty/no_results 定态）。
+    FallbackGoogle(Option<String>),
+    /// 熔断：SearXNG 故障 + Google 预检不通——回退必然空耗，直接返回（诊断行已打 stderr）。
+    /// 携带 SearXNG 真因（o1p：HTTP 错误码透传）。
+    CircuitBroken(String),
+    /// o1p：SearXNG 健康（HTTP 200）但零结果，DDG 亦空且 Google 预检不通——
+    /// 不起浏览器直接定态（调用方按 recency 判 filtered_empty / no_results）。
+    HealthyEmpty,
 }
 
 /// zc6：熔断诊断行（stderr，一行原则；元审计豁免未来任何静默策略）。
 pub const SEARXNG_CIRCUIT_MSG: &str =
     "SearXNG 零结果已熔断（基础设施降级，非查询无资料）；建议换短 query/跑 doctor/直接 fetch 已知源";
+
+/// o1p：recency 过滤后零结果（SearXNG 源健康）——与基础设施降级显式分立。
+pub const FILTERED_EMPTY_MSG: &str =
+    "recency 过滤后零结果（SearXNG 源健康，非基础设施故障）；建议去掉 --recency、换时间窗或换词重试";
+
+/// o1p：查询无果（SearXNG 源健康）——非熔断非过滤空，换词重试即可。
+pub const NO_RESULTS_MSG: &str =
+    "查询无结果（SearXNG 源健康，非基础设施故障）；建议换词或缩短查询重试";
+
+/// o1p：SearXNG 失败分类——零结果语义三态的判定依据。
+/// HealthyEmpty = json+html 双层 HTTP 200 零结果（源健康，查询真无果）；
+/// SourceError = HTTP 状态错/网络错/解析失败（携带真因链，如 HTTP 400）。
+#[derive(Debug)]
+pub enum SearxFail {
+    HealthyEmpty,
+    SourceError(String),
+}
+
+impl SearxFail {
+    /// 真因文本（SourceError）；HealthyEmpty 无故障，给可读描述供回退 warn 消费。
+    pub fn describe(&self) -> String {
+        match self {
+            Self::HealthyEmpty => "查询无结果（源健康）".to_string(),
+            Self::SourceError(s) => s.clone(),
+        }
+    }
+
+    /// o1p 三态映射（单查与 batch 共用）：源健康零结果按 recency 拆
+    /// 「过滤后空」（filtered_empty）与「查询无果」（no_results），均非 degraded。
+    pub fn empty_status(recency: Option<Recency>) -> (crate::types::RunStatus, &'static str) {
+        match recency {
+            Some(_) => (crate::types::RunStatus::FilteredEmpty, FILTERED_EMPTY_MSG),
+            None => (crate::types::RunStatus::NoResults, NO_RESULTS_MSG),
+        }
+    }
+}
+
+/// o1p：熔断诊断行组装——真因非空时透传追加（run.message 与 stderr 诊断行同源）。
+pub fn circuit_diag(reason: &str) -> String {
+    if reason.is_empty() {
+        SEARXNG_CIRCUIT_MSG.to_string()
+    } else {
+        format!("{SEARXNG_CIRCUIT_MSG}；真因: {reason}")
+    }
+}
 
 pub async fn try_searxng(cfg: &SearchConfig) -> SearxngAttempt {
     let Some(base) = crate::config::load().searxng_url.clone() else {
@@ -273,7 +329,8 @@ pub async fn try_searxng(cfg: &SearchConfig) -> SearxngAttempt {
             captcha_solved: false,
             provider: "searxng",
         }),
-        Err(reason) => {
+        Err(fail) => {
+            let reason = fail.describe();
             // af9：第二源插层——SearXNG 挂/零结果先试 DDG html（纯 HTTP 免浏览器），
             // 命中则以 provider=duckduckgo 直接返回；仍空才走 Google 预检回退/熔断老链。
             match crate::duckduckgo::collect(cfg).await {
@@ -290,10 +347,16 @@ pub async fn try_searxng(cfg: &SearchConfig) -> SearxngAttempt {
             }
             if google_fallback_precheck().await {
                 warn_searxng_fallback(&base, &reason);
-                SearxngAttempt::FallbackGoogle
+                // o1p：None = 源健康零结果（HealthyEmpty 无故障真因），供回退空时三态定态
+                let fault = matches!(fail, SearxFail::SourceError(_)).then_some(reason);
+                SearxngAttempt::FallbackGoogle(fault)
+            } else if matches!(fail, SearxFail::HealthyEmpty) {
+                // o1p：源健康 + 兜底全空 + Google 不可达——不是熔断，按源健康定态；
+                // filtered_empty/no_results 的判定与诊断行由调用方按 recency 打（此处无 recency 上下文）。
+                SearxngAttempt::HealthyEmpty
             } else {
-                eprintln!("{SEARXNG_CIRCUIT_MSG}");
-                SearxngAttempt::CircuitBroken
+                eprintln!("{}", circuit_diag(&reason));
+                SearxngAttempt::CircuitBroken(reason)
             }
         }
     }
@@ -314,21 +377,27 @@ async fn google_fallback_precheck() -> bool {
 
 /// SearXNG-only 收集内核（单查询与 batch 共用）：翻页凑 limit。
 /// Err(原因) = 未能凑到任何结果；中途双源失败但已有部分结果时有多少用多少。
+/// o1p：失败分类 SearxFail——json+html 双层 HTTP 200 零结果 = HealthyEmpty（源健康），
+/// HTTP 状态/网络/解析失败 = SourceError（真因链含 json 层 + html 层）。
 /// 回退 warn 不在此打——单查询措辞是"已回退 Google 直爬"，batch 无回退，由调用方决定。
-async fn searxng_collect(base: &str, cfg: &SearchConfig) -> Result<Vec<SearchResult>, String> {
+async fn searxng_collect(base: &str, cfg: &SearchConfig) -> Result<Vec<SearchResult>, SearxFail> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut collected: Vec<SearchResult> = Vec::new();
     let mut degraded = false; // 降级提示整次查询只打一行
     for page_no in 1..=MAX_PAGES as u32 {
         let page = match crate::searxng::search(base, &cfg.query, page_no, cfg.recency).await {
             Ok(results) if !results.is_empty() => Ok(results),
-            Ok(_) => {
-                degrade_html(base, &cfg.query, page_no, cfg.recency, &mut degraded, "查询无结果")
-                    .await
-            }
+            // json 层 HTTP 200 但零结果：html 降级定最终分类（html 200 空 = 源健康）
+            Ok(_) => degrade_html(base, &cfg.query, page_no, cfg.recency, &mut degraded, "查询无结果").await,
             Err(e) => {
-                degrade_html(base, &cfg.query, page_no, cfg.recency, &mut degraded, &format!("{e:#}"))
+                let jr = format!("{e:#}");
+                // o1p：json 层故障真因进链——html 层也故障时拼全链，不吞 400 等状态码
+                degrade_html(base, &cfg.query, page_no, cfg.recency, &mut degraded, &jr)
                     .await
+                    .map_err(|f| match f {
+                        SearxFail::HealthyEmpty => SearxFail::HealthyEmpty,
+                        SearxFail::SourceError(h) => SearxFail::SourceError(format!("{jr}；HTML 层: {h}")),
+                    })
             }
         };
         match page {
@@ -349,27 +418,27 @@ async fn searxng_collect(base: &str, cfg: &SearchConfig) -> Result<Vec<SearchRes
         }
     }
     if collected.is_empty() {
-        // 循环正常结束仍为空：各页结果全被去重掉（首查即空走的是上面的 Err 分支）
-        return Err("各页结果去重后为空".into());
+        // 循环正常结束仍为空：各页结果全被去重掉——源给过结果，非故障（o1p 归源健康）
+        return Err(SearxFail::HealthyEmpty);
     }
     collected.truncate(cfg.limit);
     Ok(collected)
 }
 
 /// batch 单条（issue gsearch-rs-doh）：SearXNG-only，禁浏览器回退——浏览器单例不可并发，
-/// 这是刻意边界（Google 回退链仅单查询模式走）。Err 文本直接作为该条目的 error message。
-async fn batch_one(cfg: &SearchConfig) -> Result<SearchOutcome, String> {
+/// 这是刻意边界（Google 回退链仅单查询模式走）。o1p：失败按 SearxFail 分类，
+/// SourceError 文本仍以「SearXNG 查询失败（…）」格式进该条目 message（存量契约不破）。
+async fn batch_one(cfg: &SearchConfig) -> Result<SearchOutcome, SearxFail> {
     let base = crate::config::load().searxng_url.clone().ok_or_else(|| {
-        "SearXNG 未配置（gsearch.json 缺 searxng_url）；batch 模式禁浏览器回退，请改用单查询".to_string()
+        SearxFail::SourceError(
+            "SearXNG 未配置（gsearch.json 缺 searxng_url）；batch 模式禁浏览器回退，请改用单查询".to_string(),
+        )
     })?;
-    searxng_collect(&base, cfg)
-        .await
-        .map(|results| SearchOutcome::Results {
-            results,
-            captcha_solved: false,
-            provider: "searxng",
-        })
-        .map_err(|reason| format!("SearXNG 查询失败（{reason}）；batch 模式禁浏览器回退"))
+    searxng_collect(&base, cfg).await.map(|results| SearchOutcome::Results {
+        results,
+        captcha_solved: false,
+        provider: "searxng",
+    })
 }
 
 /// batch 入口：多查询并发走 SearXNG，单条失败不阻塞其他条目，返回顺序与输入一致。
@@ -379,7 +448,7 @@ pub async fn run_batch(
     queries: &[String],
     limit: usize,
     recency: Option<Recency>,
-) -> Vec<(String, Result<SearchOutcome, String>)> {
+) -> Vec<(String, Result<SearchOutcome, SearxFail>)> {
     use futures::stream::StreamExt;
     let cap = queries.len().min(32);
     // stream::iter(...).map(|q| async {...}).buffer_unordered(cap)
@@ -390,7 +459,7 @@ pub async fn run_batch(
             (pos, q.clone(), batch_one(&cfg).await)
         })
         .buffer_unordered(cap);
-    let mut slots: Vec<Option<(String, Result<SearchOutcome, String>)>> =
+    let mut slots: Vec<Option<(String, Result<SearchOutcome, SearxFail>)>> =
         (0..queries.len()).map(|_| None).collect();
     while let Some((pos, q, r)) = futs.next().await {
         slots[pos] = Some((q, r));
@@ -400,7 +469,8 @@ pub async fn run_batch(
 
 /// json 不可用（Err / 零结果）时的单页降级：抓 HTML 结果页。
 /// Ok(results) = html 命中（整次查询首次命中打一行降级提示）；
-/// Err(原因) = html 亦空/失败（原因含 json 层 + html 层；回退措辞由调用方按单/批语义打）。
+/// o1p：Err 携分类——html 亦 HTTP 200 零结果 = HealthyEmpty（源健康，查询真无果）；
+/// html 层故障 = SourceError（真因由调用方拼进全链）。
 async fn degrade_html(
     base: &str,
     query: &str,
@@ -408,7 +478,7 @@ async fn degrade_html(
     recency: Option<Recency>,
     degraded: &mut bool,
     reason: &str,
-) -> Result<Vec<SearchResult>, String> {
+) -> Result<Vec<SearchResult>, SearxFail> {
     match crate::searxng::search_html(base, query, page_no, recency).await {
         Ok(results) if !results.is_empty() => {
             if !*degraded {
@@ -417,8 +487,9 @@ async fn degrade_html(
             }
             Ok(results)
         }
-        Ok(_) => Err(format!("{reason}，HTML 结果页亦无结果")),
-        Err(e) => Err(format!("{e:#}")),
+        // html 层 HTTP 200 零结果：实例健康、查询真无果（o1p 分类以最终层为准）
+        Ok(_) => Err(SearxFail::HealthyEmpty),
+        Err(e) => Err(SearxFail::SourceError(format!("{e:#}"))),
     }
 }
 
@@ -453,7 +524,13 @@ pub async fn similar(
     // 纯域名 URL 无路径关键词 → 退化 site: 查询（同域相关页语义）
     let query = if keywords.is_empty() { format!("site:{src_host}") } else { keywords.join(" ") };
     let cfg = SearchConfig { query: query.clone(), limit: (limit * 3).clamp(8, 15), recency: None };
-    let hits = searxng_collect(&base, &cfg).await?;
+    // o1p：SearxFail 分类转 String（similar 无三态信封，错误文本语义不变）
+    let hits = searxng_collect(&base, &cfg)
+        .await
+        .map_err(|f| match f {
+            SearxFail::HealthyEmpty => "查询无结果（源健康）".to_string(),
+            SearxFail::SourceError(s) => s,
+        })?;
     let mut scored: Vec<(i32, crate::types::SimilarHit)> = hits
         .into_iter()
         .map(|hit| {
@@ -623,7 +700,40 @@ pub(crate) fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_captcha, unusual_traffic};
+    use super::{is_captcha, unusual_traffic, SearxFail, SEARXNG_CIRCUIT_MSG, FILTERED_EMPTY_MSG, NO_RESULTS_MSG};
+
+    /// o1p：源健康零结果三态映射——recency 过滤后空与查询无果分立，均非 degraded。
+    #[test]
+    fn searx_fail_empty_status_maps_recency() {
+        use super::{circuit_diag, Recency};
+        let (filtered, fmsg) = SearxFail::empty_status(Some(Recency::Week));
+        assert_eq!(filtered, crate::types::RunStatus::FilteredEmpty);
+        assert_eq!(fmsg, FILTERED_EMPTY_MSG);
+        assert!(fmsg.contains("recency") && fmsg.contains("源健康"));
+
+        let (none, nmsg) = SearxFail::empty_status(None);
+        assert_eq!(none, crate::types::RunStatus::NoResults);
+        assert_eq!(nmsg, NO_RESULTS_MSG);
+        assert!(!nmsg.contains("recency"));
+
+        // 三态与 degraded 互斥：源健康空 ≠ 基础设施降级
+        assert_ne!(filtered, crate::types::RunStatus::SearxngDegraded);
+        assert_ne!(none, crate::types::RunStatus::SearxngDegraded);
+
+        // 熔断诊断行：真因透传（HTTP 错误码进诊断行），无真因回退原文
+        assert_eq!(circuit_diag(""), SEARXNG_CIRCUIT_MSG);
+        let with_reason = circuit_diag("SearXNG 返回错误状态: HTTP 400 Bad Request");
+        assert!(with_reason.starts_with(SEARXNG_CIRCUIT_MSG));
+        assert!(with_reason.contains("400"));
+    }
+
+    /// o1p：SearxFail 分类描述——HealthyEmpty 可读化，SourceError 原样透传真因链。
+    #[test]
+    fn searx_fail_describe_keeps_reason_chain() {
+        assert!(SearxFail::HealthyEmpty.describe().contains("源健康"));
+        let chain = "SearXNG 返回错误状态: HTTP 400 Bad Request；HTML 层: 请求 SearXNG HTML 失败";
+        assert_eq!(SearxFail::SourceError(chain.to_string()).describe(), chain);
+    }
 
     /// 结果页脚本残留 "recaptcha" 字样不得误判为验证页（真机假超时的根因）。
     #[test]

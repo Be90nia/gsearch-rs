@@ -32,8 +32,8 @@ pub struct MetaOutput {
     #[serde(skip_serializing_if = "skip_compact_str")]
     /// `~/.gsearch/profiles/<name>/` 的末段名（未设 GSEARCH_PROFILE 时为 "default"）。
     pub profile: String,
-    #[serde(skip_serializing_if = "skip_compact_opt")]
-    /// 代理 URL；直连时为 None → JSON null。
+    #[serde(skip_serializing_if = "skip_compact_absent_opt")]
+    /// 代理 URL；未传/直连时键缺席（ago：缺席语义执行到底，README「未传时键缺席」为真）。
     pub proxy: Option<String>,
     #[serde(skip_serializing_if = "skip_compact_bool")]
     pub humanize: bool,
@@ -46,7 +46,8 @@ pub struct MetaOutput {
     pub truncated: bool,
     /// M16：本次搜索来源："searxng"（配了 SearXNG 且成功）或 "google"（直爬 / 回退 / browse / dl）。
     pub provider: String,
-    /// 时间过滤回显（--recency 的原始值）；未传时 None → JSON null（同 proxy 风格）。
+    /// 时间过滤回显（--recency 的原始值）；未传时键缺席（ago：与 proxy 同缺席语义）。
+    #[serde(skip_serializing_if = "skip_compact_absent_opt")]
     pub recency: Option<String>,
 }
 
@@ -69,8 +70,9 @@ fn skip_compact_static(_: &'static str) -> bool {
 fn skip_compact_str(_: &String) -> bool {
     compact_on()
 }
-fn skip_compact_opt(_: &Option<String>) -> bool {
-    compact_on()
+/// ago：proxy/recency 未传（None）时键缺席（README 缺席语义）；--compact-meta 下仍全跳。
+fn skip_compact_absent_opt(v: &Option<String>) -> bool {
+    compact_on() || v.is_none()
 }
 fn skip_compact_bool(_: &bool) -> bool {
     compact_on()
@@ -96,6 +98,11 @@ pub enum RunStatus {
     /// 元审计硬约束：必须是这个值而非 error（基础设施降级 ≠ 查询无资料 ≠ 出错），
     /// provider 保持 searxng，防 agent 把熔断误读为「该话题无资料」。
     SearxngDegraded,
+    /// o1p：SearXNG 健康（HTTP 200）但 recency 过滤后零结果——「没新鲜结果」≠ 基础设施降级，
+    /// agent 的正确动作是去掉 --recency / 换时间窗，而非 doctor 排障。
+    FilteredEmpty,
+    /// o1p：查询无果且 SearXNG 源健康——既非熔断也非过滤空，换词重试即可。
+    NoResults,
     #[default]
     Error,
 }
@@ -241,17 +248,25 @@ mod tests {
         assert_eq!(m["query"], "python asyncio");
         assert_eq!(m["profile"], "default");
     }
-    /// M14-1B 验收：proxy = None 必须序列化成 JSON `null`（不是缺失字段，不是空字符串）。
+    /// ago：缺席语义执行到底——proxy/recency 未传（None）时键真缺席
+    ///（README 契约「未传时键缺席」；原 M14-1B 的 null 常驻语义已被拍板废弃）。
     #[test]
-    fn meta_proxy_none_serializes_as_null() {
+    fn meta_proxy_recency_none_keys_absent() {
         let env = OutputEnvelope {
             meta: sample_meta(),
             run: RunStatusInfo { status: RunStatus::Ok, captcha_solved: false, message: String::new() },
             results: sample_results(),
         };
         let s = serde_json::to_string(&env).unwrap();
-        assert!(s.contains("\"proxy\":null"), "proxy 应为 JSON null: {s}");
-        assert!(!s.contains("\"proxy\":\""), "proxy 不应是空字符串");
+        assert!(!s.contains("\"proxy\""), "proxy 未传应键缺席: {s}");
+        assert!(!s.contains("\"recency\""), "recency 未传应键缺席: {s}");
+        // 传了值则键照常出现（缺席 ≠ 永远缺席）
+        let mut m = sample_meta();
+        m.proxy = Some("http://127.0.0.1:10808".into());
+        m.recency = Some("week".into());
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"proxy\":\"http://127.0.0.1:10808\""), "proxy 传值应出现: {s}");
+        assert!(s.contains("\"recency\":\"week\""), "recency 传值应出现: {s}");
     }
 
     /// M15：四种状态都正确序列化小写 snake_case。
@@ -262,6 +277,9 @@ mod tests {
             (RunStatus::CaptchaRequired, "\"status\":\"captcha_required\""),
             (RunStatus::CaptchaTimeout, "\"status\":\"captcha_timeout\""),
             (RunStatus::Error, "\"status\":\"error\""),
+            // o1p：三态零结果语义（filtered_empty / no_results 与 searxng_degraded 分立）
+            (RunStatus::FilteredEmpty, "\"status\":\"filtered_empty\""),
+            (RunStatus::NoResults, "\"status\":\"no_results\""),
         ] {
             let env = OutputEnvelope::<Vec<SearchResult>> {
                 meta: sample_meta(),
