@@ -29,7 +29,7 @@ gsearch search "..." --open 1
 - **紧凑单行**（无缩进——缩进对 LLM 是纯 token 税）
 - 每条结果：`title / url / snippet / score / domain_class`
   - `snippet` 默认 160 字符截断（`--snippet-len N` 可调，1..=100000）
-  - `score` 为 SearXNG 内部相关性分透传（agent 可按分筛序）；Google/DDG html 等无分来源此键缺席
+  - `score` 为 SearXNG 内部相关性分透传（agent 可按分筛序）；DDG html 用返回序等价分（首条 = n 递减到 1，返回序即相关性序）；Google 等无分来源此键缺席
   - `domain_class`：URL host 启发式（docs/github/wikipedia/blog/forum/video/news/qa/other），可按类筛权威源
 - 顶层 `run.status`：`ok / captcha_required / captcha_timeout / searxng_degraded / error`
 - `meta` 键缺席语义：`truncated:false`、空 `message`、`captcha_solved:false` 均不占键；`results_count` 已移除（`len(results)` 可推导）；`browser_path` / `browser_kind` 已移除（环境噪声，浏览器信息走 `gsearch doctor`）
