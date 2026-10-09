@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::emulation::SetFocusEmulationEnabledParams;
 use chromiumoxide::handler::Handler;
 use futures::StreamExt;
 
@@ -663,6 +664,19 @@ pub fn spawn_handler(handler: Handler) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// xt2：统一 new_page 入口——建 about:blank 页后立刻开 focus emulation（CDP
+/// Emulation.setFocusEmulationEnabled，jev-ultrafast 同款），防隐藏 tab 被 Chrome
+/// 定时器节流（shell 多 tab / swap_to_headed 重建页场景；headless 单页本就不节流，
+/// 开了无副作用）。emulation 失败只 warn 不 abort：防节流是性能加固不是正确性路径
+/// （对齐 chaser-stealth 补丁风格）。调用前提与既有 new_page 相同：handler 已 spawn。
+pub async fn open_page(browser: &Browser) -> Result<chromiumoxide::Page> {
+    let page = browser.new_page("about:blank").await?;
+    if let Err(e) = page.execute(SetFocusEmulationEnabledParams::new(true)).await {
+        tracing::warn!("focus emulation 未开启（后台 tab 定时器可能被节流）: {e}");
+    }
+    Ok(page)
 }
 
 /// 关 Chrome 并等进程死透。chromiumoxide 0.9 的 close 只 background kill，

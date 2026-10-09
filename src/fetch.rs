@@ -1,7 +1,8 @@
 //! `fetch <url>`：纯 reqwest GET 取网页正文，全程零浏览器（issue gsearch-rs-fetch）。
 //! 存在理由：没装 Chrome 的机器上也能秒读静态页——换机可用性缺口。
-//! HTTP 层与 searxng.rs 同款 reqwest 客户端构建；正文提取手写轻量状态机
-//! （剥 script/style/noscript + 实体解码），不做完整 DOM 解析、不引新 crate。
+//! HTTP 层与 searxng.rs 同款 reqwest 客户端构建；正文提取统一走 scraper 树内路径
+//! （kda：与 skeleton::extract_adaptive 同一解析器。原手写剥标签状态机在属性值含
+//! `>` 时提前截断标签、把属性尾部漏进正文，已删）。
 //!
 //! 安全门（Important-1 / 2）：
 //! - 默认拒绝私网（loopback / RFC1918 / link-local / IPv6 ::1 + fc00::/7）；
@@ -14,6 +15,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use scraper::{Html, Node, Selector};
 
 use crate::postproc::{cap_chars, read_max_chars};
 
@@ -195,6 +197,43 @@ fn is_pdf_content_type(ct: &str) -> bool {
         .eq_ignore_ascii_case("application/pdf")
 }
 
+/// kda：其余二进制 Content-Type 前置拒绝（图像/音视频/字体/压缩包/可执行等）——
+/// 原样当文本透传 = 乱码正文。文本类（text/*、+xml/+json/javascript 等）不在此判；
+/// 无 Content-Type 头由调用方兜底按文本处理（既有契约）。大小写不敏感（调用方已
+/// to_lowercase，双保险与 is_pdf_content_type 同款）。
+fn is_binary_content_type(ct: &str) -> bool {
+    let main = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    main.starts_with("image/")
+        || main.starts_with("audio/")
+        || main.starts_with("video/")
+        || main.starts_with("font/")
+        || main.starts_with("model/")
+        || matches!(
+            main.as_str(),
+            "application/pdf"
+                | "application/zip"
+                | "application/gzip"
+                | "application/x-gzip"
+                | "application/x-tar"
+                | "application/x-7z-compressed"
+                | "application/x-rar-compressed"
+                | "application/vnd.rar"
+                | "application/x-iso9660-image"
+                | "application/octet-stream"
+                | "application/wasm"
+                | "application/java-archive"
+                | "application/x-elf"
+                | "application/x-msdownload"
+                | "application/x-shockwave-flash"
+                | "application/msword"
+                | "application/vnd.ms-excel"
+                | "application/vnd.ms-powerpoint"
+                | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        )
+}
+
 /// 单 URL 拉取 + 提取（不含输出）。批量与单条共用；每 URL 独立过 SSRF 门（含重定向每跳）。
 async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
     if !http_or_https_scheme(url) {
@@ -231,6 +270,13 @@ async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
     if content_type.as_deref().is_some_and(is_pdf_content_type) {
         return Err(anyhow!(
             "PDF 二进制内容，fetch 不做本地解析；用 gsearch dl {url} 落盘后由外部工具提取文本"
+        ));
+    }
+    // kda：其余二进制类型前置拒绝（下载 body 前），与 PDF 同语义。
+    if content_type.as_deref().is_some_and(is_binary_content_type) {
+        return Err(anyhow!(
+            "二进制内容（{}），fetch 不做文本提取；用 gsearch dl {url} 落盘后处理",
+            content_type.as_deref().unwrap_or_default()
         ));
     }
     let is_html = content_type
@@ -434,11 +480,13 @@ enum FetchOne {
 /// 非 HTML（text/plain 等）不剥标签不判壳也不实体解码——markdown/JSON 源文保真，
 /// 字面 `&amp;`/`&#20013;` 原样保留（agent 取原文场景）。
 fn process_html(url: &str, html: &str, is_html: bool, limit: usize) -> Fetched {
-    let title = if is_html { extract_title(html) } else { String::new() };
-    let raw = if is_html {
-        extract_text(html)
+    // kda：HTML 解析一次，title 与正文同出树内（字符串扫描版 extract_title 对
+    // 属性值含 `>` 的标签同样漏片段）；非 HTML 源文保真，不碰解析器。
+    let (title, raw) = if is_html {
+        let doc = Html::parse_document(html);
+        (tree_title(&doc), collapse_blank(tree_text(&doc)))
     } else {
-        collapse_blank(html.to_string())
+        (String::new(), collapse_blank(html.to_string()))
     };
     let (text, truncated, omitted) = cap_chars(&raw, limit);
     Fetched { url: url.to_string(), title, text, truncated, omitted, include_hit: None, markdown: false }
@@ -456,53 +504,42 @@ fn looks_like_js_shell(text: &str, html: &str) -> bool {
         .any(|m| lower.contains(m))
 }
 
-/// 轻量正文提取：script/style/noscript/template 连内容删除；注释删除；
-/// 其余标签剥壳（块级边界 → 换行，行内 → 空格）；实体解码；空白规整。
-fn extract_text(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(lt) = rest.find('<') {
-        out.push_str(&decode_entities(&rest[..lt]));
-        let after = &rest[lt..];
-        if let Some(body) = after.strip_prefix("<!--") {
-            // 注释：跳到 -->；未闭合则后面全是注释
-            match body.find("-->") {
-                Some(end) => rest = &body[end + 3..],
-                None => return collapse_blank(out),
+/// 树内正文提取（kda）：与 extract_adaptive 同一 scraper 解析器。script/style/noscript/
+/// template 子树整跳；注释/doctype 非 Text 节点天然剔除；块级边界 → 换行、行内 → 空格
+/// （与旧手写状态机的输出约定一致）；实体由 html5ever 解析期解码；空白规整交 collapse_blank。
+fn tree_text(doc: &Html) -> String {
+    let mut out = String::with_capacity(4096);
+    // 显式栈 DFS，children 逆序入栈保持文档序（ego_tree 未被 scraper re-export，类型全程推断）
+    let mut stack: Vec<_> = doc.tree.root().children().rev().collect();
+    while let Some(node) = stack.pop() {
+        match node.value() {
+            Node::Text(t) => out.push_str(t),
+            Node::Element(el) => {
+                if matches!(el.name(), "script" | "style" | "noscript" | "template") {
+                    continue;
+                }
+                let sep = if is_block_boundary(el.name()) { '\n' } else { ' ' };
+                out.push(sep);
+                stack.extend(node.children().rev());
+                out.push(sep);
             }
-            continue;
-        }
-        let Some(gt) = after.find('>') else {
-            // 未闭合标签：丢弃尾巴
-            break;
-        };
-        let tag = &after[1..gt];
-        rest = &after[gt + 1..];
-        let name = tag_name(tag);
-        if !tag.starts_with('/') && matches!(name.as_str(), "script" | "style" | "noscript" | "template") {
-            // 整块内容删除：跳到对应闭合标签（rest 停在 </xxx 处，下一轮当普通标签处理）
-            let close = format!("</{name}");
-            match rest.to_ascii_lowercase().find(&close) {
-                Some(p) => rest = &rest[p..],
-                None => return collapse_blank(out),
-            }
-        } else if is_block_boundary(&name) {
-            out.push('\n');
-        } else {
-            out.push(' ');
+            _ => {}
         }
     }
-    out.push_str(&decode_entities(rest));
-    collapse_blank(out)
+    out
 }
 
-/// 标签名：剥可能的闭合斜杠，取前导 ASCII 字母数字，小写化。
-fn tag_name(tag: &str) -> String {
-    tag.trim_start_matches('/')
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_ascii_lowercase()
+/// `<title>` 文本（解析期已解码实体，trim 后取用）；无 title → 空串。
+fn tree_title(doc: &Html) -> String {
+    let sel = Selector::parse("title").expect("静态选择器必然合法");
+    doc.select(&sel)
+        .next()
+        .map(|el| el.text().collect::<String>().trim().to_string())
+        .unwrap_or_default()
+}
+
+fn extract_text(html: &str) -> String {
+    collapse_blank(tree_text(&Html::parse_document(html)))
 }
 
 /// 块级边界标签 → 换行（开闭都算，连续换行由 collapse_blank 压平）。
@@ -543,20 +580,9 @@ fn collapse_blank(s: String) -> String {
     out.trim().to_string()
 }
 
-/// `<title>` 文本（实体解码 + trim）；无 title 标签 → 空串。定位用小写副本，取值用原文。
-fn extract_title(html: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    let Some(start) = lower.find("<title") else { return String::new() };
-    let Some(gt) = lower[start..].find('>') else { return String::new() };
-    let body_from = start + gt + 1;
-    let Some(end) = lower[body_from..].find("</title") else { return String::new() };
-    decode_entities(html[body_from..body_from + end].trim())
-}
-
 /// --include：逗号分隔 selector 依序试（scraper 解析），返回首个命中元素的 inner_html；全未命中 → None。
 /// selector 语法错误 → Err：用户显式输入拼错了要报错，静默跳过会伪装成"未命中回退全文"。
 fn extract_with_include(html: &str, include: &str) -> Result<Option<String>> {
-    use scraper::{Html, Selector};
     let doc = Html::parse_document(html);
     for sel in include.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         // day：scraper 的 Display 泄漏内部变体名（EmptySelector/Please report...），映射成用户可操作的文案
@@ -568,53 +594,6 @@ fn extract_with_include(html: &str, include: &str) -> Result<Option<String>> {
         }
     }
     Ok(None)
-}
-
-/// 常见命名实体 + 十/十六进制数字实体解码；未知实体原样保留（不破坏正文）。
-fn decode_entities(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(amp) = rest.find('&') {
-        out.push_str(&rest[..amp]);
-        let after = &rest[amp..];
-        // 实体最长 &#x10FFFF;：分号超出 10 字符即按普通文本
-        let semi = match after.find(';') {
-            Some(p) if p <= 10 => p,
-            _ => {
-                out.push('&');
-                rest = &after[1..];
-                continue;
-            }
-        };
-        let ent = &after[1..semi];
-        let decoded = match ent {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            "nbsp" => Some('\u{a0}'),
-            _ => ent
-                .strip_prefix('#')
-                .and_then(|num| match num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
-                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
-                    None => num.parse::<u32>().ok(),
-                })
-                .and_then(char::from_u32)
-                // 控制字符（&#0; 等）不落正文
-                .filter(|c| !c.is_control()),
-        };
-        match decoded {
-            Some(c) => out.push(c),
-            None => out.push_str(&after[..semi + 1]),
-        }
-        rest = &after[semi + 1..];
-    }
-    out.push_str(rest);
-    out
 }
 
 #[cfg(test)]
@@ -667,17 +646,54 @@ mod tests {
         assert_eq!(text, "");
     }
 
-    /// decode_entities：命名实体 + 数字实体 + 未知实体原样 + 控制字符过滤。
+    /// kda 回归：属性值含 `>` 的标签不漏片段进正文（旧手写剥标签在 title="a>b" 处提前
+    /// 截断标签，把 `b">` 起的尾巴漏进正文/title）。树内路径由解析器按引号正确处理。
     #[test]
-    fn decode_entities_cases() {
-        assert_eq!(decode_entities("a &amp; b &lt;c&gt; &quot;q&quot; &apos;s&apos;"), "a & b <c> \"q\" 's'");
-        assert_eq!(decode_entities("&nbsp;X"), "\u{a0}X");
-        assert_eq!(decode_entities("&#20013;&#x6587;"), "中文");
-        assert_eq!(decode_entities("&unknown; &notanentity"), "&unknown; &notanentity");
-        // 控制字符实体：解码失败 → 原样保留实体文本（不伪装丢内容）
-        assert_eq!(decode_entities("&#0;&#x1F;"), "&#0;&#x1F;");
-        // 无实体快路径
-        assert_eq!(decode_entities("plain"), "plain");
+    fn extract_text_attr_gt_no_leak() {
+        let html = r#"<html><head><title foo="a>b">标题</title></head>
+                      <body><div data-x="p>q">正文甲</div><span title="a>b">正文乙</span></body></html>"#;
+        let fetched = process_html("https://e.test/", html, true, 50_000);
+        assert_eq!(fetched.title, "标题", "title 不得含属性尾巴: {}", fetched.title);
+        assert!(
+            fetched.text.contains("正文甲") && fetched.text.contains("正文乙"),
+            "got: {}",
+            fetched.text
+        );
+        // 旧实现泄漏形态：attr 尾 `q">正文甲` 与 title 处 `b">标题`
+        assert!(!fetched.text.contains("q\""), "attr 尾巴泄漏: {}", fetched.text);
+        assert!(!fetched.text.contains("\">"), "引号闭合片段泄漏: {}", fetched.text);
+        assert!(!fetched.text.contains('<'), "不应残留标签: {}", fetched.text);
+    }
+
+    /// kda：二进制 Content-Type 门——压缩包/图像/音视频/字体/文档判真，文本与结构化判假。
+    #[test]
+    fn binary_content_type_detection() {
+        for bin in [
+            "application/zip",
+            "application/zip; charset=binary",
+            "image/png",
+            "video/mp4",
+            "audio/ogg",
+            "font/woff2",
+            "application/octet-stream",
+            "application/gzip",
+            "application/pdf",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "APPLICATION/ZIP", // 大小写不敏感（fetch_one 已 to_lowercase，双保险）
+        ] {
+            assert!(is_binary_content_type(bin), "应判二进制: {bin}");
+        }
+        for text_ct in [
+            "text/html; charset=utf-8",
+            "text/plain",
+            "text/markdown",
+            "application/json",
+            "application/xhtml+xml",
+            "application/xml",
+            "application/javascript",
+        ] {
+            assert!(!is_binary_content_type(text_ct), "不应判二进制: {text_ct}");
+        }
     }
 
     /// looks_like_js_shell：短正文 + SPA 挂载点才判 true；小静态页（example.com 类）不判壳。

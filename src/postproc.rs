@@ -399,12 +399,12 @@ async fn open_page(
     Ok((page, snap))
 }
 
-/// new_page + goto + 等语义定稿（原 open_page 前半，登录墙重抓路径复用）。
+/// new_page（browser::open_page，含 focus emulation）+ goto + 等语义定稿（登录墙重抓路径复用）。
 async fn goto_page(
     browser: &Browser,
     url: &str,
 ) -> Result<(chromiumoxide::Page, Option<PageSnapshot>)> {
-    let page = browser.new_page("about:blank").await?;
+    let page = gsearch::browser::open_page(browser).await?;
     tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
         .await
         .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
@@ -534,7 +534,7 @@ pub async fn dl(
     output: Option<&Path>,
 ) -> Result<()> {
     let url = pick(results, n, "dl")?;
-    let page = browser.new_page("about:blank").await?;
+    let page = gsearch::browser::open_page(browser).await?;
     // I4：goto 失败/超时 warn 留痕后继续——下载靠后续 fetch 直链兜底（goto 慢的站 fetch 可能可达）。
     let _ = goto_for_download(page.goto(url), url).await;
     let bytes = fetch_in_page(&page, url).await?;

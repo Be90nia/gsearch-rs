@@ -411,7 +411,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             // h_slot: swap_to_headed 时 abort 旧 handler task，再起新 task 接新 Browser 的 sender
             h_slot = Some(gsearch::browser::spawn_handler(handler));
             let mut browser = b;
-            let page = browser.new_page("about:blank").await?;
+            let page = gsearch::browser::open_page(&browser).await?;
             if args.humanize {
                 stealth::install_init_script(&page).await?;
                 stealth::warmup(&page).await?;

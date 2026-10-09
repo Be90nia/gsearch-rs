@@ -106,6 +106,8 @@ gsearch fetch https://docs-site/page --markdown # 正文 markdown（表格/标�
 - **JS 壳页**：剥标签后正文 < 500 字符 **且** html 含 SPA 挂载点（`id="root"/id="app"/__next`）→ 退出码 1 + stderr `该页无服务端正文（JS 壳），需渲染：用 gsearch browse <url>`。**注意**：退出码 1 在这里是"需换 browse"，不是"命令错误"——agent 应改用 browse 而非重试 fetch。
 - **跟随重定向**：≤10 跳，每跳 host 都过私网门 + https 规则（防重定向绕过）。
 - **PDF 拒抓**：`Content-Type: application/pdf` 直接报错（不做本地 PDF 解析）并指引 `gsearch dl <url>` 落盘后用外部工具提取文本——剥标签路径对二进制 PDF 只会产出乱码。
+- **二进制内容拒抓**：其余非文本 Content-Type（`image/*` `audio/*` `video/*` `font/*`、zip/gzip/tar、`application/octet-stream`、Office 文档等）同样前置报错指引 `gsearch dl <url>`；文本类（`text/*`、JSON、`+xml`、javascript）照常提取，无 Content-Type 头按文本处理。
+- **正文提取走 scraper 树内解析**（与 `search --read` 的 AdaptiveRead 同一解析器）：HTML 由 html5ever 按浏览器规则解析，属性值含 `>` 的标签不会漏片段进正文，实体在解析期解码。
 - **fetch 输出 `content_untrusted: true`** 与 read/browse 同契约。
 
 ### 退出码（agent 消费必读，对照源码 main.rs/verify.rs）
@@ -146,6 +148,7 @@ gsearch dl    https://.../file.pdf -o a.bin --output-file b.bin  # -o 含扩展�
 ### shell（交互模式，可选）
 
 `gsearch shell` 起一次 Chrome 后台会话，prompt `gsearch> ` 持续读 stdin，cookie / 页面状态跨命令延续。
+所有建页入口（顶层命令、shell 多 tab、CAPTCHA 有头/无头切换重建页）统一开 focus emulation（CDP `Emulation.setFocusEmulationEnabled`）——隐藏 tab 的 `setTimeout`/`setInterval` 不被 Chrome 钳到秒级（实测 2s 窗口 3 次 → 125 次，16ms 满速率），read 判稳轮询 / 后台页定时器不被节流拖慢。
 单 exe 「用完即走」原则不破：shell 是可选的人用交互模式，顶层一次性命令全部保留；shell 内输出仍走人读格式。
 
 ```

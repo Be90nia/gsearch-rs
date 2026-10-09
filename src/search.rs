@@ -109,7 +109,7 @@ pub async fn run_search(
         SearxngAttempt::CircuitBroken => return Err(anyhow!("{SEARXNG_CIRCUIT_MSG}")),
         SearxngAttempt::NotConfigured | SearxngAttempt::FallbackGoogle => {}
     }
-    let page = browser.new_page("about:blank").await?;
+    let page = browser::open_page(browser).await?;
     run_search_on_page(browser, cfg, page, h_slot, human_solved).await
 }
 
@@ -154,7 +154,7 @@ pub async fn run_search_on_page(
                 let _ = page.close().await;
                 return Err(anyhow!("swap_to_headed 失败: {e}"));
             }
-            let page2 = match browser.new_page("about:blank").await {
+            let page2 = match browser::open_page(browser).await {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = page.close().await;
@@ -195,7 +195,7 @@ pub async fn run_search_on_page(
                 let _ = page2.close().await;
                 return Err(e);
             }
-            page = match browser.new_page("about:blank").await {
+            page = match browser::open_page(browser).await {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = page2.close().await;

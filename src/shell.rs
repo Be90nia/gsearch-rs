@@ -66,10 +66,7 @@ pub async fn run_shell() -> Result<ExitCode> {
     let (browser, handler) = browser::launch(true).await.context("启动 Chrome 失败")?;
     let handler_task = Some(browser::spawn_handler(handler));
 
-    let page = browser
-        .new_page("about:blank")
-        .await
-        .context("创建初始 page 失败")?;
+    let page = browser::open_page(&browser).await.context("创建初始 page 失败")?;
 
     let mut ctx = ShellCtx {
         browser,
@@ -182,9 +179,7 @@ async fn cmd_search(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
                 eprintln!("切回 headless 失败: {e}");
                 return Err(e);
             }
-            ctx.page = ctx
-                .browser
-                .new_page("about:blank")
+            ctx.page = browser::open_page(&ctx.browser)
                 .await
                 .context("切回 headless 后创建 page 失败")?;
             ctx.current_url.clear();
@@ -193,9 +188,7 @@ async fn cmd_search(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     };
     // 随旧 browser 死掉（后续命令报 "receiver is gone"）。检测失效即重建。
     if ctx.page.evaluate("1").await.is_err() {
-        ctx.page = ctx
-            .browser
-            .new_page("about:blank")
+        ctx.page = browser::open_page(&ctx.browser)
             .await
             .context("CAPTCHA 换 browser 后重建 page 失败")?;
     }
@@ -441,9 +434,7 @@ async fn cmd_login(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     // 先切有头（close + 同 profile 重起），保持 cookie 不丢
     swap_to_headed(&mut ctx.browser, &mut ctx.handler_task).await?;
     // 有头模式下旧 page 已随旧 browser 关闭，新开一个
-    ctx.page = ctx
-        .browser
-        .new_page("about:blank")
+    ctx.page = browser::open_page(&ctx.browser)
         .await
         .context("有头模式创建 page 失败")?;
     goto(&ctx.page, url).await?;
@@ -491,9 +482,7 @@ async fn cmd_login(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     let cut = ans.trim();
     if cut.is_empty() || cut.eq_ignore_ascii_case("y") || cut.eq_ignore_ascii_case("yes") {
         browser::swap_to_headless(&mut ctx.browser, &mut ctx.handler_task).await?;
-        ctx.page = ctx
-            .browser
-            .new_page("about:blank")
+        ctx.page = browser::open_page(&ctx.browser)
             .await
             .context("切回 headless 后创建 page 失败")?;
         ctx.current_url.clear();

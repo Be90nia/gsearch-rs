@@ -13,7 +13,7 @@ use chromiumoxide::cdp::browser_protocol::browser::{
     SetDownloadBehaviorBehavior, SetDownloadBehaviorParams,
 };
 
-use gsearch::browser::{BrowserKind, launch_with_kind_proxy, spawn_handler};
+use gsearch::browser::{BrowserKind, launch_with_kind_proxy, open_page, spawn_handler};
 use gsearch::search::is_captcha;
 use gsearch::skeleton::extract_adaptive;
 use gsearch::util::filename_from_url;
@@ -59,7 +59,7 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
         let (browser, handler) =
             launch_with_kind_proxy(true, opts.browser, opts.proxy.clone()).await?;
         let _h = spawn_handler(handler);
-        let page = browser.new_page("about:blank").await?;
+        let page = open_page(&browser).await?;
         tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
             .await
             .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
@@ -167,7 +167,7 @@ pub async fn cmd_login(url: &str, browser: Option<BrowserKind>, proxy: Option<St
         let _h = spawn_handler(handler);
         browser_opt = Some(browser_inst);
 
-        let page = browser_opt.as_ref().unwrap().new_page("about:blank").await?;
+        let page = open_page(browser_opt.as_ref().unwrap()).await?;
         tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), page.goto(url))
             .await
             .map_err(|_| anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}"))?
@@ -276,7 +276,7 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>, output_file: Option<&Path>
             .context("设置下载行为失败（Browser.setDownloadBehavior）")?;
 
         let before = list_dir(&dir)?;
-        let page = browser_inst.new_page("about:blank").await?;
+        let page = open_page(browser_inst).await?;
         // I4：goto 失败/超时 warn 留痕后继续——下载靠原生下载嗅探或页内 fetch 兜底。
         let _ = postproc::goto_for_download(page.goto(url), url).await;
 
