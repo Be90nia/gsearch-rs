@@ -187,6 +187,7 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
                     // 不再伪装成 "google" 误导 agent 分流；搜索路径恒非空不受影响
                     provider: String::new(),
                     recency: None,
+                    site_warn: None,
                 };
                 let run = gsearch::types::RunStatusInfo {
                     status: gsearch::types::RunStatus::Ok,

@@ -54,6 +54,10 @@ pub struct MetaOutput {
     /// 时间过滤回显（--recency 的原始值）；未传时键缺席（ago：与 proxy 同缺席语义）。
     #[serde(skip_serializing_if = "skip_compact_absent_opt")]
     pub recency: Option<String>,
+    /// P1 盲测八 site: 静默吞掉修复：查询含 site: 限定符时给出可行动建议，
+    /// 缺席语义与 proxy/recency 同（仅 search 路径可能填值）。
+    #[serde(skip_serializing_if = "skip_compact_absent_opt")]
+    pub site_warn: Option<String>,
 }
 
 // 6dp：`--compact-meta` 压缩开关。skip 判定读进程级标志——serde 的 skip_serializing_if
@@ -224,6 +228,7 @@ mod tests {
             truncated: false,
             provider: "google".into(),
             recency: None,
+            site_warn: None,
         }
     }
 

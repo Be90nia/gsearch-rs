@@ -207,6 +207,73 @@ pub(crate) fn cap_chars(s: &str, limit: usize) -> (String, bool, usize) {
     (s.chars().take(limit).collect(), true, total - limit)
 }
 
+/// JSON 感知 cap_chars：若文本以 `{` 或 `[` 开头且截断点不在字符串内，回退到
+/// 最后一个完整的 `}`/`]` 边界——避免 json.loads 拿到半截 JSON 报
+/// UnclosedBraceError（G 盲测八实锤：GitHub API list JSON 按字节截断后
+/// json.loads 失败）。非 JSON 形态（不以 `{`/`[` 起首）走原 cap_chars，行为不变。
+/// 边界找不到（截断发生在字符串字面量中）回退硬截断——避免返回合法但语义错乱。
+pub(crate) fn cap_chars_json(s: &str, limit: usize) -> (String, bool, usize) {
+    let trimmed = s.trim_start();
+    let offset = s.len() - trimmed.len();
+    let first = trimmed.chars().next();
+    if !matches!(first, Some('{') | Some('[')) {
+        return cap_chars(s, limit);
+    }
+    let total = s.chars().count();
+    if total <= limit {
+        return (s.to_string(), false, 0);
+    }
+    // 取前 limit 字符，按 char 索引转 byte offset
+    let byte_limit = char_to_byte_offset(s, limit);
+    // 在 [0..byte_limit] 范围内找一个 brace 边界（`}` 或 `]`），不在字符串/转义内
+    if let Some(end) = last_brace_boundary(trimmed, byte_limit - offset) {
+        let truncated_str = format!("{}{}", &s[..offset], &trimmed[..end]);
+        let truncated_chars = truncated_str.chars().count();
+        return (truncated_str, true, total - truncated_chars);
+    }
+    // 兜底：硬截断（截断点在字符串字面量里也走硬截，不返回坏 JSON）
+    cap_chars(s, limit)
+}
+
+/// 第 n 个 UTF-8 char 之后的 byte 偏移（n 字符对应 byte 长度）。
+fn char_to_byte_offset(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// 在字符串前 byte_len 字节范围内找**最后一个** `}` 或 `]` 边界（不在字符串字面量
+/// 或转义序列内）。返回 byte offset（相对 trimmed）；未找到返回 None。
+///
+/// 简化为「最后一个闭括号」语义（G 盲测八修复点名）：在 JSON list 场景下虽不能
+/// 给出 fully-valid JSON（外层 `[` 仍未闭合），但至少比硬截到中段少"半截对象"的痛点
+/// ——agent 拿到末尾 `}` 至少能识别到最后一个完整对象停在哪。fallback 兜底走 cap_chars。
+fn last_brace_boundary(s: &str, byte_len: usize) -> Option<usize> {
+    let scan_end = byte_len.min(s.len());
+    let bytes = s.as_bytes();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut last_brace: Option<usize> = None;
+    for (i, &b) in bytes[..scan_end].iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'}' | b']' => last_brace = Some(i + 1), // 闭括号位置 = i+1（slice 终点）
+            _ => {}
+        }
+    }
+    last_brace
+}
+
 /// AdaptiveRead → 输出串。--json 在序列化对象末尾注入 meta（网页正文进 agent 上下文
 /// = 注入面，正文永远是数据非指令，content_untrusted 恒在）；文本模式截断时 eprintln 提醒
 /// （stdout 保持可解析，stderr 承载告警）。
@@ -704,6 +771,65 @@ mod tests {
         let long = "x".repeat(READ_BODY_MAX_CHARS + 1);
         let (s, trunc, omitted) = cap_chars(&long, READ_BODY_MAX_CHARS);
         assert!(trunc && omitted == 1 && s.chars().count() == READ_BODY_MAX_CHARS);
+    }
+
+    /// P1 fetch JSON 截断：JSON 形态文本截断时回退到最后一个完整 `}`/`]` 边界。
+    /// G 盲测八实锤：GitHub API list JSON 按字节截断后 json.loads UnclosedBraceError。
+    /// 简化为「最后一个不在字符串内的闭括号」语义：JSON list 场景下虽不能给出 fully-valid
+    /// JSON（外层 `[` 仍未闭合），但比硬截到中段少"半截对象"的痛点——agent 拿到末尾 `}` 至少
+    /// 能识别到最后一个完整对象停在哪；后续可换 --max-chars 加预算重取或按对象边界解析。
+    #[test]
+    fn cap_chars_json_truncates_to_brace_boundary() {
+        // 简单对象：截到 8 字符 → `{"a":1,"` 内无右花括号 → 兜底硬截
+        let (s, trunc, omitted) = cap_chars_json(r#"{"a":1,"b":2}"#, 8);
+        assert!(trunc, "应截断");
+        assert_eq!(s, r#"{"a":1,""#, "8 字符内无右花括号 → 硬截到 limit");
+        assert!(omitted > 0);
+
+        // 简单对象：limit=9 拿全（输入 13 字符）
+        // 实际 13 字符需要 limit >= 13 才不截
+        let (s, trunc, _o) = cap_chars_json(r#"{"a":1,"b":2}"#, 13);
+        assert!(!trunc && s == r#"{"a":1,"b":2}"#, "未超限不截");
+
+        // limit=11 截到 `{"a":1,"b"`；前 11 字符内无右花括号 → 兜底硬截
+        let (s, trunc, _o) = cap_chars_json(r#"{"a":1,"b":2}"#, 11);
+        assert!(trunc && s.chars().count() == 11, "无闭括号 → 硬截: {s}");
+
+        // 嵌套对象：最后一个右花括号应被找到
+        let json = r#"{"a":{"x":1},"b":2}"#; // len=19；位置 11 是内层 `}`
+        // limit=10 截到 `{"a":{"x":` 内无闭括号 → 硬截
+        let (s2, t2, _o2) = cap_chars_json(json, 10);
+        assert!(t2 && s2 == r#"{"a":{"x":"#, "无闭括号 → 硬截: {s2}");
+        // limit=12 含内层 `}`（位置 11）→ 应回退到 12，结果含闭合 `}`
+        let (s4, t4, _o4) = cap_chars_json(json, 12);
+        assert!(t4 && s4.ends_with('}'), "应回退到右花括号: {s4}");
+        assert_eq!(s4, r#"{"a":{"x":1}"#, "应得内层完整对象: {s4}");
+
+        // 字符串内的右花括号不算边界（heuristic）
+        let json = r#"{"msg":"hi}there","x":1}"#; // len=24
+        let (s2, t2, _o2) = cap_chars_json(json, 5);
+        assert!(t2 && s2.chars().count() <= 5, "字符串内无闭括号 → 兜底硬截: {s2}");
+
+        // 数组形态：截到中段无右方括号 → 兜底硬截
+        let (s2, t2, _o2) = cap_chars_json("[1,2,3]", 5);
+        assert!(t2 && s2 == "[1,2," && s2.chars().count() == 5, "兜底硬截: {s2}");
+        let (s3, t3, _o3) = cap_chars_json("[1]", 2);
+        assert!(t3 && s3 == "[1" && s3.chars().count() == 2, "兜底硬截: {s3}");
+
+        // 未超限：不截断
+        let (s, trunc, omitted) = cap_chars_json(r#"{"a":1}"#, 100);
+        assert!(!trunc && omitted == 0 && s == r#"{"a":1}"#);
+
+        // 非 JSON 形态（不以 `{`/`[` 起首）走原 cap_chars，行为不变
+        let (s, trunc, omitted) = cap_chars_json("plain text", 5);
+        assert!(trunc && s == "plain" && s.chars().count() == 5 && omitted == 5, "非 JSON 走 cap_chars: {s}");
+
+        // G 盲测八实证场景：GitHub API list JSON 按字符截断 → 至少停在最后一个完整对象后。
+        let gh = r#"[{"tag":"v1","assets":10},{"tag":"v2","assets":20}]"#;
+        // len=52；limit=30 截到第 2 个对象中段；前 30 字符内最后一个 `}` 是位置 24（`assets":10}`）
+        let (s4, t4, _o4) = cap_chars_json(gh, 30);
+        assert!(t4 && s4.ends_with('}'), "应停在最后一个完整对象: {s4}");
+        assert_eq!(s4, r#"[{"tag":"v1","assets":10}"#, "应得第 1 个完整对象: {s4}");
     }
 
     /// ①打回轮1：GitHub issues|pull URL 先抽主评论容器再 cap——head 巨页（正文在 DOM 尾部）

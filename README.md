@@ -211,6 +211,10 @@ gsearch> <Ctrl+D>          # EOF 优雅退出，Chrome 自动关
 - 空的末段、`..` 或根路径会报错，不回退覆盖已有 profile
 - 首次冷启动养号，可能遇 CAPTCHA，人工解一次后养熟
 - Profile 可整目录 zip 携走，换机只需放同位置
+- **多 agent 并发同 default profile**（盲测八 P0）：双层 fork 防御——
+  - 第一层：解析时检查 SingletonLock 残留 + 持锁进程，命中则自动 fork 到 `fork-<timestamp>-<pid>-<rand>` 子目录从 default copy 一次性内容；stderr 一行 `[hint] default profile 被他人持锁（PID 列表），自动 fork 到 fork-{uuid}（cookie 已 copy 一次）`
+  - 第二层 race-robust：盲测并发毫秒级窗口两进程都过第一层后撞锁，重试打尽 + last_err 含 lockfile/Singleton/locked by 关键词 → fork 路径自动重试一次，仅限默认 profile；stderr `[hint] 启动 Chrome 时撞 default profile lock（启动前 race），自动 fork 到 fork-{uuid} 重试`
+  - 用户自定义 profile（`GSEARCH_PROFILE=work` 等）不触发 fork，避免误拷私有 profile
 
 ### 环境变量
 

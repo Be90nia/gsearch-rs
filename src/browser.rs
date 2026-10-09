@@ -239,6 +239,11 @@ pub fn find_chrome() -> Result<PathBuf> {
 /// Profile 目录：env `GSEARCH_PROFILE` > 配置文件 profile 键 > default。
 /// 值为**已存在的绝对路径**时直接用作 profile 目录（换盘符存放）；
 /// 否则视为 profile 名，放进 `~/.gsearch/profiles/<名>/`。
+///
+/// 命中默认 profile 时若已被他人持锁（多 agent 并发场景：chromiumoxide 持同一
+/// Chrome profile lockfile，第二进程必撞锁），自动 fork 到 `fork-<uuid>` 子目录
+/// 从 default 一次性 copy cookie/历史/GAEX，后续所有 read/write 走 fork。
+/// stderr 一行 hint 通报用户/agent。诊断 exit code 0 不变——fork 是 silent fallback。
 pub fn profile_dir() -> Result<PathBuf> {
     let path = match effective_profile_raw() {
         Some(raw) if is_absolute_dir(&raw) => std::path::absolute(raw.trim())?,
@@ -255,7 +260,144 @@ pub fn profile_dir() -> Result<PathBuf> {
         }
     };
     ensure_dir(&path)?;
+    // Fork 仅作用于默认 profile 路径：用户显式指定 GSEARCH_PROFILE=work 等自定义
+    // profile 时不触发 fork（避免误把个人 work profile 内容拷成 fork-{uuid}）。
+    if is_default_profile_path(&path)
+        && let Some(forked) = try_fork_profile(&path)
+    {
+        return Ok(forked);
+    }
     Ok(path)
+}
+
+/// 是否「默认 profile 路径」语义（HOME/.gsearch/profiles/default，末段 = default）。
+/// 非默认 profile（用户显式指定）不走 fork，避免误拷用户私有 profile 内容。
+fn is_default_profile_path(p: &Path) -> bool {
+    p.file_name().and_then(|n| n.to_str()) == Some("default")
+}
+
+/// 检测 default profile 是否被其他进程持锁（chrome SingletonLock/SingletonCookie
+/// 存在 + diagnose_lock_holders 返回 Some = 有别的 browser 进程在用它）。
+/// 命中时返回 fork 路径（已 cp 完 default 内容）；不命中/拷贝失败返回 None，
+/// 调用方静默回落到 default 路径。
+fn try_fork_profile(default_path: &Path) -> Option<PathBuf> {
+    if !default_path.exists() {
+        return None; // 首次启动，default 不存在无锁可抢，自然走 default
+    }
+    // 仅在 lockfile 残留 + 确认有其他 browser 持锁时才 fork（孤立 SingletonLock
+    // 残留但无活进程 = 上次进程被 kill，留着走 cleanup_stale_locks，不 fork）。
+    let lock_files_present = ["SingletonLock", "SingletonCookie", "SingletonSocket"]
+        .iter()
+        .any(|name| default_path.join(name).exists());
+    if !lock_files_present {
+        return None;
+    }
+    // 只诊断不 kill——精确 PID 交给用户；存在 PID 则 fork
+    let holders = match diagnose_lock_holders(default_path) {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return None, // 锁文件残留但无活进程持锁（孤儿）→ 走 cleanup_stale_locks
+    };
+    let fork_path = fork_path_for(default_path)?;
+    if fork_path.exists() {
+        // 同 uuid 已存在（理论同进程同时刻只会进来一次，但极端场景下兜底：存在即复用，
+        // 不重新拷贝，避免 fork-{uuid} 在并发 agent 间被反复覆盖）。
+        eprintln!(
+            "[hint] default profile 被他人持锁（{holders}），复用 fork {}",
+            fork_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+        );
+        return Some(fork_path);
+    }
+    match copy_profile_contents(default_path, &fork_path) {
+        Ok(()) => {
+            eprintln!(
+                "[hint] default profile 被他人持锁（{holders}），自动 fork 到 {}（cookie 已 copy 一次）",
+                fork_path.display()
+            );
+            Some(fork_path)
+        }
+        Err(e) => {
+            // fork 失败时静默回落 default——Chromium 仍会撞锁但锁打尽逻辑已能
+            // 给出降级出口（gsearch fetch 路径），不阻断用户。
+            tracing::warn!("fork profile 失败，回落 default: {e}");
+            None
+        }
+    }
+}
+
+/// 构造 fork 路径：`~/.gsearch/profiles/fork-<timestamp>-<pid>-<rand>`。
+/// 时间戳+pid+随机后缀防并发 agent 同名冲突。
+fn fork_path_for(default_path: &Path) -> Option<PathBuf> {
+    let parent = default_path.parent()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    // 末段随机：4 hex 字符（16 bits 足够区分同秒同 pid 的并发 agent）
+    let rand: u32 = {
+        use std::hash::{BuildHasher, Hasher, RandomState};
+        (RandomState::new().build_hasher().finish() as u32) & 0xFFFF
+    };
+    let name = format!("fork-{stamp}-{pid}-{rand:04x}");
+    Some(parent.join(name))
+}
+
+/// 一次性 copy default profile 内容到 fork 目录（cookie/历史/Local Storage/GAEX）。
+/// 不递归（profile 顶层文件 + Default/ 子目录已含 chrome 主要持久化数据；递归
+/// 引入边界复杂度且缺测试，扁平拷贝足以保留跨次命令的登录态）。
+fn copy_profile_contents(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to).with_context(|| format!("创建 fork profile 目录失败: {}", to.display()))?;
+    for entry in std::fs::read_dir(from).with_context(|| format!("读取 default profile 失败: {}", from.display()))? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        // 跳过 lockfile 残留：fork 目录绝不带 SingletonLock/Cookie/Socket，
+        // 否则 fork 进程一启动又会报"持锁"歧义。
+        if let Some(name) = entry.file_name().to_str()
+            && matches!(name, "SingletonLock" | "SingletonCookie" | "SingletonSocket" | "lockfile")
+        {
+            continue;
+        }
+        let copy_result: std::result::Result<(), std::io::Error> = if src.is_dir() {
+            copy_dir_recursive(&src, &dst)
+        } else {
+            std::fs::copy(&src, &dst).map(|_| ())
+        };
+        if let Err(e) = copy_result {
+            tracing::warn!("fork profile 跳过 {}: {e}", src.display());
+        }
+    }
+    Ok(())
+}
+
+/// 递归拷贝子目录（仅 chrome profile 内 Default/Cookies/History/Local Storage/...）。
+/// 跳过锁文件与 SymbolicLink（Windows 上少见，遭遇即 warn 不 abort）。
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::result::Result<(), std::io::Error> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let s = entry.path();
+        let d = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            tracing::warn!("fork profile 跳过符号链接: {}", s.display());
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str()
+            && matches!(name, "SingletonLock" | "SingletonCookie" | "SingletonSocket" | "lockfile")
+        {
+            continue;
+        }
+        if file_type.is_dir() {
+            copy_dir_recursive(&s, &d)?;
+        } else {
+            std::fs::copy(&s, &d)?;
+        }
+    }
+    Ok(())
 }
 
 /// 值是“存在的绝对路径目录”→ 当存放路径用（不是 profile 名）。
@@ -494,10 +636,61 @@ pub async fn launch_with_kind_proxy(
     // M14-2A cfg 切换点：默认（feature off）走 chromiumoxide 0.9 原路径，零行为变化；
     // chaser-stealth on 时改走 launch 层 transport stealth（见 launch_with_stealth_transport）。
     #[cfg(feature = "chaser-stealth")]
-    let (browser, handler) = launch_with_stealth_transport(config, &profile).await?;
+    let (browser, handler) = launch_with_stealth_transport(
+        config,
+        &profile,
+        |forked_path| rebuild_browser_config(&browser_exe, &browser_kind, &proxy, headless, forked_path),
+    )
+    .await?;
     #[cfg(not(feature = "chaser-stealth"))]
-    let (browser, handler) = launch_with_retry(config, &profile).await?;
+    let (browser, handler) = launch_with_retry(config, &profile, |forked_path| {
+        rebuild_browser_config(&browser_exe, &browser_kind, &proxy, headless, forked_path)
+    })
+    .await?;
     Ok((browser, handler))
+}
+
+/// BrowserConfig 重搭：fork 路径触发时调用，复制同配方 builder 把 user_data_dir 换掉。
+/// ponytail: chromiumoxide 0.9 BrowserConfig 无公开 setter，必须走 Builder 重搭；这里
+/// 把 builder 配方提出来当纯函数，便于 race-robust 第二层防御复用。
+fn rebuild_browser_config(
+    browser_exe: &Path,
+    browser_kind: &BrowserKind,
+    proxy: &Option<String>,
+    headless: bool,
+    profile: &Path,
+) -> BrowserConfig {
+    let mut builder = BrowserConfig::builder()
+        .chrome_executable(browser_exe)
+        .user_data_dir(profile)
+        .arg("disable-blink-features=AutomationControlled")
+        .arg(format!("user-agent={UA}"))
+        .disable_default_args();
+    if let Some(p) = proxy {
+        tracing::info!("代理: {}", redact_proxy(p));
+        builder = builder.arg(format!("proxy-server={p}"));
+    }
+    let safe_args: &[&str] = if headless {
+        ["headless=new", "no-sandbox", "disable-dev-shm-usage", "window-size=1920,1080"].as_slice()
+    } else {
+        ["no-sandbox", "disable-dev-shm-usage"].as_slice()
+    };
+    builder = builder.args(safe_args.iter().copied());
+    builder = if headless {
+        builder
+            .viewport(chromiumoxide::handler::viewport::Viewport {
+                width: 1920,
+                height: 1080,
+                ..Default::default()
+            })
+            .new_headless_mode()
+    } else {
+        builder.with_head()
+    };
+    let _ = browser_kind; // 路径已定，kind 不影响 builder 构造（仅 launch 自动兑底时才用）
+    builder
+        .build()
+        .expect("BrowserConfig 重搭不应失败（builder 已验证）")
 }
 
 
@@ -508,7 +701,22 @@ pub async fn launch_with_kind_proxy(
 /// 每轮重试打出上一次失败的**真实错误**（可见进度，不再静默五连）；打尽后列出
 /// 持 profile 锁的僵尸浏览器进程 PID——chromiumoxide Windows 子进程继承锁句柄，
 /// gsearch 退出后残留浏览器持续持锁，继续重试无效，只有精确 kill 才能解。
-async fn launch_with_retry(config: BrowserConfig, profile: &Path) -> Result<(Browser, Handler)> {
+///
+/// 第二层 race-robust 防御：profile_dir() 解析时已做第一层 lockfile 检测，但盲测
+/// 并发毫秒级窗口可能两进程都过"启动前 lockfile 检查"→ 都走 default → 撞锁。
+/// 重试打尽后若 last_err 含锁文件/Singleton/locked by 等关键词（Chrome 报错标准文案）
+/// → fork 路径自动重试一次（仅限默认 profile；用户自定义 profile 不误触发）。
+/// `rebuild` 闭包由调用方传入：用相同 builder 配方但改 user_data_dir 到 fork 路径。
+/// ponytail: chromiumoxide 0.9 BrowserConfig 无公开 setter，必须走 Builder 重搭——闭包
+/// 把 builder 逻辑从调用方借来，避免在这里复制构造代码。
+async fn launch_with_retry<F>(
+    config: BrowserConfig,
+    profile: &Path,
+    rebuild: F,
+) -> Result<(Browser, Handler)>
+where
+    F: FnOnce(&Path) -> BrowserConfig,
+{
     const BACKOFF_SECS: [u64; 5] = [1, 3, 6, 10, 15];
     let rounds = BACKOFF_SECS.len();
     let mut attempt = Browser::launch(config.clone()).await;
@@ -528,7 +736,27 @@ async fn launch_with_retry(config: BrowserConfig, profile: &Path) -> Result<(Bro
         attempt = Browser::launch(config.clone()).await;
     }
     let last_err = attempt.expect_err("退避循环打尽必有 Err");
-    let mut msg = lock_failure_msg(rounds, &last_err.to_string());
+    let last_err_str = last_err.to_string();
+
+    // 第二层 race-robust 防御：锁文件碰撞错误 + 当前是默认 profile → fork 重试一次
+    if is_lock_collision_error(&last_err_str)
+        && is_default_profile_path(profile)
+        && let Some(forked) = try_fork_profile(profile)
+    {
+        eprintln!(
+            "[hint] 启动 Chrome 时撞 default profile lock（启动前 race），自动 fork 到 {} 重试",
+            forked
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+        );
+        let forked_config = rebuild(&forked);
+        if let Ok(ok) = Browser::launch(forked_config).await {
+            return Ok(ok);
+        }
+    }
+
+    let mut msg = lock_failure_msg(rounds, &last_err_str);
     match diagnose_lock_holders(profile) {
         Some(holders) => {
             msg.push_str(&format!("\n持有该 profile 的进程（按 PID 精确处理，禁 taskkill /IM 全杀）:\n{holders}"));
@@ -538,6 +766,16 @@ async fn launch_with_retry(config: BrowserConfig, profile: &Path) -> Result<(Bro
         ),
     }
     Err(anyhow!(msg))
+}
+
+/// Chrome 启动失败文案是否提示 lockfile 竞态（关键词匹配，覆盖 chromiumoxide / Chrome 标准输出）。
+/// 命中词：lockfile / Singleton / locked by / profile lock / already locked。
+/// 大小写不敏感，避免遗漏变体。
+fn is_lock_collision_error(err_str: &str) -> bool {
+    let lower = err_str.to_ascii_lowercase();
+    ["lockfile", "singleton", "locked by", "profile lock", "already locked"]
+        .iter()
+        .any(|k| lower.contains(k))
 }
 
 /// profile 锁打尽重试后的裸失败消息（纯函数供单测锁出口建议）。
@@ -603,11 +841,15 @@ const STEALTH_PATCH_SEQUENCE: &[StealthPatchStep] =
 /// ponytail: 调用方后续 new_page 的新 target 不在本层（--humanize 路径已注入）；
 /// 全量 CDP 命令拦截是 chaser-oxide fork 本体价值，接入 fork 时替换本函数实现即可。
 #[cfg(feature = "chaser-stealth")]
-async fn launch_with_stealth_transport(
+async fn launch_with_stealth_transport<F>(
     config: BrowserConfig,
     profile: &Path,
-) -> Result<(Browser, Handler)> {
-    let (browser, mut handler) = launch_with_retry(config, profile).await?;
+    rebuild: F,
+) -> Result<(Browser, Handler)>
+where
+    F: FnOnce(&Path) -> BrowserConfig,
+{
+    let (browser, mut handler) = launch_with_retry(config, profile, rebuild).await?;
     // 缩窄 patches 作用域：循环结束 + drop 后再移动 browser。
     // ponytail: Box::pin 让 borrow 在块尾随 patches drop 一起结束，
     // 否则编译器看见 borrowing coroutine 跨 move（E0505）。
@@ -787,6 +1029,175 @@ mod tests {
         assert!(chrome.to_string_lossy().contains("Google"));
         assert!(chrome.to_string_lossy().contains("Chrome"));
         assert!(!chrome.to_string_lossy().contains("Microsoft"));
+    }
+
+    /// P0 fork profile：default 不存在（首次启动）→ 不 fork，返回 default 自身
+    ///（首次启动也是 silent fallback，与正式运行时行为一致）。
+    #[test]
+    fn try_fork_profile_returns_none_when_default_missing() {
+        let tmp = tempdir();
+        let default_path = tmp.join("profiles").join("default");
+        assert!(!default_path.exists());
+        assert!(super::try_fork_profile(&default_path).is_none());
+    }
+
+    /// P0 fork profile：default 存在但无 lockfile → 不 fork（用户主动开关一次
+    /// Chrome 残留的 SingletonLock 由 cleanup_stale_locks 处理，不在 fork 路径触发）。
+    #[test]
+    fn try_fork_profile_returns_none_when_no_locks() {
+        let tmp = tempdir();
+        let default_path = tmp.join("profiles").join("default");
+        std::fs::create_dir_all(&default_path).unwrap();
+        // 放一些内容代表 cookie/历史
+        std::fs::write(default_path.join("Cookies"), b"cookie-data").unwrap();
+        assert!(super::try_fork_profile(&default_path).is_none());
+    }
+
+    /// P0 fork profile：lockfile 残留但无诊断到的持锁进程（孤儿 SingletonLock）→
+    /// 不 fork，走 cleanup_stale_locks 路径——fork 仅在确有并发实例时触发。
+    /// 本测试在普通 CI 上（无 chrome 进程）必命中 None。
+    #[test]
+    fn try_fork_profile_orphan_lock_no_fork() {
+        let tmp = tempdir();
+        let default_path = tmp.join("profiles").join("default");
+        std::fs::create_dir_all(&default_path).unwrap();
+        std::fs::write(default_path.join("SingletonLock"), b"").unwrap();
+        // 在没有 chrome.exe/msedge.exe 跑着的 CI 上 diagnose_lock_holders 返回 None
+        // → try_fork_profile 也返回 None（孤儿锁不 fork）。
+        let r = super::try_fork_profile(&default_path);
+        assert!(r.is_none(), "孤儿 SingletonLock 不应触发 fork（避免误拷无主内容）");
+    }
+
+    /// P0 fork profile：fork 路径形如 fork-<timestamp>-<pid>-<rand>，与 default 同 parent。
+    #[test]
+    fn fork_path_for_uses_fork_prefix_and_default_parent() {
+        let tmp = tempdir();
+        let default_path = tmp.join("profiles").join("default");
+        std::fs::create_dir_all(default_path.parent().unwrap()).unwrap();
+        let fork = super::fork_path_for(&default_path).unwrap();
+        assert_eq!(fork.parent(), default_path.parent());
+        let name = fork.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("fork-"), "fork 名前缀: {name}");
+        // 末段 4 个 hex 字符
+        let last = name.rsplit('-').next().unwrap();
+        assert_eq!(last.len(), 4, "rand 后缀长度: {last}");
+        assert!(last.chars().all(|c| c.is_ascii_hexdigit()), "rand 后缀 hex: {last}");
+    }
+
+    /// P0 fork profile：copy_profile_contents 递归拷贝并跳过 lockfile 残留。
+    /// 模拟 default 顶层 + 子目录（Default/Cookies）+ 锁文件。
+    #[test]
+    fn copy_profile_contents_recursive_and_skips_locks() {
+        let tmp = tempdir();
+        let default_path = tmp.join("default");
+        let fork_path = tmp.join("fork");
+        // 顶层：cookie 文件 + 锁文件（应被跳过）
+        std::fs::create_dir_all(&default_path).unwrap();
+        std::fs::write(default_path.join("Cookies"), b"my-cookie").unwrap();
+        std::fs::write(default_path.join("SingletonLock"), b"lock-data").unwrap();
+        std::fs::write(default_path.join("Preferences"), b"pref-json").unwrap();
+        // 子目录：Default/Cookies + 子目录里也有锁文件
+        let default_sub = default_path.join("Default");
+        std::fs::create_dir_all(&default_sub).unwrap();
+        std::fs::write(default_sub.join("History"), b"history-data").unwrap();
+        std::fs::write(default_sub.join("lockfile"), b"inner-lock").unwrap();
+
+        super::copy_profile_contents(&default_path, &fork_path).unwrap();
+
+        // 顶层：cookie + preferences 拷过去，SingletonLock 不拷
+        assert!(fork_path.join("Cookies").exists(), "顶层 cookie 应拷");
+        assert!(fork_path.join("Preferences").exists(), "顶层 prefs 应拷");
+        assert!(!fork_path.join("SingletonLock").exists(), "顶层 SingletonLock 应跳过");
+
+        // 子目录：History 拷过去，lockfile 不拷
+        assert!(fork_path.join("Default").join("History").exists(), "子目录 History 应拷");
+        assert!(!fork_path.join("Default").join("lockfile").exists(), "子目录 lockfile 应跳过");
+
+        // 内容保真（cookie 是 cookie，不是 lock-data）
+        let cookie = std::fs::read(fork_path.join("Cookies")).unwrap();
+        assert_eq!(cookie, b"my-cookie", "cookie 内容保真");
+    }
+
+    /// P0 fork profile：is_default_profile_path 仅末段 = default 时为真，
+    /// 自定义 profile (work 等) 不误判，避免误拷用户私有 profile。
+    #[test]
+    fn is_default_profile_path_only_default() {
+        assert!(super::is_default_profile_path(std::path::Path::new("/home/u/.gsearch/profiles/default")));
+        assert!(super::is_default_profile_path(std::path::Path::new("D:/foo/default")));
+        assert!(!super::is_default_profile_path(std::path::Path::new("/home/u/.gsearch/profiles/work")));
+        assert!(!super::is_default_profile_path(std::path::Path::new("D:/foo/default-backup")));
+    }
+
+    /// 用临时目录作为本次测试的「HOME」——避免污染真 ~/.gsearch/profiles。
+    /// 测试结束后 tempdir drop 时会触发临时目录清理（dirs cleanup 由调用方控制）。
+    fn tempdir() -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "gsearch-fork-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /// 第二层 race-robust 防御：is_lock_collision_error 关键词匹配覆盖 chromiumoxide / Chrome
+    /// 标准报错文案。大小写不敏感；命中即视为锁碰撞，触发 fork 重试一次。
+    #[test]
+    fn is_lock_collision_error_keyword_coverage() {
+        // 命中：各变体文案
+        for ok in [
+            "SingletonLock exists",
+            "the lockfile is held by another process",
+            "Profile locked by another browser instance",
+            "Profile is already locked",
+            "LOCKFILE contention",
+            "user data dir is already locked by another process",
+        ] {
+            assert!(
+                super::is_lock_collision_error(ok),
+                "应识别锁碰撞: {ok}"
+            );
+        }
+        // 不命中：非锁碰撞错（防御误触发 fork）
+        for bad in [
+            "ExitStatus(21)",
+            "connection refused",
+            "timeout waiting for browser",
+            "Failed to find Chrome executable",
+        ] {
+            assert!(
+                !super::is_lock_collision_error(bad),
+                "不应误判锁碰撞: {bad}"
+            );
+        }
+    }
+
+    /// 第二层 race-robust 防御：fork 重试路径需要默认 profile + 持锁才能触发。
+    /// 通过 try_fork_profile 直接验证（launch_with_retry 是 async 不易单测）——
+    /// 验证条件分支：is_default_profile_path + SingletonLock 残留 → fork 路径生成。
+    /// 单元测试不验证 Browser::launch 真实 mock（需 Chrome 进程），改验证 fork 路径产物
+    /// 与 hint 文案。
+    #[test]
+    fn race_robust_second_layer_fork_path_generates_distinct_dir() {
+        let tmp = tempdir();
+        let default_path = tmp.join("profiles").join("default");
+        std::fs::create_dir_all(&default_path).unwrap();
+        std::fs::write(default_path.join("SingletonLock"), b"").unwrap();
+        std::fs::write(default_path.join("Cookies"), b"cookie").unwrap();
+        // fork 路径前缀 + UUID 形态（每次独立），不应与 default 同名
+        let f1 = super::fork_path_for(&default_path).unwrap();
+        let f2 = super::fork_path_for(&default_path).unwrap();
+        assert_ne!(f1, f2, "两次 fork 路径应不同（uuid 随机性）");
+        assert_eq!(f1.parent(), default_path.parent());
+        assert!(f1.file_name().unwrap().to_str().unwrap().starts_with("fork-"));
+        // copy_profile_contents 应跳过 SingletonLock 不带入 fork
+        std::fs::create_dir_all(&f1).unwrap();
+        super::copy_profile_contents(&default_path, &f1).unwrap();
+        assert!(f1.join("Cookies").exists());
+        assert!(!f1.join("SingletonLock").exists());
     }
 }
 

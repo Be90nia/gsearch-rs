@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use scraper::{Html, Node, Selector};
 
-use crate::postproc::cap_chars;
+use crate::postproc::{cap_chars, cap_chars_json};
 
 /// fetch 总超时（含 redirect 链）；纯 HTTP 无渲染，10s 足够。
 const FETCH_TIMEOUT_SECS: u64 = 10;
@@ -379,17 +379,32 @@ pub async fn cmd_fetch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> {
                     }
                     println!("=== {} | {} ===\n{}", fetched.url, fetched.title, fetched.text);
                 }
+                flush_stdout();
                 tracing::debug!("fetch 完成: {url} ({}ms)", started.elapsed().as_millis());
                 Ok(ExitCode::SUCCESS)
             }
             Ok(FetchOne::JsShell) => {
                 eprintln!("该页无服务端正文（JS 壳），需渲染：用 gsearch browse {url}");
+                flush_stdout();
                 Ok(ExitCode::from(1))
             }
             Err(e) => Err(e),
         };
     }
-    cmd_fetch_batch(urls, opts).await
+    let code = cmd_fetch_batch(urls, opts).await?;
+    flush_stdout();
+    Ok(code)
+}
+
+/// P1 fetch redirect 0 字节修：stdout 在 redirect（`> file`）下走全缓冲而非
+/// 行缓冲——若 fetch 在 println 之后早返回，缓冲未及时 flush 会让下游看到
+/// 0 字节（H 盲测八实锤：`fetch URL > file 2> err` 拿到 0B，`2>&1 | tee file`
+/// 拿到全量；根因是 redirect 阻塞 stdout 写出）。这里在每条结果 println 后
+/// 显式 flush stdout，确保 redirect 也吃到全部字节。tee/管道本身是 line-buffered
+/// 或自己 drain，无副作用。
+fn flush_stdout() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
 }
 
 /// 批量：并发上限 5（防目标站/出口压力），buffered 保持输入序；每条独立过 SSRF 门（含重定向每跳）。
@@ -443,6 +458,7 @@ async fn cmd_fetch_batch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> 
             }
         }
     }
+    flush_stdout();
     eprintln!("batch 完成：{ok_count}/{total} 条成功");
     let code = if ok_count == total { 0 } else if ok_count == 0 { 2 } else { 1 };
     Ok(ExitCode::from(code))
@@ -516,7 +532,7 @@ enum FetchOne {
 
 /// 纯函数：html → 提取 + 截断（limit 注入，离线单测不碰配置）。
 /// 非 HTML（text/plain 等）不剥标签不判壳也不实体解码——markdown/JSON 源文保真，
-/// 字面 `&amp;`/`&#20013;` 原样保留（agent 取原文场景）。
+/// 字面 `&`/`&#20013;` 原样保留（agent 取原文场景）。
 fn process_html(url: &str, html: &str, is_html: bool, limit: usize) -> Fetched {
     // kda：HTML 解析一次，title 与正文同出树内（字符串扫描版 extract_title 对
     // 属性值含 `>` 的标签同样漏片段）；非 HTML 源文保真，不碰解析器。
@@ -526,7 +542,10 @@ fn process_html(url: &str, html: &str, is_html: bool, limit: usize) -> Fetched {
     } else {
         (String::new(), collapse_blank(html.to_string()))
     };
-    let (text, truncated, omitted) = cap_chars(&raw, limit);
+    // P1 fetch JSON 截断修复：GitHub API 等 JSON 源按字节截断会出半截 JSON，
+    // json.loads 直接 UnclosedBraceError（G 盲测八实锤）。检测文本以 `{`/`[`
+    // 开头 → 截断时回退到最后一个完整 `}`/`]` 边界；非 JSON 形态走原 cap_chars。
+    let (text, truncated, omitted) = cap_chars_json(&raw, limit);
     Fetched { url: url.to_string(), title, text, truncated, omitted, include_hit: None, markdown: false, github_comment_hint: None }
 }
 

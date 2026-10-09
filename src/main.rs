@@ -385,6 +385,62 @@ fn first_blank_query(queries: &[String]) -> Option<&str> {
     queries.iter().map(String::as_str).find(|q| q.trim().is_empty())
 }
 
+/// P1 盲测八 site: 静默吞掉修复（H 实锤：site:github.com/... whitelist 引擎 0 命中，
+/// 错误只说"查询无结果"无解释）。检测 query 含 site: 限定符时返回可行动建议；
+/// 缺席 = 无 site:（语义与 proxy/recency 一致，键整体缺席不污染正常查询）。
+fn site_warn_for(query: &str) -> Option<String> {
+    if !contains_site_qualifier(query) {
+        return None;
+    }
+    Some(
+        "查询含 site: 限定符——白名单 SearXNG 引擎常忽略或仅特定引擎支持；\
+         建议拆词（site:github.com → 加 inurl: 限定或换纯词）或用 -site test 排查引擎命中".to_string(),
+    )
+}
+
+/// 检测 site: 限定符（前导 word boundary 简单匹配，不解析完整搜索语法）。
+/// 也支持 site: 含子域路径形态（如 site:github.com/tokio-rs/tokio）。
+fn contains_site_qualifier(query: &str) -> bool {
+    // 简易 token 化：以空白/引号切词，找 site: 起首的 token
+    let bytes = query.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // 跳过空白
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        // 跳引号
+        if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+            let q = bytes[i];
+            i += 1;
+            while i < bytes.len() && bytes[i] != q {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // 找 token 结尾
+        let start = i;
+        while i < bytes.len() && bytes[i] != b' ' && bytes[i] != b'\t' && bytes[i] != b'"' && bytes[i] != b'\'' {
+            i += 1;
+        }
+        let token_bytes = &bytes[start..i];
+        // site: 限定符（含前缀 - 排除形态）
+        if token_bytes.len() > 5
+            && token_bytes[..5].eq_ignore_ascii_case(b"site:")
+        {
+            return true;
+        }
+        if token_bytes.len() > 6
+            && token_bytes[0] == b'-'
+            && token_bytes[1..6].eq_ignore_ascii_case(b"site:")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// 盲测六 isatty 拍板：humanize 生效档 = 显式 flag 优先，都未传时跟随 stdout 是否 TTY——
 /// 人（TTY）保留 warmup 档，管道/agent 自动快档。纯函数，三态单测锁。
 fn resolve_humanize(explicit_on: bool, explicit_off: bool, stdout_is_tty: bool) -> bool {
@@ -571,6 +627,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         truncated: results.len() >= args.limit,
         provider: provider.into(),
         recency: recency.map(|r| r.as_str().into()),
+        site_warn: site_warn_for(&query),
     };
     // o1p：stderr 诊断行与 run.status 同源——run move 进信封后仍需在空结果分支打 stderr
     let stderr_diag = (results.is_empty() && !run_message.is_empty()).then(|| run_message.clone());
@@ -706,7 +763,7 @@ async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode>
     let meta = gsearch::types::MetaOutput {
         tool: "gsearch",
         version: env!("CARGO_PKG_VERSION"),
-        query: derived_query,
+        query: derived_query.clone(),
         profile: gsearch::browser::profile_name_only(),
         proxy: None,
         humanize: false,
@@ -715,6 +772,7 @@ async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode>
         truncated: hits.len() >= limit,
         provider: "searxng".into(),
         recency: None,
+        site_warn: site_warn_for(&derived_query),
     };
     let envelope = gsearch::types::OutputEnvelope { meta, run, results: &hits };
     let mut doc = serde_json::to_value(&envelope)?;
@@ -789,6 +847,7 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
                 truncated: results.len() >= args.limit,
                 provider: "searxng".into(),
                 recency: recency.map(|r| r.as_str().into()),
+                site_warn: site_warn_for(&query),
             };
             gsearch::types::BatchEntry {
                 query,
@@ -899,6 +958,7 @@ fn emit_captcha_timeout_json(
         // CAPTCHA 超时只发生在 Google 直爬路径（searxng 不撞码）
         provider: "google".into(),
         recency: recency.map(|r| r.as_str().into()),
+        site_warn: site_warn_for(query),
     };
     let run = gsearch::types::RunStatusInfo {
         status: gsearch::types::RunStatus::CaptchaTimeout,
@@ -935,6 +995,7 @@ fn emit_searxng_degraded_json(
         // 熔断时结果确实来自 SearXNG 链路（provider 照实标注，非 google）
         provider: "searxng".into(),
         recency: recency.map(|r| r.as_str().into()),
+        site_warn: site_warn_for(query),
     };
     let run = gsearch::types::RunStatusInfo {
         status: gsearch::types::RunStatus::SearxngDegraded,
@@ -1307,8 +1368,46 @@ async fn fetch_public_ip() -> anyhow::Result<String> {
 mod tests {
     use super::check_exit_ip_drift;
     use super::resolve_humanize;
-    use super::{first_blank_query, Cli, Command, RecencyArg};
+    use super::{contains_site_qualifier, first_blank_query, site_warn_for, Cli, Command, RecencyArg};
     use clap::Parser;
+
+    /// P1 site: 检测：含 site: 限定符的 query 返回 Some(warn)；其他 None。
+    /// H 盲测八 site:github.com/tokio-rs/tokio refactor 0 命中无解释。
+    #[test]
+    fn site_warn_for_returns_some_only_with_site_qualifier() {
+        // 命中：site: 起首 token
+        let w = site_warn_for("site:github.com/tokio-rs/tokio refactor");
+        assert!(w.is_some(), "site: 起首应命中");
+        let msg = w.unwrap();
+        assert!(msg.contains("site:"), "warn 应提及 site:");
+        // 不命中：普通查询
+        assert!(site_warn_for("rust async").is_none());
+        // 不命中：site 在词中（不是限定符）
+        assert!(site_warn_for("website:foo bar").is_none(), "site 在词中不视作限定符");
+        // 命中：大小写无关
+        assert!(site_warn_for("Site:example.com foo").is_some());
+        // 引号内 site: 大多数搜索引擎视为字面字符串而非限定符——不命中
+        assert!(site_warn_for(r#""site:foo.com" bar"#).is_none(), "引号内视为字面字符串");
+        // 不命中：相似前缀（sit:）
+        assert!(site_warn_for("sit:foo bar").is_none());
+    }
+
+    /// contains_site_qualifier：基础边界——词形态、空白、引号、前后置。
+    #[test]
+    fn contains_site_qualifier_boundary_cases() {
+        assert!(contains_site_qualifier("site:foo"));
+        assert!(contains_site_qualifier("site:github.com/a/b refactor"));
+        assert!(contains_site_qualifier("foo site:github.com"));
+        assert!(contains_site_qualifier("a -site:test.com"));
+        // 引号内 site: 视为字面字符串，不命中
+        assert!(!contains_site_qualifier(r#""site:foo.com" bar"#));
+        assert!(!contains_site_qualifier(""));
+        assert!(!contains_site_qualifier("rust tokio"));
+        assert!(!contains_site_qualifier("website:foo"));
+        assert!(!contains_site_qualifier("sit:foo"));
+        // 多词含 site: 也命中（site:bar 是合法限定符）
+        assert!(contains_site_qualifier("foo site:bar baz qux"));
+    }
 
     /// 5a5：首跑无记录→None 且落盘；同 IP→静默；换 IP→WARN 文案含新旧 IP。
     #[test]
