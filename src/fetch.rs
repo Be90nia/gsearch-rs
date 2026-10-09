@@ -475,13 +475,9 @@ async fn fetch_one_attempt(
     if let Some(include) = &opts.include {
         fetched.include_hit = Some(false);
         if is_html
-            && let Some((inner, hits)) = extract_with_include(&html, include)?
+            && let Some((blocks, hits)) = extract_with_include(&html, include)?
         {
-            let raw = if opts.markdown {
-                crate::convert::html_to_markdown(&inner)?
-            } else {
-                extract_text(&inner)
-            };
+            let raw = render_include_blocks(&blocks, opts.markdown)?;
             let (text, t, o, off) = cap_chars(&raw, limit);
             fetched = Fetched {
                 url: fetched.url,
@@ -578,7 +574,18 @@ fn project_json_body(body: &str, keys: &[String]) -> Result<Option<String>> {
         Ok(p) => p,
         Err(_) => return Ok(None),
     };
-    let projected = project_json_paths(&parsed, keys)?;
+    let projected = match project_json_paths(&parsed, keys) {
+        Ok(p) => p,
+        Err(e) => {
+            // 顶层数组误用裸字段路径是最常见错法（GitHub comments/releases API）——
+            // 教可行动语法而非让 agent 拿全量回退自己猜（盲测十四 W）。已用 [*] 的失败
+            // 是元素缺字段，再教 [*] 会误导，不加。
+            if parsed.is_array() && !keys.iter().any(|k| k.contains('*')) {
+                anyhow::bail!("{e:#}\n响应为顶层数组：请用 `0.field` 索引语法（如 `0.user.login`）或 `[*]` 通配（如 `[*].tag_name`）");
+            }
+            return Err(e);
+        }
+    };
     let serialized = serde_json::to_string(&projected).context("投影结果序列化失败")?;
     Ok(Some(serialized))
 }
@@ -651,9 +658,10 @@ async fn cmd_fetch_batch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> 
     Ok(ExitCode::from(code))
 }
 
-/// GitHub issue/PR 页的评论区不在 SSR HTML 里（JS 动态加载），fetch 纯 HTTP 输出
-/// 必缺评论区——meta 打缺失信号 + 可行动建议（盲测七 wqm：输出自称完整，agent 据
-/// 此误判「无讨论」，靠 api.github.com 交叉验证才识破）。非 GitHub thread 页 None。
+/// GitHub issue/PR 页的评论区由 JS 动态加载，SSR HTML 最多带少量已渲染评论（无作者归属、
+/// 不完整）——正文并非"零评论"但也不完整，hint 如实说"仅部分包含"并给升级路径（盲测七
+/// wqm：输出自称完整，agent 据此误判「无讨论」；盲测十四 W："未包含"绝对断言与正文混入
+/// 部分评论自相矛盾）。非 GitHub thread 页 None。
 fn github_thread_comment_gap(url: &str) -> Option<String> {
     let rest = url.strip_prefix("https://github.com/")?;
     let path = rest.split(['?', '#']).next()?;
@@ -665,8 +673,8 @@ fn github_thread_comment_gap(url: &str) -> Option<String> {
         _ => return None,
     };
     Some(format!(
-        "评论区由 JS 动态加载，未包含在本输出中（勿据本文判断有无讨论）；完整讨论：\
-         gsearch browse {url} --markdown，或 GET https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments"
+        "评论区仅部分包含在本输出正文中（可能缺作者归属且不完整，勿据本文判断完整讨论）；\
+         完整讨论：gsearch browse {url} --markdown，或 GET https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments"
     ))
 }
 
@@ -798,7 +806,8 @@ fn crop_text_lines(text: &str, start: usize, end: usize, pad: usize) -> (String,
 }
 
 /// FixG10 J-2：JSONPath 风格路径解析 + 投影。
-/// 支持 `.field` 段与 `[N]` 段（数组下标），不支持复杂查询（递归 `..` / 通配符 / 过滤）。
+/// 支持 `.field` 段 / `[N]` 段（数组下标）/ 裸数字段 / `[*]` 数组通配（FixG15），
+/// 不支持复杂查询（递归 `..` / 过滤）。
 /// 解析失败 → 整体失败（Err），不静默吞掉（agent 拼错了要报错）。
 /// 空 paths → 原样返回（不做投影）。
 /// FixG14：多路径末段名冲突（`items.0.title` / `items.1.title` 都要写 key "title"）时，
@@ -808,23 +817,7 @@ fn project_json_paths(v: &serde_json::Value, paths: &[String]) -> Result<serde_j
     let mut resolved: Vec<(String, serde_json::Value)> = Vec::with_capacity(paths.len());
     for path in paths {
         let segments = parse_json_path(path)?;
-        let mut node: &serde_json::Value = v;
-        for seg in &segments {
-            node = match seg {
-                Segment::Field(name) => node.get(name).ok_or_else(|| {
-                    anyhow!("json-keys 路径无此字段: {path:?}（在 {name:?} 处失败）")
-                })?,
-                Segment::Index(i) => node.get(*i).ok_or_else(|| {
-                    anyhow!("json-keys 数组下标越界: {path:?}（[{i}] 失败）")
-                })?,
-            };
-        }
-        // 把路径末段名作为 key（数组下标则用 `[N]` 形态）
-        let key = match segments.last().expect("至少一段") {
-            Segment::Field(n) => n.clone(),
-            Segment::Index(i) => format!("[{i}]"),
-        };
-        resolved.push((key, node.clone()));
+        resolved.push(eval_json_path(v, &segments, path)?);
     }
     // 冲突检测：路径数是个位数，O(n²) 两两比对足够
     let mut conflicted = vec![false; resolved.len()];
@@ -849,10 +842,78 @@ fn project_json_paths(v: &serde_json::Value, paths: &[String]) -> Result<serde_j
     Ok(serde_json::Value::Object(out))
 }
 
+/// 单条路径求值，返回 (输出 key, 投影值)。无通配：现行为——key 取末段名（数组下标用
+/// `[N]` 形态）。含 `[*]`（FixG15）：通配前段定位到数组，其余段对每个元素求值，值为数组
+/// 形态、key 取通配后末段名（纯 `[*]` → `"[*]"`）；一条路径最多一个 `[*]`，作用于非数组
+/// → Err（不静默跳过回退全量，盲测十四 V）。
+fn eval_json_path(
+    v: &serde_json::Value,
+    segs: &[Segment],
+    path: &str,
+) -> Result<(String, serde_json::Value)> {
+    let Some(wi) = segs.iter().position(|s| *s == Segment::Wildcard) else {
+        let mut node: &serde_json::Value = v;
+        for seg in segs {
+            node = step_json_path(node, seg, path)?;
+        }
+        let key = match segs.last().expect("至少一段") {
+            Segment::Field(n) => n.clone(),
+            Segment::Index(i) => format!("[{i}]"),
+            Segment::Wildcard => unreachable!("position 为 None 即无通配"),
+        };
+        return Ok((key, node.clone()));
+    };
+    if segs[wi + 1..].contains(&Segment::Wildcard) {
+        anyhow::bail!("json-keys 一条路径最多一个 [*] 通配: {path:?}");
+    }
+    // 通配前段定位到数组节点（如 `data.items[*].tag_name` 的 `data.items`）
+    let mut node: &serde_json::Value = v;
+    for seg in &segs[..wi] {
+        node = step_json_path(node, seg, path)?;
+    }
+    let arr = node
+        .as_array()
+        .ok_or_else(|| anyhow!("json-keys 通配符 [*] 要求当前节点为数组: {path:?}"))?;
+    let mut vals = Vec::with_capacity(arr.len());
+    for el in arr {
+        let mut n = el;
+        for seg in &segs[wi + 1..] {
+            n = step_json_path(n, seg, path)?;
+        }
+        vals.push(n.clone());
+    }
+    let key = match segs.last().expect("至少一段") {
+        Segment::Field(n) => n.clone(),
+        Segment::Index(i) => format!("[{i}]"),
+        Segment::Wildcard => "[*]".to_string(),
+    };
+    Ok((key, serde_json::Value::Array(vals)))
+}
+
+/// 单步求值：Field/Index 走既有语义；Wildcard 只在 eval_json_path 的扇出层消费，
+/// 走到这里说明一条路径里有第二个 `[*]`。
+fn step_json_path<'a>(
+    node: &'a serde_json::Value,
+    seg: &Segment,
+    path: &str,
+) -> Result<&'a serde_json::Value> {
+    match seg {
+        Segment::Field(name) => node.get(name).ok_or_else(|| {
+            anyhow!("json-keys 路径无此字段: {path:?}（在 {name:?} 处失败）")
+        }),
+        Segment::Index(i) => node.get(*i).ok_or_else(|| {
+            anyhow!("json-keys 数组下标越界: {path:?}（[{i}] 失败）")
+        }),
+        Segment::Wildcard => anyhow::bail!("json-keys 一条路径最多一个 [*] 通配: {path:?}"),
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum Segment {
     Field(String),
     Index(usize),
+    /// `[*]` 数组通配（FixG15）：对其余段在当前数组的每个元素上求值。
+    Wildcard,
 }
 
 /// 解析 `crate.max_version` / `.crate.max_version` / `[0]` / `versions[5].tag` 等形态。
@@ -868,9 +929,13 @@ fn parse_json_path(path: &str) -> Result<Vec<Segment>> {
         if s.starts_with('[') {
             let close = s[1..].find(']').map(|c| c + 1)
                 .ok_or_else(|| anyhow!("json-keys 路径 `[` 未闭合: {path:?}"))?;
-            let n: usize = s[1..close].parse()
-                .map_err(|_| anyhow!("json-keys 数组下标必须为非负整数: {path:?}"))?;
-            segs.push(Segment::Index(n));
+            if &s[1..close] == "*" {
+                segs.push(Segment::Wildcard);
+            } else {
+                let n: usize = s[1..close].parse()
+                    .map_err(|_| anyhow!("json-keys 数组下标必须为非负整数: {path:?}"))?;
+                segs.push(Segment::Index(n));
+            }
             s = &s[close + 1..];
         } else {
             // 字段段：剥前导 `.`（首段可省略），字段名到下一个 `.` / `[` / 末尾
@@ -1042,14 +1107,10 @@ fn apply_docsrs_host_route(
     if !is_html {
         return Ok(false);
     }
-    let Some((inner, hits)) = extract_with_include(html, "main")? else {
+    let Some((blocks, hits)) = extract_with_include(html, "main")? else {
         return Ok(false);
     };
-    let raw = if markdown {
-        crate::convert::html_to_markdown(&inner)?
-    } else {
-        extract_text(&inner)
-    };
+    let raw = render_include_blocks(&blocks, markdown)?;
     let (text, t, o, off) = cap_chars(&raw, limit);
     fetched.text = text;
     fetched.truncated = t;
@@ -1328,10 +1389,12 @@ fn collapse_blank(s: String) -> String {
 }
 
 /// --include：逗号分隔 selector 依序试（scraper 解析），FixG10 J-3 累加所有命中容器（多选器全要），
-/// 返回 (拼接后的 inner_html, 命中数)；全未命中 → (None, 0)。命中容器间以 `\n\n---\n\n` 分隔，
-/// 让 agent 能识别不同 selector 块的边界。
+/// 返回 (命中块的 inner_html 列表, 命中数)；全未命中 → None。每块收尾 trim + 换行归一 LF
+/// （源码缩进/CRLF 是提取层伪影，官方 HTML 为 LF 无缩进——盲测十四 X）；块间分隔由
+/// render_include_blocks 在渲染层以 `\n\n---\n\n` 拼接（分隔符混在 inner_html 里过
+/// extract_text 会沦为裸文本节点被空白规整压扁）。
 /// selector 语法错误 → Err：用户显式输入拼错了要报错，静默跳过会伪装成"未命中回退全文"。
-fn extract_with_include(html: &str, include: &str) -> Result<Option<(String, usize)>> {
+fn extract_with_include(html: &str, include: &str) -> Result<Option<(Vec<String>, usize)>> {
     let doc = Html::parse_document(html);
     let mut collected: Vec<String> = Vec::new();
     for sel in include.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -1340,13 +1403,31 @@ fn extract_with_include(html: &str, include: &str) -> Result<Option<(String, usi
             anyhow!("CSS selector 无效: {sel:?}（语法错误，应为合法 CSS 选择器如 \"#main, article\"）")
         })?;
         for el in doc.select(&selector) {
-            collected.push(el.inner_html());
+            let inner = el.inner_html().replace("\r\n", "\n").replace('\r', "\n");
+            collected.push(inner.trim().to_string());
         }
     }
-    if collected.is_empty() {
+    let hits = collected.len();
+    if hits == 0 {
         return Ok(None);
     }
-    Ok(Some((collected.join("\n\n---\n\n"), collected.len())))
+    Ok(Some((collected, hits)))
+}
+
+/// --include 命中块渲染成正文：每块独立走 text/markdown 提取并 trim，再以 `\n\n---\n\n` 拼接，
+/// 与 --help/README 宣称的分隔符形态一致。拼接 inner_html 整体重解析会让分隔符沦为裸文本
+/// 节点被压成 ` --- ` 胶连、块首缩进漏成前导空格（盲测十四 X）——分块提取是修法本体。
+fn render_include_blocks(blocks: &[String], markdown: bool) -> Result<String> {
+    let mut parts = Vec::with_capacity(blocks.len());
+    for b in blocks {
+        let raw = if markdown {
+            crate::convert::html_to_markdown(b)?
+        } else {
+            extract_text(b)
+        };
+        parts.push(raw.trim().to_string());
+    }
+    Ok(parts.join("\n\n---\n\n"))
 }
 
 #[cfg(test)]
@@ -1359,7 +1440,8 @@ mod tests {
         let html = "<html><head><title>T</title></head><body>\
                     <nav>菜单 链接</nav><main><h1>正文标题</h1><p>第一段</p></main></body></html>";
         // article 不存在 → main 命中容器：只取容器内正文
-        let (got, hits) = extract_with_include(html, "article,main").unwrap().unwrap();
+        let (blocks, hits) = extract_with_include(html, "article,main").unwrap().unwrap();
+        let got = blocks.join("\n");
         assert_eq!(hits, 1, "article 不存在、main 命中 1 个");
         assert!(got.contains("正文标题") && got.contains("第一段"), "got: {got}");
         assert!(!got.contains("菜单"), "nav 内容不应混入: {got}");
@@ -1379,21 +1461,135 @@ mod tests {
                     <section class='release-entry'><h2>1.4.0</h2><p>上一个版本</p></section>\
                     <section class='release-entry'><h2>1.3.0</h2><p>远古版本</p></section>\
                     </body></html>";
-        let (got, hits) = extract_with_include(html, ".release-entry").unwrap().unwrap();
+        let (got_blocks, hits) = extract_with_include(html, ".release-entry").unwrap().unwrap();
+        let got = got_blocks.join("\n");
         assert_eq!(hits, 3, "3 个 release entries 应全部命中: got_hits={hits}");
         assert!(got.contains("1.5.0") && got.contains("1.4.0") && got.contains("1.3.0"), "got: {got}");
         assert!(!got.contains("菜单"), "nav 不应混入: {got}");
-        // 拼接分隔符：让 agent 能识别 selector 块边界
-        assert!(got.contains("\n\n---\n\n"), "多命中应加分隔符: {got}");
+        // 拼接分隔符：让 agent 能识别 selector 块边界（FixG15 起在渲染层拼接）
+        let rendered = render_include_blocks(&got_blocks, false).unwrap();
+        assert!(rendered.contains("\n\n---\n\n"), "多命中应加分隔符: {rendered}");
         // 跨 selector 累加：releases + markdown-body 都命中，拼接成两段
         let html2 = "<html><body>\
                      <article class='markdown-body'>正文</article>\
                      <section class='release-entry'><h2>1.0.0</h2></section>\
                      <section class='release-entry'><h2>0.9.0</h2></section>\
                      </body></html>";
-        let (got2, hits2) = extract_with_include(html2, ".markdown-body,.release-entry").unwrap().unwrap();
+        let (got2_blocks, hits2) = extract_with_include(html2, ".markdown-body,.release-entry").unwrap().unwrap();
+        let got2 = got2_blocks.join("\n");
         assert_eq!(hits2, 3, "1 markdown-body + 2 release-entry");
         assert!(got2.contains("正文") && got2.contains("1.0.0") && got2.contains("0.9.0"));
+    }
+
+    /// FixG15：inner_html 收集即归一——首尾空白 trim、CRLF 归 LF（盲测十四 X 前导空格伪影）。
+    #[test]
+    fn extract_with_include_normalizes_block_whitespace() {
+        let html = "<html><body><pre>\r\n  <code>pub fn f()</code>  \r\n</pre></body></html>";
+        let (blocks, hits) = extract_with_include(html, "pre").unwrap().unwrap();
+        assert_eq!(hits, 1);
+        assert_eq!(blocks[0], "<code>pub fn f()</code>", "块首尾空白应剥除: {:?}", blocks[0]);
+    }
+
+    /// FixG15：块级渲染后分隔符保持 `\n\n---\n\n`、无前导空白、纯 LF——拼接 inner_html
+    /// 整体重解析会把分隔符压成 ` --- ` 胶连（盲测十四 X），分块分别提取是修法本体。
+    #[test]
+    fn render_include_blocks_separator_exact_and_trimmed() {
+        let html = "<html><body>\
+                    <pre class='a'>  <code>pub fn f() -&gt; u32</code>  </pre>\
+                    <p>间隔噪音</p>\
+                    <pre class='b'>\r\n<code>use serde;</code></pre>\
+                    </body></html>";
+        let (blocks, hits) = extract_with_include(html, "pre").unwrap().unwrap();
+        assert_eq!(hits, 2);
+        let text = render_include_blocks(&blocks, false).unwrap();
+        assert!(text.starts_with("pub fn"), "无前导空白: {text:?}");
+        assert!(!text.contains('\r'), "纯 LF: {text:?}");
+        assert!(text.contains("\n\n---\n\n"), "分隔符形态: {text:?}");
+        let mut segs = text.split("\n\n---\n\n");
+        assert!(segs.next().unwrap().starts_with("pub fn"));
+        assert!(segs.next().unwrap().starts_with("use serde;"));
+        assert!(!text.contains("间隔噪音"), "未选中容器不混入: {text:?}");
+    }
+
+    /// FixG15：`[*]` 通配段解析——与 Field/Index 并存（`data.items[*].name`）。
+    #[test]
+    fn parse_json_path_wildcard_segment() {
+        use Segment::{Field, Wildcard};
+        assert_eq!(
+            parse_json_path("[*].tag_name").unwrap(),
+            vec![Wildcard, Field("tag_name".into())]
+        );
+        assert_eq!(parse_json_path("[*]").unwrap(), vec![Wildcard]);
+        assert_eq!(
+            parse_json_path("data.items[*].name").unwrap(),
+            vec![Field("data".into()), Field("items".into()), Wildcard, Field("name".into())]
+        );
+    }
+
+    /// FixG15：`[*]` 通配投影——顶层数组每元素取指定字段，值为数组形态（盲测十四 V
+    /// "静默跳过返回全量"的修法本体）；纯 `[*]` 取整组元素。
+    #[test]
+    fn project_json_paths_wildcard_projects_all_elements() {
+        let payload = serde_json::json!([
+            {"tag_name": "v1.0.0", "body": "a"},
+            {"tag_name": "v0.9.0", "body": "b"},
+            {"tag_name": "v0.8.0", "body": "c"},
+        ]);
+        let out = project_json_paths(&payload, &["[*].tag_name".to_string()]).unwrap();
+        assert_eq!(out, serde_json::json!({"tag_name": ["v1.0.0", "v0.9.0", "v0.8.0"]}));
+        let out = project_json_paths(&payload, &["[*]".to_string()]).unwrap();
+        assert_eq!(out, serde_json::json!({"[*]": payload.clone()}));
+    }
+
+    /// FixG15：`[*]` 与既有索引/字段段同次调用共存（GitHub comments 场景形状）。
+    #[test]
+    fn project_json_paths_wildcard_coexists_with_index_and_field() {
+        let payload = serde_json::json!([
+            {"user": {"login": "alice"}, "body": "first"},
+            {"user": {"login": "bob"}, "body": "second"},
+        ]);
+        let out = project_json_paths(
+            &payload,
+            &["0.user.login".to_string(), "[*].body".to_string()],
+        )
+        .unwrap();
+        assert_eq!(out, serde_json::json!({"login": "alice", "body": ["first", "second"]}));
+    }
+
+    /// FixG15：`[*]` 作用于非数组 → 显式 Err，不静默跳过回退全量。
+    #[test]
+    fn project_json_paths_wildcard_on_non_array_errors() {
+        let payload = serde_json::json!({"tag_name": "v1.0.0"});
+        let err = project_json_paths(&payload, &["[*].tag_name".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("数组"), "err: {err:#}");
+    }
+
+    /// FixG15：顶层数组 + 裸字段路径 → 错误信息教 `0.field` 索引与 `[*]` 语法（盲测十四 W）；
+    /// 已用 `[*]` 的失败（元素缺字段）不再重复教学。
+    #[test]
+    fn project_json_body_array_error_teaches_syntax() {
+        let body = r#"[{"user": {"login": "alice"}}]"#;
+        let err = project_json_body(body, &["user.login".to_string()]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("顶层数组"), "err: {msg}");
+        assert!(msg.contains("0.user.login"), "err: {msg}");
+        assert!(msg.contains("[*]"), "err: {msg}");
+        let err2 = project_json_body(body, &["[*].nope".to_string()]).unwrap_err();
+        assert!(!format!("{err2:#}").contains("顶层数组"), "已用 [*] 不再教语法: {err2:#}");
+    }
+
+    /// FixG15：hint 文案诚实——"仅部分包含"取代"未包含"绝对断言（正文实际混入部分
+    /// 已渲染评论，盲测十四 W 自相矛盾点）；api.github.com 升级路径保留。
+    #[test]
+    fn github_thread_hint_claims_partial_not_absent() {
+        let hint = github_thread_comment_gap("https://github.com/tokio-rs/tokio/issues/6741")
+            .expect("issue 页应命中");
+        assert!(hint.contains("仅部分"), "hint: {hint}");
+        assert!(!hint.contains("未包含"), "不得绝对断言缺失: {hint}");
+        assert!(
+            hint.contains("api.github.com/repos/tokio-rs/tokio/issues/6741/comments"),
+            "升级路径保留: {hint}"
+        );
     }
 
     /// extract_text：script/style 连内容删除、标签剥壳、块级换行、空白规整。
