@@ -1,6 +1,7 @@
 pub mod browser;
 pub mod build;
 pub mod config;
+pub mod duckduckgo;
 pub mod skeleton;
 pub mod output;
 pub mod parse;

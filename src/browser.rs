@@ -348,7 +348,12 @@ pub fn cleanup_stale_locks(dir: &Path) -> Result<()> {
             // M3 swap_to_headed 二次 launch 撞到该路径；容错为 warn 不 abort
             #[cfg(windows)]
             Err(e) if e.raw_os_error() == Some(32) => {
-                tracing::warn!("残留锁被活 Chrome 持有（等 1s 后 retry 也可能失败）: {} ({e})", p.display());
+                // 276：持有者未必是 Chrome（用户他机实报是 msedge）——文案不误导排查方向
+                tracing::warn!(
+                    "残留锁被浏览器进程或杀软持有: {} ({e})。排查: handle.exe \"{}\"，或资源监视器（性能→CPU→关联的句柄）搜索 profile 路径",
+                    p.display(),
+                    p.display()
+                );
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 tracing::warn!("残留锁仍被占用（上一 Chrome 未死透，跳过）: {} ({e})", p.display());
@@ -488,9 +493,9 @@ pub async fn launch_with_kind_proxy(
     // M14-2A cfg 切换点：默认（feature off）走 chromiumoxide 0.9 原路径，零行为变化；
     // chaser-stealth on 时改走 launch 层 transport stealth（见 launch_with_stealth_transport）。
     #[cfg(feature = "chaser-stealth")]
-    let (browser, handler) = launch_with_stealth_transport(config).await?;
+    let (browser, handler) = launch_with_stealth_transport(config, &profile).await?;
     #[cfg(not(feature = "chaser-stealth"))]
-    let (browser, handler) = launch_with_retry(config).await?;
+    let (browser, handler) = launch_with_retry(config, &profile).await?;
     Ok((browser, handler))
 }
 
@@ -499,22 +504,64 @@ pub async fn launch_with_kind_proxy(
 /// 扫新生 exe 的文件锁（OS error 5）、以及**多 agent 并发同 profile**（实测：3 个并发
 /// browse 只有 1 个能起，其余 ExitStatus(21)；browse 单次 5-15s，1s 单次重试必然再撞）。
 /// 退避序列 1/3/6/10/15s（累计 35s）盖住前一个实例的完整会话时长；打尽仍失败才上抛。
-async fn launch_with_retry(config: BrowserConfig) -> Result<(Browser, Handler)> {
+/// 276：每轮重试打出上一次失败的**真实错误**（可见进度，不再静默五连）；打尽后列出
+/// 持 profile 锁的僵尸浏览器进程 PID——chromiumoxide Windows 子进程继承锁句柄，
+/// gsearch 退出后残留浏览器持续持锁，继续重试无效，只有精确 kill 才能解。
+async fn launch_with_retry(config: BrowserConfig, profile: &Path) -> Result<(Browser, Handler)> {
     const BACKOFF_SECS: [u64; 5] = [1, 3, 6, 10, 15];
+    let rounds = BACKOFF_SECS.len();
     let mut attempt = Browser::launch(config.clone()).await;
     for (round, wait) in BACKOFF_SECS.into_iter().enumerate() {
         if attempt.is_ok() {
             return attempt.map_err(|e| anyhow!("{e}"));
         }
         tracing::warn!(
-            "Chrome 启动失败（第 {}/{} 次重试前等待 {wait}s）：profile 疑被并发实例占用",
+            "浏览器启动失败（第 {}/{} 次，{}s 后重试）: {}——profile 疑被并发实例/僵尸进程占用",
             round + 1,
-            BACKOFF_SECS.len()
+            rounds,
+            wait,
+            attempt.as_ref().unwrap_err()
         );
         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         attempt = Browser::launch(config.clone()).await;
     }
-    attempt.map_err(|e| anyhow!("启动 Chrome 失败（已重试 {} 轮共 35s），profile 可能被长期占用: {e}", BACKOFF_SECS.len()))
+    let last_err = attempt.expect_err("退避循环打尽必有 Err");
+    let mut msg = format!(
+        "启动浏览器失败（已重试 {rounds} 轮共 35s），profile 锁疑被长期占用（残留浏览器进程持锁时重试无效）: {last_err}"
+    );
+    match diagnose_lock_holders(profile) {
+        Some(holders) => {
+            msg.push_str(&format!("\n持有该 profile 的进程（按 PID 精确处理，禁 taskkill /IM 全杀）:\n{holders}"));
+        }
+        None => msg.push_str(
+            "\n未发现命令行引用该 profile 的浏览器进程——可能是杀软/同步盘占用: handle.exe 查锁文件，或资源监视器（性能→CPU→关联的句柄）搜索 profile 路径",
+        ),
+    }
+    Err(anyhow!(msg))
+}
+
+/// 276：列出命令行引用了该 profile 的浏览器进程（僵尸持锁者），返回 "PID=… 进程名" 行集。
+/// 只诊断不 kill——精确 PID 交给用户处理（禁 taskkill /IM chrome.exe 全杀：OMP daemon 等
+/// 无关会话共用进程名，全杀误伤）。非 Windows / 枚举失败 / 无命中 → None。
+fn diagnose_lock_holders(profile: &Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let pat = profile.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' or Name='msedge.exe'\" | Where-Object {{ $_.CommandLine -like '*{pat}*' }} | ForEach-Object {{ \"PID=$($_.ProcessId) $($_.Name)\" }}"
+        );
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if text.is_empty() { None } else { Some(text) }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = profile;
+        None
+    }
 }
 
 /// chaser-stealth transport 补丁序列（launch 层逐 target 按序应用，顺序即检测面）。
@@ -546,8 +593,9 @@ const STEALTH_PATCH_SEQUENCE: &[StealthPatchStep] =
 #[cfg(feature = "chaser-stealth")]
 async fn launch_with_stealth_transport(
     config: BrowserConfig,
+    profile: &Path,
 ) -> Result<(Browser, Handler)> {
-    let (browser, mut handler) = launch_with_retry(config).await?;
+    let (browser, mut handler) = launch_with_retry(config, profile).await?;
     // 缩窄 patches 作用域：循环结束 + drop 后再移动 browser。
     // ponytail: Box::pin 让 borrow 在块尾随 patches drop 一起结束，
     // 否则编译器看见 borrowing coroutine 跨 move（E0505）。

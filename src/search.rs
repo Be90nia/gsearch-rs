@@ -244,6 +244,9 @@ pub async fn run_search_on_page(
 /// zc6：json+html 双空/双失败不再无条件回退——先 TCP 预检 google:443（1.5s）。
 /// IP 正常时 FallbackGoogle（老行为不变）；被墙/断网时段 CircuitBroken 熔断，
 /// 不再空耗 30s 等浏览器超时。
+///
+/// af9：回退链插层为 SearXNG → DDG html → Google——SearXNG 失败先试 DDG 纯 HTTP
+///（免浏览器），DDG 命中时 Results 携 provider="duckduckgo"；batch 不走此层（仍 SearXNG-only）。
 #[derive(Debug)]
 pub enum SearxngAttempt {
     /// 未配置 searxng_url——用户没要 SearXNG，直接 Google 直爬（不预检）。
@@ -271,6 +274,20 @@ pub async fn try_searxng(cfg: &SearchConfig) -> SearxngAttempt {
             provider: "searxng",
         }),
         Err(reason) => {
+            // af9：第二源插层——SearXNG 挂/零结果先试 DDG html（纯 HTTP 免浏览器），
+            // 命中则以 provider=duckduckgo 直接返回；仍空才走 Google 预检回退/熔断老链。
+            match crate::duckduckgo::collect(cfg).await {
+                Ok(results) if !results.is_empty() => {
+                    eprintln!("SearXNG {base} 查询失败（{reason}），已回退 DuckDuckGo html 直连");
+                    return SearxngAttempt::Results(SearchOutcome::Results {
+                        results,
+                        captcha_solved: false,
+                        provider: "duckduckgo",
+                    });
+                }
+                Ok(_) => eprintln!("DDG html 直连零结果，继续 Google 回退链"),
+                Err(e) => eprintln!("DDG html 直连失败（{e:#}），继续 Google 回退链"),
+            }
             if google_fallback_precheck().await {
                 warn_searxng_fallback(&base, &reason);
                 SearxngAttempt::FallbackGoogle
@@ -412,6 +429,89 @@ fn warn_searxng_fallback(base: &str, err: &str) {
         msg.push_str("；提示：检查 SearXNG 实例已启用 JSON format（settings.yml 的 search.formats 加 json）");
     }
     eprintln!("{msg}");
+}
+
+/// af9-e7c：similar 内核——从 URL 提取 title 关键词派生查询，SearXNG 单查（超采样 limit×3，
+/// 8..=15 条），title 词重合 ×2 + 同域 ×1 加权 stable 重排（同分保留 SearXNG 相关序）。
+/// **启发式派生查询，非 exa 神经 findSimilar**（README 预期管理）。返回（重排后条目，派生查询串）。
+pub async fn similar(
+    src_url: &str,
+    limit: usize,
+) -> Result<(Vec<crate::types::SimilarHit>, String), String> {
+    let base = crate::config::load()
+        .searxng_url
+        .clone()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "SearXNG 未配置（gsearch.json 缺 searxng_url 或未设 GSEARCH_SEARXNG_URL）；similar 走 SearXNG 派生查询"
+                .to_string()
+        })?;
+    let (src_host, keywords) = split_site_keys(src_url);
+    if src_host.is_empty() {
+        return Err(format!("无法从 {src_url} 解析 host（需 http(s):// 或 // 前缀的绝对 URL）"));
+    }
+    // 纯域名 URL 无路径关键词 → 退化 site: 查询（同域相关页语义）
+    let query = if keywords.is_empty() { format!("site:{src_host}") } else { keywords.join(" ") };
+    let cfg = SearchConfig { query: query.clone(), limit: (limit * 3).clamp(8, 15), recency: None };
+    let hits = searxng_collect(&base, &cfg).await?;
+    let mut scored: Vec<(i32, crate::types::SimilarHit)> = hits
+        .into_iter()
+        .map(|hit| {
+            let same = host_of(&hit.url) == src_host;
+            let overlap = title_overlap(&hit.title, &keywords);
+            let mut tags: Vec<String> = Vec::new();
+            if !overlap.is_empty() {
+                tags.push(format!("title={}", overlap.join(",")));
+            }
+            if same {
+                tags.push(format!("site={src_host}"));
+            }
+            let score = overlap.len() as i32 * 2 + i32::from(same);
+            let similarity = if tags.is_empty() {
+                "none（仅派生查询命中，无 title/同域启发）".to_string()
+            } else {
+                tags.join("; ")
+            };
+            (score, crate::types::SimilarHit { hit, similarity })
+        })
+        .collect();
+    scored.sort_by_key(|(s, _)| -(*s)); // stable：同分保留 SearXNG 原始相关序
+    scored.truncate(limit);
+    Ok((scored.into_iter().map(|(_, h)| h).collect(), query))
+}
+
+/// host 提取：去 scheme（含 protocol-relative //）、剥 www.、截 path 前；小写。解析不出返回空串。
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("//").map(|(_, r)| r).unwrap_or(url);
+    let bare = rest.split(['/', '?', '#']).next().unwrap_or("");
+    bare.strip_prefix("www.").unwrap_or(bare).trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// URL → (host, title 关键词)：path 末段去扩展名后分词。纯域名 → 空关键词表。
+fn split_site_keys(url: &str) -> (String, Vec<String>) {
+    let rest = url.split_once("//").map(|(_, r)| r).unwrap_or(url);
+    let (host_part, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let lowered = host_part.to_ascii_lowercase();
+    let host = lowered.strip_prefix("www.").unwrap_or(&lowered).to_string();
+    let last = path.trim_end_matches('/').rsplit('/').find(|s| !s.is_empty());
+    let keywords = last
+        .map(|seg| tokenize(seg.split('.').next().unwrap_or(seg)))
+        .unwrap_or_default();
+    (host, keywords)
+}
+
+/// 非字母数字切段，保留 ≥2 字符且含字母的段（serde → [serde]；Rust_(lang) → [rust, lang]；2024 → 丢）。
+fn tokenize(seg: &str) -> Vec<String> {
+    seg.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 2 && w.chars().any(char::is_alphabetic))
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// title 分词后与派生关键词的交集（保关键词序，小写比较）。
+fn title_overlap(title: &str, keywords: &[String]) -> Vec<String> {
+    let words = tokenize(title);
+    keywords.iter().filter(|k| words.contains(k)).cloned().collect()
 }
 
 /// close 当前 browser 并同 profile 起重起有头实例。
@@ -580,6 +680,44 @@ mod tests {
         assert_eq!(Recency::Week.as_str(), "week");
         assert_eq!(Recency::Month.as_str(), "month");
         assert_eq!(Recency::Year.as_str(), "year");
+    }
+
+    /// e7c：URL → (host, 关键词) 分词。路径末段去扩展名、非字母数字切分、纯数字/单字符段丢弃。
+    #[test]
+    fn split_site_keys_extracts_host_and_keywords() {
+        use super::split_site_keys;
+        assert_eq!(
+            split_site_keys("https://docs.rs/serde"),
+            ("docs.rs".into(), vec!["serde".to_string()])
+        );
+        assert_eq!(
+            split_site_keys("https://en.wikipedia.org/wiki/Rust_(programming_language)"),
+            ("en.wikipedia.org".into(), vec!["rust".to_string(), "programming".to_string(), "language".to_string()])
+        );
+        assert_eq!(
+            split_site_keys("https://example.com/posts/2024/07.html"),
+            ("example.com".into(), Vec::<String>::new()),
+            "末段 07 纯数字被丢弃 → 关键词空（不回溯猜前段，similar 退化 site: 查询）"
+        );
+    }
+
+    /// 纯域名（无 path 关键词）与 www 前缀、大写归一。
+    #[test]
+    fn split_site_keys_pure_domain_and_www() {
+        use super::split_site_keys;
+        let (host, kws) = split_site_keys("https://WWW.Example.COM/");
+        assert_eq!(host, "example.com");
+        assert!(kws.is_empty(), "纯域名无关键词 → similar 退化 site: 查询");
+    }
+
+    #[test]
+    fn title_overlap_and_host_of() {
+        use super::{host_of, title_overlap};
+        let kws = vec!["serde".to_string(), "rust".to_string()];
+        assert_eq!(title_overlap("Serde — Rust serialization", &kws), vec!["serde", "rust"]);
+        assert_eq!(title_overlap("unrelated page", &kws), Vec::<String>::new());
+        assert_eq!(host_of("https://docs.rs/serde?q=1"), "docs.rs");
+        assert_eq!(host_of("https://www.Example.com/x"), "example.com", "www 剥离与同域比较归一一致");
     }
 }
 

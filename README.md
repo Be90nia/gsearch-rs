@@ -20,7 +20,7 @@ gsearch search "..." --open 1
 
 `--humanize` 默认启用：Google 搜索前随机访问 Wikipedia/GitHub/HN，滚动并短暂停留；指纹补丁仅用于 search，不改变 browse/login。agent 反复调用建议加 `--no-humanize`。
 
-`--recency day|week|month|year` 时间过滤双 provider 生效：SearXNG 请求追加 `time_range`，Google SERP URL 追加 `tbs=qdr:d/w/m/y`；不传时请求 URL 与旧版逐字节一致。`site:` 等查询语法原样透传，无专属参数。batch 多查询同样生效（batch 仅 SearXNG 源）。`meta.recency` 回显本次过滤值（未传时键缺席）。
+`--recency day|week|month|year` 时间过滤多 provider 生效：SearXNG 请求追加 `time_range`，Google SERP URL 追加 `tbs=qdr:d/w/m/y`，DDG html 表单追加 `df=d/w/m/y`；不传时请求 URL 与旧版逐字节一致。`site:` 等查询语法原样透传，无专属参数。batch 多查询同样生效（batch 仅 SearXNG 源）。`meta.recency` 回显本次过滤值（未传时键缺席）。
 
 参数护栏：`--limit` 取 1..=100（SearXNG 单查最多 10 页×10 条，更大只会翻页白耗时）；`--read N` 取 N≥1（`--read 0` 直接被 clap 拒绝，不再白起浏览器）。
 
@@ -29,7 +29,7 @@ gsearch search "..." --open 1
 - **紧凑单行**（无缩进——缩进对 LLM 是纯 token 税）
 - 每条结果：`title / url / snippet / score / domain_class`
   - `snippet` 默认 160 字符截断（`--snippet-len N` 可调，1..=100000）
-  - `score` 为 SearXNG 内部相关性分透传（agent 可按分筛序）；Google/HTML 降级源无此键
+  - `score` 为 SearXNG 内部相关性分透传（agent 可按分筛序）；Google/DDG html 等无分来源此键缺席
   - `domain_class`：URL host 启发式（docs/github/wikipedia/blog/forum/video/news/qa/other），可按类筛权威源
 - 顶层 `run.status`：`ok / captcha_required / captcha_timeout / searxng_degraded / error`
 - `meta` 键缺席语义：`truncated:false`、空 `message`、`captcha_solved:false` 均不占键；`results_count` 已移除（`len(results)` 可推导）
@@ -47,12 +47,20 @@ gsearch search "rust async runtime" "tokio tutorial" --limit 3
 
 多位置参数 = batch 模式：并发走 SearXNG、单条失败不阻塞其他、**禁浏览器回退**（浏览器单例不可并发），
 默认输出裸数组（紧凑 JSON），元素含 `query / status / meta / results`（ok 条目 `message` 缺席，error 条目携带原因）。
-退出码：`0` 全成功 / `1` 部分失败 / `2` 全部失败。单查询模式行为不变（SearXNG → Google 回退链完整保留）。
+退出码：`0` 全成功 / `1` 部分失败 / `2` 全部失败。单查询模式行为不变（SearXNG → DDG → Google 回退链完整保留）。
 
 #### SearXNG 熔断与降级标记（searxng_degraded）
 
-SearXNG 返回零结果时先做 Google 直连预检（TCP 1.5s）：不通则**熔断**——跳过回退秒级返回，`run.status=searxng_degraded`、exit 2、stderr 一行诊断（基础设施降级 ≠ 查询无资料，agent 应换短 query / `doctor` / 直接 `fetch` 已知源，而非当空结果处理）。
-IP 可达时回退 Google 直爬；**若回退也零结果，信封 `run.status` 同样标 `searxng_degraded`**（此前该路径 exit 2 但无状态标记，agent 无从区分「没资料」与「源降级」）。
+单查询回退链为 **SearXNG → DDG html → Google**：SearXNG 挂/零结果时先试 DDG html 直连（纯 HTTP 免浏览器，命中时 `meta.provider=duckduckgo`、stderr 一行接管提示）；DDG 也空才做 Google 直连预检（TCP 1.5s）：不通则**熔断**——跳过回退秒级返回，`run.status=searxng_degraded`、exit 2、stderr 一行诊断（基础设施降级 ≠ 查询无资料，agent 应换短 query / `doctor` / 直接 `fetch` 已知源，而非当空结果处理）。
+IP 可达时回退 Google 直爬；**若回退也零结果，信封 `run.status` 同样标 `searxng_degraded`**（此前该路径 exit 2 但无状态标记，agent 无从区分「没资料」与「源降级」）。DDG 被风控（anomaly challenge）时 stderr 显式报 challenge 而非静默算零结果。**已实测限制（2026-10-09）**：reqwest 的 TLS/头指纹在共享代理出口下会被 DDG anomaly 风控拦截（curl/.NET 同出口 200），出口 IP 信誉被拉黑的场景 DDG 直连层救「SearXNG 容器死」不救「出口黑」。
+
+#### similar（启发式相似页，e7c）
+
+```
+gsearch similar "https://docs.rs/serde" --limit 3
+```
+
+从 URL 提取 host 与 path 末段关键词派生查询（`docs.rs/serde` → 查 `serde`；纯域名退化 `site:<host>`），走 SearXNG 单查（超采样 limit×3，8..=15 条），按 **title 词重合 ×2 + 同域 ×1** 加权 stable 重排。**启发式派生查询，非 exa 神经 findSimilar**——预期管理：同主题词命中与同站相关页，不是语义相似。输出 = 常规搜索信封 + 每条 `similarity` 标注（启发来源，如 `title=serde; site=docs.rs`）+ 顶层 `similar_of`（源 URL）与 `note`。需配置 SearXNG（`searxng_url` / `GSEARCH_SEARXNG_URL`），不参与 Google/DDG 回退链。`meta.provider=searxng`、`meta.query` 回显派生查询。
 
 ### read / browse 输出契约（供 agent 消费）
 
@@ -169,7 +177,7 @@ gsearch> <Ctrl+D>          # EOF 优雅退出，Chrome 自动关
 ### 环境变量
 
 - `GSEARCH_PROFILE`：profile 名或任意输入路径（统一取末段名）
-- `GSEARCH_SEARXNG_URL`：SearXNG 实例地址（如 `http://localhost:8888`）；配置后 search 走 SearXNG 纯 HTTP 搜索（不走代理），失败自动回退 Google 直爬，`meta.provider` 标注来源。未配置 = 不启用 SearXNG
+- `GSEARCH_SEARXNG_URL`：SearXNG 实例地址（如 `http://localhost:8888`）；配置后 search 走 SearXNG 纯 HTTP 搜索（不走代理），失败自动回退 DDG html 直连（尊重 `HTTPS_PROXY` 等环境代理）再落 Google 直爬，`meta.provider` 标注来源。未配置 = 不启用 SearXNG
 - `GSEARCH_FETCH_ALLOW_PRIVATE=1`：放行 fetch 子命令的私网门（loopback / RFC1918 / link-local / 云 metadata）。默认拒。同效果 `--allow-private` flag。
 
 ### 配置文件（gsearch.json，可选）
@@ -218,7 +226,7 @@ gsearch search "rust"                              # 默认 auto：优先 Chrome
 
 - **Chrome / Edge**：路径是否找到；Edge 缺仅给 WARN（仍可跑）
 - **profile 可写**：在默认 / 自定义 profile 目录建一个临时探针文件做读写验证
-- **出口 IP**：明文 HTTP GET `http://ipv4.icanhazip.com/` 取公网 IP。**撞码时可以这里查 IP 被封状况**
+- **出口 IP**：明文 HTTP GET `http://ipv4.icanhazip.com/` 取公网 IP。**撞码时可以这里查 IP 被封状况**。当前 IP 记录到 `<profile>/last_exit_ip`；下次检查发现变化时附加 `exit_ip_drift` 一行 `[WARN]`（VPN/代理切换或 IP 信誉重置信号）——首次无记录或 IP 未变则静默
 - **网络连通**：TCP connect `www.google.com:443`，2 秒超时
 - **GSEARCH_PROFILE**：环境变量检查，缺/空用默认；路径不存在仅 WARN（首次启动会建）
 - **SearXNG probe**（配置 searxng_url 时）：GET `{url}/search?q=probe&format=json` 报 results 数与 unresponsive_engines；可达但零结果标 `[WARN]`（引擎降级/IP 信誉嫌疑）
@@ -235,6 +243,18 @@ gsearch verify https://slow-cdn --timeout 10           # 超时秒数可调（�
 ```
 
 批量退出码对齐 batch search：`0` 全 OK / `1` 部分失败 / `2` 全失败；`--urls-file <path>` 每行一 URL（空行跳过）。
+
+### `gsearch update`（版本检查）
+
+```
+gsearch update        # 查 GitHub latest release，与本地版本比对
+# 已是最新（本地 v0.2.9，远端 v0.2.9）
+# 有新版 v0.2.10（本地 v0.2.9）
+#   下载 URL: https://github.com/Be90nia/gsearch-rs/releases/tag/v0.2.10
+#   或: cargo install --git https://github.com/Be90nia/gsearch-rs --locked
+```
+
+查询失败（网络/DNS/限流）stderr 一行报错，退出码 1；查询成功退出码 0。**不做自替换**（Windows 运行中 exe 有文件锁）：升级自行下载 release 资产替换，或走 `cargo install`。网络请求尊重 `GSEARCH_PROXY`。
 
 ### 安装与构建
 
@@ -264,4 +284,4 @@ MIT，见 [LICENSE](LICENSE)。
 
 ## Companion tools
 
-需要多搜索引擎 provider（Bing / DuckDuckGo / Brave 等）互补时，推荐搭配 paperfoot 或 search-cli；gsearch 专注 Google 搜索 + 通用浏览器代理这一条单刀路径。
+需要更多搜索引擎 provider 互补时，search 已内置 DDG html 第二源（SearXNG 失败时自动接管）；再要 Bing / Brave 等多源可搭配 paperfoot 或 search-cli；gsearch 专注 Google 搜索 + 通用浏览器代理这一条单刀路径。

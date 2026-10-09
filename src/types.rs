@@ -127,6 +127,16 @@ pub struct OutputEnvelope<T: Serialize> {
     pub results: T,
 }
 
+/// af9-e7c：`similar` 输出条目 = SearchResult + similarity 启发标注（serde flatten 并列展开，
+/// search 全套字段与键缺席语义不变）。
+#[derive(Serialize, Clone, Debug)]
+pub struct SimilarHit {
+    #[serde(flatten)]
+    pub hit: SearchResult,
+    /// 启发来源标注：`title=<词>` / `site=<host>` 分号连接；两者皆无时为 none 说明串。
+    pub similarity: String,
+}
+
 /// batch 多查询（`search q1 q2 --json`，issue gsearch-rs-doh）输出的裸数组元素：
 /// 每条自带 meta，单条失败（status=error、results 空、message 给原因）不阻塞其他条目。
 #[derive(Serialize, Clone, Debug)]

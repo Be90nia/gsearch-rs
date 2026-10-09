@@ -13,6 +13,7 @@ mod postproc;
 mod shell;
 mod shell_snap;
 mod stealth;
+mod update;
 
 // Windows 控制台 UTF-8：让 println! / eprintln! 正确输出中文标题与 SERP 摘要。
 // 走 extern "system" 直接调 Win32，不引 windows-sys（PLAN §1 依赖表未列）。
@@ -198,6 +199,22 @@ enum Command {
         #[arg(long, default_value_t = false)]
         markdown: bool,
     },
+    /// 启发式相似页搜索（e7c）：URL → title 关键词派生查询，SearXNG 单查 + 词重合/同域重排。
+    /// 派生查询而非 exa 神经 findSimilar（README 预期管理）。
+    Similar {
+        /// 参照页 URL（提取 host 与 path 末段关键词；纯域名退化 site: 查询）
+        url: String,
+        #[arg(long, default_value_t = 3, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=100))]
+        limit: usize,
+        /// 3gw：输出默认 JSON（AI-first 契约）；此 flag 切人读文本。
+        #[arg(long, default_value_t = false)]
+        human: bool,
+        /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
+        #[arg(long, hide = true, default_value_t = false)]
+        json: bool,
+    },
+    /// 查 GitHub latest release 与本地版本比对（745）；只给指引，不做自替换
+    Update,
 }
 #[derive(Args, Debug)]
 struct SearchArgs {
@@ -327,6 +344,8 @@ async fn main() -> ExitCode {
         Command::Fetch { url, human, allow_private, include, markdown, .. } => {
             fetch::cmd_fetch(&url, &fetch::FetchOpts { json: !human, proxy: proxy.clone(), allow_private, include, markdown }).await
         }
+        Command::Similar { url, limit, human, .. } => cmd_similar(url, limit, human).await,
+        Command::Update => update::cmd_update(proxy.clone()).await,
     };
 
     match result {
@@ -580,6 +599,55 @@ fn resolve_browser_meta(
             (std::path::PathBuf::new(), gsearch::browser::BrowserKind::Chrome)
         }),
     }
+}
+
+/// e7c：`similar <url>`——启发式派生查询（title 关键词，SearXNG 单查 + 词重合/同域重排）。
+/// JSON 信封 = 常规 envelope + 顶层 similar_of/note 注解（0mf to_value 手法，不动公共结构）。
+async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode> {
+    let started = std::time::Instant::now();
+    let (browser_path, resolved_kind) = resolve_browser_meta(None);
+    let (mut hits, derived_query) =
+        gsearch::search::similar(&url, limit).await.map_err(anyhow::Error::msg)?;
+    // cw8 同款：snippet cap 装配层统一
+    for h in &mut hits {
+        h.hit.snippet = gsearch::output::truncate_snippet(&h.hit.snippet, 160);
+    }
+    if human {
+        for (i, h) in hits.iter().enumerate() {
+            println!("{}. {}", i + 1, h.hit.title);
+            println!("   {}", h.hit.url);
+            println!("   [similarity] {}", h.similarity);
+            println!("   {}", h.hit.snippet);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let meta = gsearch::types::MetaOutput {
+        tool: "gsearch",
+        version: env!("CARGO_PKG_VERSION"),
+        query: derived_query,
+        profile: gsearch::browser::profile_name_only(),
+        browser_kind: format!("{resolved_kind:?}"),
+        browser_path: browser_path.to_string_lossy().into_owned(),
+        proxy: None,
+        humanize: false,
+        limit,
+        elapsed_ms: started.elapsed().as_millis(),
+        truncated: hits.len() >= limit,
+        provider: "searxng".into(),
+        recency: None,
+    };
+    let run = gsearch::types::RunStatusInfo::default();
+    let envelope = gsearch::types::OutputEnvelope { meta, run, results: &hits };
+    let mut doc = serde_json::to_value(&envelope)?;
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert("similar_of".into(), serde_json::Value::String(url.clone()));
+        obj.insert(
+            "note".into(),
+            serde_json::Value::String("启发式派生查询（title 词重合 + 同域重排），非 exa 神经 findSimilar".into()),
+        );
+    }
+    println!("{doc}");
+    Ok(ExitCode::SUCCESS)
 }
 
 /// batch 多查询（issue gsearch-rs-doh）：并发走 SearXNG，单条失败不阻塞其他条目。
@@ -901,8 +969,9 @@ async fn cmd_doctor(json: bool) -> Result<ExitCode> {
     record_check(&mut checks, &mut fail, &mut warn, "edge", st, msg, val);
 
     // 3) profile 可写
-    let (st, msg, val) = match gsearch::browser::profile_dir() {
-        Ok(dir) => match test_profile_writable(&dir) {
+    let profile_res = gsearch::browser::profile_dir();
+    let (st, msg, val) = match &profile_res {
+        Ok(dir) => match test_profile_writable(dir) {
             Ok(()) => (DoctorStatus::Ok, format!("profile 可写: {}", dir.display()), None),
             Err(e) => (
                 DoctorStatus::Fail,
@@ -913,24 +982,38 @@ async fn cmd_doctor(json: bool) -> Result<ExitCode> {
         Err(e) => (DoctorStatus::Fail, format!("profile 解析失败: {e}"), None),
     };
     record_check(&mut checks, &mut fail, &mut warn, "profile_writable", st, msg, val);
+    let profile_dir = profile_res.ok();
 
     // 4) 出口 IP（明文 HTTP GET 80 端口，3s 超时；失败降 WARN）
-    let (st, msg, val) = match tokio::time::timeout(
+    let (st, msg, val, ip_drift) = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         fetch_public_ip(),
     )
     .await
     {
         // 8lp③：值类检查——IP 进 value
-        Ok(Ok(ip)) => (DoctorStatus::Ok, String::new(), Some(ip.to_string())),
+        Ok(Ok(ip)) => {
+            // 5a5 工具侧：与上次记录比对，漂移则附加一行 WARN（passwall 路由器层仍需人工）
+            let drift = check_exit_ip_drift(&ip, profile_dir.as_deref());
+            (DoctorStatus::Ok, String::new(), Some(ip), drift)
+        }
         Ok(Err(e)) => (
             DoctorStatus::Warn,
             format!("出口 IP 不可达（撞码调试辅助；改用代理/VPN 后重试）: {e}"),
             None,
+            None,
         ),
-        Err(_) => (DoctorStatus::Warn, "出口 IP 检测超时（2s）".to_string(), None),
+        Err(_) => (
+            DoctorStatus::Warn,
+            "出口 IP 检测超时（2s）".to_string(),
+            None,
+            None,
+        ),
     };
     record_check(&mut checks, &mut fail, &mut warn, "exit_ip", st, msg, val);
+    if let Some(drift) = ip_drift {
+        record_check(&mut checks, &mut fail, &mut warn, "exit_ip_drift", DoctorStatus::Warn, drift, None);
+    }
 
     // 5) 网络连通（TCP connect google.com:443，2s 超时）
     let (st, msg, val) = match tokio::time::timeout(
@@ -1085,6 +1168,27 @@ fn test_profile_writable(dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 5a5 工具侧：出口 IP 漂移检测。上次 IP 存 `<profile>/last_exit_ip`；
+/// 首次无记录 → 记当前、不 WARN；与上次相同 → 静默；不同 → 返回 WARN 文案。
+/// 记录写入失败只 warn 不影响 doctor 结果（漂移检测是增值项，不是健康门）。
+fn check_exit_ip_drift(ip: &str, profile_dir: Option<&std::path::Path>) -> Option<String> {
+    let path = profile_dir?.join("last_exit_ip");
+    let prev = std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    if let Err(e) = std::fs::write(&path, ip) {
+        tracing::warn!("记录出口 IP 失败（漂移检测下次不可用）: {} ({e})", path.display());
+    }
+    match prev {
+        None => None,
+        Some(p) if p == ip => None,
+        Some(p) => Some(format!(
+            "出口 IP 自上次检查已变化（{p} → {ip}）——VPN/代理切换或 IP 信誉重置信号"
+        )),
+    }
+}
+
 /// 明文 HTTP GET `http://ipv4.icanhazip.com/` → 返回 IP 字符串。
 /// ponytail: 仅用 std TCP，不引 HTTP 客户端依赖；服务偶尔挂时降 WARN 不 fail。
 async fn fetch_public_ip() -> anyhow::Result<String> {
@@ -1116,8 +1220,28 @@ async fn fetch_public_ip() -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::check_exit_ip_drift;
     use super::{Cli, Command, RecencyArg};
     use clap::Parser;
+
+    /// 5a5：首跑无记录→None 且落盘；同 IP→静默；换 IP→WARN 文案含新旧 IP。
+    #[test]
+    fn exit_ip_drift_three_states() {
+        let dir = std::env::temp_dir().join(format!("gsearch_drift_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = Some(dir.as_path());
+        // 首次：无记录，只显示 IP 不 WARN
+        assert_eq!(check_exit_ip_drift("1.1.1.1", d), None);
+        assert_eq!(std::fs::read_to_string(dir.join("last_exit_ip")).unwrap(), "1.1.1.1");
+        // 相同：静默
+        assert_eq!(check_exit_ip_drift("1.1.1.1", d), None);
+        // 漂移：WARN 含 A→B
+        let warn = check_exit_ip_drift("2.2.2.2", d).unwrap();
+        assert!(warn.contains("1.1.1.1") && warn.contains("2.2.2.2"), "WARN 应含新旧 IP: {warn}");
+        // 无 profile 目录：直接 None（不 panic）
+        assert_eq!(check_exit_ip_drift("3.3.3.3", None), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
 
     /// M18：humanize 默认 true（人用保留 warmup），加 --no-humanize 跳过。
@@ -1268,5 +1392,22 @@ mod tests {
         assert_eq!(args.recency, None);
         // 非法值 clap 直接拒绝
         assert!(Cli::try_parse_from(["gsearch", "search", "x", "--recency", "hour"]).is_err());
+    }
+
+    /// e7c：similar 子命令解析——默认 limit 3、--json 兼容占位、limit 越界拒绝。
+    #[test]
+    fn similar_subcommand_parses() {
+        let cli = Cli::try_parse_from(["gsearch", "similar", "https://docs.rs/serde"]).unwrap();
+        let Command::Similar { url, limit, human, json } = cli.cmd else { panic!("expected similar") };
+        assert_eq!(url, "https://docs.rs/serde");
+        assert_eq!(limit, 3, "默认 limit 3");
+        assert!(!human && !json);
+        let cli = Cli::try_parse_from(["gsearch", "similar", "https://docs.rs/serde", "--limit", "5"]).unwrap();
+        let Command::Similar { limit, .. } = cli.cmd else { panic!("expected similar") };
+        assert_eq!(limit, 5);
+        // cxa 同款护栏：limit 0 拒绝
+        assert!(Cli::try_parse_from(["gsearch", "similar", "https://docs.rs/serde", "--limit", "0"]).is_err());
+        // 零位置参数拒绝
+        assert!(Cli::try_parse_from(["gsearch", "similar"]).is_err());
     }
 }

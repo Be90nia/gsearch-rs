@@ -354,7 +354,18 @@ fn resolve_dl_target(output: Option<&Path>, output_file: Option<&Path>) -> Resul
 async fn dl_direct(url: &str, proxy: Option<&str>, path: &Path) -> Result<Option<u64>> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
-    if crate::fetch::gate_check(url, false).is_err() {
+    if let Err(e) = crate::fetch::gate_check(url, false) {
+        // yvz：门层 DNS 失败（域名不存在）→ fail-fast rc=1，免起 Chrome（全链 6.1s vs 此处亚秒）。
+        // 误伤防护：本机解析器坏/纯代理代解析环境在这里同样报 DNS 失败——先用（可能带代理的）
+        // client 复核一次 HEAD，复核仍是 DNS 类失败才判死；复核成功/超时/SSL 一律回退 browser。
+        if is_gate_dns_error(&e) {
+            let client = crate::fetch::build_client(proxy, false, Duration::from_secs(DL_DIRECT_TIMEOUT_SECS))?;
+            if let Err(head_err) = client.head(url).send().await
+                && is_dns_error(&head_err)
+            {
+                anyhow::bail!("域名不存在（DNS 解析失败），跳过浏览器下载: {url}");
+            }
+        }
         return Ok(None);
     }
     let client = crate::fetch::build_client(proxy, false, Duration::from_secs(DL_DIRECT_TIMEOUT_SECS))?;
@@ -396,6 +407,36 @@ async fn dl_direct(url: &str, proxy: Option<&str>, path: &Path) -> Result<Option
     Ok(Some(size))
 }
 
+/// yvz：gate_check 错误是否 DNS 解析类（"host 解析失败/为空"）；私网拒绝、URL 畸形不算。
+fn is_gate_dns_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("host 解析失败") || s.contains("host 解析为空")
+}
+
+/// yvz：reqwest 错误链是否 DNS 解析类。getaddrinfo 文案随系统语言变化，
+/// 特征串之外兜底 Windows WSA DNS 错误码：11001 WSAHOST_NOT_FOUND / 11002 TRY_AGAIN / 11004 NO_DATA。
+fn is_dns_error(e: &reqwest::Error) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if let Some(io) = err.downcast_ref::<std::io::Error>()
+            && matches!(io.raw_os_error(), Some(11001) | Some(11002) | Some(11004))
+        {
+            return true;
+        }
+        let s = err.to_string().to_ascii_lowercase();
+        if s.contains("dns error")
+            || s.contains("failed to lookup address")
+            || s.contains("no such host")
+            || s.contains("name or service not known")
+            || s.contains("temporary failure in name resolution")
+            || s.contains("nodename nor servname")
+        {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
 
 /// 轮询 dir 等 before 之外的新文件。
 async fn wait_new_file(dir: &Path, before: &HashSet<String>) -> Result<Option<String>> {
@@ -444,6 +485,17 @@ fn list_dir(dir: &Path) -> Result<HashSet<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// yvz：gate 错误分类——DNS 解析类 true；私网拒绝/URL 畸形 false（不 fail-fast，回退老链路）。
+    #[test]
+    fn gate_dns_error_classification() {
+        assert!(is_gate_dns_error(&anyhow::anyhow!("host 解析失败: no-such-zzz.invalid")));
+        assert!(is_gate_dns_error(&anyhow::anyhow!("host 解析为空: x")));
+        assert!(!is_gate_dns_error(&anyhow::anyhow!("URL 无 scheme: example.com")));
+        assert!(!is_gate_dns_error(&anyhow::anyhow!(
+            "fetch 拒绝私网地址 127.0.0.1（host=localhost）"
+        )));
+    }
 
     /// i9a：-o 末段带扩展名 = 文件；纯目录名 = 目录；--output-file 优先；都缺省 = CWD 目录。
     #[test]
