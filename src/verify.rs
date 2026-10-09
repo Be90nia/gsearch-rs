@@ -130,7 +130,7 @@ fn scheme_is_https(url: &str) -> bool {
     url.trim_start().to_ascii_lowercase().starts_with("https://")
 }
 
-/// 6a6：verdict 数值 → 分类名（与单条退出码 0/2/3/4/5 一一对应）。
+/// verdict 数值 → 分类名（与单条退出码 0/2/3/4/5 一一对应）。
 fn verdict_name(v: u8) -> &'static str {
     match v {
         0 => "ok",
@@ -293,7 +293,7 @@ fn print_batch(urls: &[String], probes: &[Probe], json: bool) {
     }
 }
 
-/// ih1：ssl 列单元格——None = http 无 TLS 参与，显示 n/a。
+/// ssl 列单元格——None = http 无 TLS 参与，显示 n/a。
 fn ssl_cell(ssl: Option<bool>) -> &'static str {
     match ssl {
         Some(true) => "true",
@@ -302,7 +302,7 @@ fn ssl_cell(ssl: Option<bool>) -> &'static str {
     }
 }
 
-/// 8lp：JSON 走 compact 单行——输出契约面向 agent 消费，pretty 纯耗 token。
+/// JSON 走 compact 单行——输出契约面向 agent 消费，pretty 纯耗 token。
 fn print_json<T: Serialize>(v: &T) {
     match serde_json::to_string(v) {
         Ok(s) => println!("{s}"),

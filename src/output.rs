@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::types::{BatchEntry, BatchEnvelopeV2, OutputEnvelope, SearchResult};
 
 /// snippet 截断长度（按字符不按字节，中文摘要不会截出乱码）。
-/// 3gw：JSON 路径同样默认 160（此前人读 160/JSON 不截的倒挂已翻转），
+/// JSON 路径同样默认 160（此前人读 160/JSON 不截的倒挂已翻转），
 /// `--snippet-len` 可调，cli 值经 main 装配层用 `truncate_snippet` 落到结果上。
 const SNIPPET_MAX_CHARS: usize = 160;
 
@@ -15,7 +15,7 @@ pub fn truncate_snippet(s: &str, max: usize) -> String {
 }
 
 /// 默认输出：`N. 标题\n   url\n   snippet 前 160 字`
-/// M5：剥 title/url/snippet 里的 ANSI ESC 序列——日志/输出被彩色化（trace / 服务端标记
+/// 剥 title/url/snippet 里的 ANSI ESC 序列——日志/输出被彩色化（trace / 服务端标记
 /// 注入 [31m / 自定义 ANSI）时打印到 stdout 会污染 agent 解析；strip 走纯函数好单测。
 pub fn print_text(results: &[SearchResult]) {
     for (i, r) in results.iter().enumerate() {
@@ -58,9 +58,9 @@ pub(crate) fn strip_ansi(s: &str) -> String {
 }
 
 
-/// M14-1B：`--json` 输出 `{meta, results}` 信封，agent 解析友好。
+/// `--json` 输出 `{meta, results}` 信封，agent 解析友好。
 /// 泛型让 search 数组 / browse AdaptiveRead 共用同一序列化路径。
-/// 3gw：compact 是默认态（人不再是一等消费者）；pretty 人读模式也不加——缩进对
+/// compact 是默认态（人不再是一等消费者）；pretty 人读模式也不加——缩进对
 /// LLM token 是纯税，JSON 语义与缩进无关。
 pub fn print_envelope_json<T: serde::Serialize>(envelope: &OutputEnvelope<T>) -> Result<()> {
     println!("{}", serde_json::to_string(envelope)?);
@@ -74,7 +74,7 @@ pub fn print_batch_json(entries: &[BatchEntry]) -> Result<()> {
     Ok(())
 }
 
-/// nx4：`--envelope v2` batch 信封——顶层 meta 批统计一次，元素不带 14 字段 meta。
+/// `--envelope v2` batch 信封——顶层 meta 批统计一次，元素不带 14 字段 meta。
 pub fn print_batch_envelope_v2(envelope: &BatchEnvelopeV2) -> Result<()> {
     println!("{}", serde_json::to_string(envelope)?);
     Ok(())

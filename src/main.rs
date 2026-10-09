@@ -379,7 +379,7 @@ async fn main() -> ExitCode {
     }
 }
 
-/// o1p：空串/纯空白 query 前置拒绝——单查与 batch 两入口共用（cmd_search 开头统一拦），
+/// 空串/纯空白 query 前置拒绝——单查与 batch 两入口共用（cmd_search 开头统一拦），
 /// 不发起任何网络。返回首个非法 query 供报错（与 qbw similar 闸同型一行报错）。
 fn first_blank_query(queries: &[String]) -> Option<&str> {
     queries.iter().map(String::as_str).find(|q| q.trim().is_empty())
@@ -878,7 +878,7 @@ async fn ensure_search_browser<'a>(
     }
 }
 
-/// M15：CAPTCHA 超时时输出 status=captcha_timeout 的 JSON 信封。
+/// CAPTCHA 超时时输出 status=captcha_timeout 的 JSON 信封。
 fn emit_captcha_timeout_json(
     query: &str,
     args: &SearchArgs,
@@ -911,9 +911,9 @@ fn emit_captcha_timeout_json(
     let _ = gsearch::output::print_envelope_json(&envelope);
 }
 
-/// zc6：SearXNG 熔断输出——status=searxng_degraded（元审计硬约束值）、provider 照实标
+/// SearXNG 熔断输出——status=searxng_degraded（元审计硬约束值）、provider 照实标
 /// searxng、results 空；message 带诊断行让 Agent 无需解析 stderr。
-/// o1p：真因（HTTP 错误码等）透传进 message，与 stderr 诊断行同源（circuit_diag）。
+/// 真因（HTTP 错误码等）透传进 message，与 stderr 诊断行同源（circuit_diag）。
 fn emit_searxng_degraded_json(
     query: &str,
     args: &SearchArgs,
@@ -956,7 +956,7 @@ fn browser_arg_to_kind(arg: BrowserArg) -> Option<gsearch::browser::BrowserKind>
 
 /// doctor 总耗时 <3s；不启动 Chrome。每项输出 `[OK] 描述 + 路径 / [WARN] ... / [FAIL] ...`。
 /// 全部 OK 退出 0；任意 FAIL 退出 1；仅 WARN 退出 0。
-/// 2i1：--json 输出 {checks:[{name,status,message,value?}], elapsed_ms, fail_count, warn_count}
+/// --json 输出 {checks:[{name,status,message,value?}], elapsed_ms, fail_count, warn_count}
 /// （status 语义 ok/warn/fail/skip；exit 规则不变；8lp③：ok 值类检查 message 缺席、数据进 value）。
 /// 人读模式文本与旧版逐字节一致（除新增项）。
 #[derive(serde::Serialize)]

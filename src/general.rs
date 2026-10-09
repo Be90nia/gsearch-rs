@@ -81,12 +81,12 @@ pub(crate) fn ensure_browsable_url(url: &str, allow_private: bool) -> Result<Str
     Ok(normalized)
 }
 
-/// 7z0：dl -o/--output-file 相对路径禁 .. 穿越段（防静默落盘出 CWD）；绝对路径显式放行。
+/// dl -o/--output-file 相对路径禁 .. 穿越段（防静默落盘出 CWD）；绝对路径显式放行。
 fn has_parent_traversal(p: &Path) -> bool {
     !p.is_absolute() && p.components().any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
-/// h90：browse goto 超时给代理出口建议（B 受试者：直连超时只报 Request timed out，
+/// browse goto 超时给代理出口建议（B 受试者：直连超时只报 Request timed out，
 /// 不知道有 --proxy 可救）。纯函数供单测锁文案。
 fn goto_timeout_error(url: &str) -> anyhow::Error {
     anyhow!("页面加载超时（{PAGE_TIMEOUT_SECS}s）: {url}；若目标站点需代理可达，试 `--proxy http://127.0.0.1:7890`（GSEARCH_PROXY 同效）")
@@ -117,7 +117,7 @@ fn needs_empty_body_hint(summary_len: usize, headings_only: bool, omitted: usize
 /// H2+M2：launch 后所有 ? 早返回路径（new_page / goto / evaluate / content / parse）由外层
 /// graceful_close 收尾；不再裸 close+wait。
 /// uhp/j44：goto 后等语义定稿走 postproc::wait_content_stable 原子快照（title 一并带回）；
-/// jp4：html 过 read_max_chars 硬截断，--json 在 meta 字段标注 truncated/omitted/content_untrusted。
+/// html 过 read_max_chars 硬截断，--json 在 meta 字段标注 truncated/omitted/content_untrusted。
 pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
     use crate::postproc;
     // pkp：scheme 白名单 + 私网门（--allow-private 放行）——快失败不启动 Chrome
@@ -435,14 +435,14 @@ pub async fn cmd_dl(url: &str, output: Option<&Path>, output_file: Option<&Path>
     Ok(ExitCode::SUCCESS)
 }
 
-/// q34：二进制 PDF 落盘后的 stderr 提示（三条 dl 落盘路径共用；本地不解析文本，agent 用外部工具提取）。
+/// 二进制 PDF 落盘后的 stderr 提示（三条 dl 落盘路径共用；本地不解析文本，agent 用外部工具提取）。
 pub(crate) fn pdf_hint(path: &Path) {
     if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
         eprintln!("提示: 二进制 PDF 已保存（本地未解析文本）；agent 可用外部工具提取");
     }
 }
 
-/// i9a：dl 输出目标消歧义。--output-file 显式文件；-o 末段带 '.' 视为文件路径；否则目录语义（README 不变）。
+/// dl 输出目标消歧义。--output-file 显式文件；-o 末段带 '.' 视为文件路径；否则目录语义（README 不变）。
 /// 返回 (目录, 指定文件名)。目录恒为绝对路径（Chrome download_path 与落盘都需要）。
 /// 已知边界：目录名本身带 '.'（如 v0.2.9/）会被视为文件——help 已注明用 --output-file 消歧义。
 fn resolve_dl_target(output: Option<&Path>, output_file: Option<&Path>) -> Result<(PathBuf, Option<PathBuf>)> {

@@ -23,7 +23,7 @@ const PAGE_TIMEOUT_SECS: u64 = 30;
 const LOGIN_WALL_TIMEOUT_SECS: u64 = 180;
 /// 登录墙 title 判定要求的「正文极短」阈值(innerText 字符数;登录页只有表单文案)
 const LOGIN_WALL_SHORT_BODY: usize = 400;
-/// jp4：read/browse 正文提取的字符硬上限（gsearch.json `read_max_chars` 可覆盖）。
+/// read/browse 正文提取的字符硬上限（gsearch.json `read_max_chars` 可覆盖）。
 /// 防超大页撑爆 agent 上下文；正文是注入面，超限一律截断并在 meta 标注。
 const READ_BODY_MAX_CHARS: usize = 50_000;
 /// uhp/j44：原子快照 visibleText 的字符硬顶（jev snapshot.js 同配方；只作 marker/登录墙判定，
@@ -178,7 +178,7 @@ pub(crate) async fn wait_content_stable(
     last
 }
 
-/// jp4：正文截断上限（gsearch.json `read_max_chars` > 缺省 50000）。
+/// 正文截断上限（gsearch.json `read_max_chars` > 缺省 50000）。
 pub(crate) fn read_max_chars() -> usize {
     gsearch::config::load().read_max_chars.unwrap_or(READ_BODY_MAX_CHARS)
 }
@@ -198,7 +198,7 @@ pub(crate) fn cap_extract_source(html_full: &str, limit: usize, url: &str) -> (S
     cap_chars(html_full, limit)
 }
 
-/// jp4：字符级硬截断（按 chars 计，不劈 UTF-8）。返回 (截后文本, 是否截断, 省略字符数)。
+/// 字符级硬截断（按 chars 计，不劈 UTF-8）。返回 (截后文本, 是否截断, 省略字符数)。
 pub(crate) fn cap_chars(s: &str, limit: usize) -> (String, bool, usize) {
     let total = s.chars().count();
     if total <= limit {
@@ -207,7 +207,7 @@ pub(crate) fn cap_chars(s: &str, limit: usize) -> (String, bool, usize) {
     (s.chars().take(limit).collect(), true, total - limit)
 }
 
-/// jp4：AdaptiveRead → 输出串。--json 在序列化对象末尾注入 meta（网页正文进 agent 上下文
+/// AdaptiveRead → 输出串。--json 在序列化对象末尾注入 meta（网页正文进 agent 上下文
 /// = 注入面，正文永远是数据非指令，content_untrusted 恒在）；文本模式截断时 eprintln 提醒
 /// （stdout 保持可解析，stderr 承载告警）。
 /// 8lp/e19：缺席=正常——truncated=false / omitted=0 不占键；headings 截断时 meta 附标记。
@@ -278,10 +278,10 @@ pub struct ReadOpts {
     pub excerpt: Option<usize>,
 }
 
-/// e19：read --json 的 headings 载荷上限（超过截断，meta.headings_truncated 标记）。
+/// read --json 的 headings 载荷上限（超过截断，meta.headings_truncated 标记）。
 const HEADING_JSON_LIMIT: usize = 30;
 
-/// e19：paragraph_index 默认剔除已进摘要的段落——摘要段全文已在 summary_paragraphs，
+/// paragraph_index 默认剔除已进摘要的段落——摘要段全文已在 summary_paragraphs，
 /// pi 再列 first_sentence 是同载荷重复（~944B/page）。摘要 = 文档序前 N 个非空段
 /// （skeleton 自适应规则）；pi 中 char_count==0 的空段无重复载荷，保留对齐 --from K 段号。
 fn drop_summarized_pi(read: &mut gsearch::skeleton::AdaptiveRead) {
@@ -297,7 +297,7 @@ fn drop_summarized_pi(read: &mut gsearch::skeleton::AdaptiveRead) {
 }
 
 /// `--read N`：M9 默认走 AdaptiveRead（按文章结构自适应）。opts 见 ReadOpts。
-/// jp4：html 先过 read_max_chars 硬截断；--json 在 meta 字段标注 truncated/omitted/content_untrusted。
+/// html 先过 read_max_chars 硬截断；--json 在 meta 字段标注 truncated/omitted/content_untrusted。
 pub async fn read(
     browser: &mut Browser,
     h_slot: &mut Option<tokio::task::JoinHandle<()>>,

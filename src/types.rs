@@ -16,7 +16,7 @@ pub struct SearchResult {
     pub domain_class: &'static str,
 }
 
-/// M14-1B：给 agent 用的 self-describing JSON 头部。`--json` 输出现在长这样：
+/// 给 agent 用的 self-describing JSON 头部。`--json` 输出现在长这样：
 /// ```json
 /// { "meta": <MetaOutput>, "results": [...] }
 /// ```
@@ -60,7 +60,7 @@ pub struct MetaOutput {
 // 拿不到 self，全局 AtomicBool 是最小改动（构造方零改动、保留字段 JSON 顺序不变）。
 static COMPACT_META: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 6dp：设置 `--compact-meta` 生效值（flag && !debug，main 在派发前算好传入）。
+/// 设置 `--compact-meta` 生效值（flag && !debug，main 在派发前算好传入）。
 /// debug 日志开启强制全量——元审计硬约束（compact 与 stderr 静默同开 = 排障现场双失）。
 pub fn set_compact_meta(effective: bool) {
     COMPACT_META.store(effective, std::sync::atomic::Ordering::Relaxed);
@@ -86,7 +86,7 @@ fn skip_compact_usize(_: &usize) -> bool {
     compact_on()
 }
 
-/// M14-1B：`--json` 输出的统一信封，`results` 是真正的载荷（Vec 或 AdaptiveRead）。
+/// `--json` 输出的统一信封，`results` 是真正的载荷（Vec 或 AdaptiveRead）。
 /// ponytail: 用泛型让 search / browse / dl 共用同一序列化路径；不引新依赖。
 /// M15 扩展：每次响应顶层带状态，便于 Agent 识别四种结局而不必解析 stderr / 文案。
 /// 协议约定：
@@ -113,7 +113,7 @@ pub enum RunStatus {
 }
 
 /// M15 扩展：人类可读的状态文本，Agent 可直接喂回 LLM。
-/// 8lp：happy-path 空值缺席——captcha_solved=false、message="" 是正常态，不占键。
+/// happy-path 空值缺席——captcha_solved=false、message="" 是正常态，不占键。
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct RunStatusInfo {
     pub status: RunStatus,
@@ -133,7 +133,7 @@ pub struct OutputEnvelope<T: Serialize> {
     pub results: T,
 }
 
-/// af9-e7c：`similar` 输出条目 = SearchResult + similarity 启发标注（serde flatten 并列展开，
+/// `similar` 输出条目 = SearchResult + similarity 启发标注（serde flatten 并列展开，
 /// search 全套字段与键缺席语义不变）。
 #[derive(Serialize, Clone, Debug)]
 pub struct SimilarHit {
@@ -156,7 +156,7 @@ pub struct BatchEntry {
     pub results: Vec<SearchResult>,
 }
 
-/// nx4：`--envelope v2` 的 batch 信封——批统计 meta 只出一层，元素不带 14 字段 meta。
+/// `--envelope v2` 的 batch 信封——批统计 meta 只出一层，元素不带 14 字段 meta。
 /// 默认仍是裸数组（BatchEntry）；v2 为 opt-in，存量 agent 零破坏。
 #[derive(Serialize, Clone, Debug)]
 pub struct BatchEnvelopeV2 {
@@ -164,7 +164,7 @@ pub struct BatchEnvelopeV2 {
     pub results: Vec<BatchEntryV2>,
 }
 
-/// nx4：批处理级统计（一次）；原每条 meta 的 elapsed_ms 并入此处。
+/// 批处理级统计（一次）；原每条 meta 的 elapsed_ms 并入此处。
 #[derive(Serialize, Clone, Debug)]
 pub struct BatchMetaV2 {
     pub n_total: usize,
@@ -173,7 +173,7 @@ pub struct BatchMetaV2 {
     pub elapsed_ms: u128,
 }
 
-/// nx4：v2 数组元素——只留 query/status/message/results（14 字段 meta 移除）。
+/// v2 数组元素——只留 query/status/message/results（14 字段 meta 移除）。
 #[derive(Serialize, Clone, Debug)]
 pub struct BatchEntryV2 {
     pub query: String,

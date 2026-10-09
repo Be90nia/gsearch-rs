@@ -80,7 +80,7 @@ pub(crate) fn absolutize(href: &str, origin: &str) -> String {
     }
 }
 
-/// 54c：Google 直爬壳 URL 解包——`google.com/url?q=<目标>` 与 `google.com/goto?url=<目标>`
+/// Google 直爬壳 URL 解包——`google.com/url?q=<目标>` 与 `google.com/goto?url=<目标>`
 /// 两种包装解出真实目标 URL（percent-decode 后须为 http/https 才采用）。
 /// 解不出（非 google 壳 / 无参数 / 目标非 http）保留原样返回，不报错不丢结果。
 pub(crate) fn unwrap_google_redirect(url: &str) -> String {

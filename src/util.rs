@@ -31,7 +31,7 @@ pub fn filename_from_url(url: &str) -> String {
     }
 }
 
-/// I9：URL 末段字符过滤——禁路径分隔符 / Win 保留字符 / `..`，禁控制字符，封顶 200 字节。
+/// URL 末段字符过滤——禁路径分隔符 / Win 保留字符 / `..`，禁控制字符，封顶 200 字节。
 /// 不引依赖（PLAN §1）；这函数可能受 Windows 设备名影响单测覆盖。
 fn sanitize_filename(raw: &str) -> String {
     // Win 保留字符 + 路径分隔符 + 控制字符 → '_'
@@ -98,7 +98,7 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// nw4：SERP 来源类型标注——纯 host/后缀启发式，零网络请求、保守不猜（未命中一律 other）。
+/// SERP 来源类型标注——纯 host/后缀启发式，零网络请求、保守不猜（未命中一律 other）。
 /// 值域即 JSON `domain_class` 字段：docs/github/wikipedia/blog/forum/video/news/qa/other。
 pub fn domain_class(url: &str) -> &'static str {
     // host 提取：剥 scheme → 截到第一个 / ? # → 去端口 → 去 www. → 小写

@@ -29,7 +29,7 @@ pub struct GsearchConfig {
 
 static CONFIG: OnceLock<GsearchConfig> = OnceLock::new();
 static EXPLICIT: OnceLock<PathBuf> = OnceLock::new();
-/// vw2：自动发现配置的解析失败详情（load() 惰性初始化时恰好只 set 一次）。
+/// 自动发现配置的解析失败详情（load() 惰性初始化时恰好只 set 一次）。
 static PARSE_FAILURE: OnceLock<ParseFailure> = OnceLock::new();
 
 /// 自动发现的配置文件「存在但解析失败」的详情（区别于文件不存在的静默默认）。
@@ -57,7 +57,7 @@ pub fn set_explicit_and_load(path: PathBuf) -> Result<()> {
 pub fn load() -> &'static GsearchConfig {
     CONFIG.get_or_init(|| load_from_disk().unwrap_or_default())
 }
-/// M16：searxng_url 的 env 覆盖（GSEARCH_SEARXNG_URL > 配置文件 > None）。
+/// searxng_url 的 env 覆盖（GSEARCH_SEARXNG_URL > 配置文件 > None）。
 /// 对齐 GSEARCH_PROXY 语义：设了但空白 = 未设。抽纯函数便于单测（env::set_var 在测试里是 unsafe + 全局污染）。
 fn merge_searxng_env(cfg: &mut GsearchConfig, env_val: Option<String>) {
     if let Some(v) = env_val.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {

@@ -78,7 +78,7 @@ pub fn unusual_traffic(html: &str) -> bool {
         || lower.contains("/sorry/index")
 }
 
-/// M15：搜索结果 + 是否撞码过验证，Agent 拿一次 JSON 就能知道全部状态。
+/// 搜索结果 + 是否撞码过验证，Agent 拿一次 JSON 就能知道全部状态。
 #[derive(Debug)]
 pub enum SearchOutcome {
     /// 正常出结果，可能包含“本轮经过人工 CAPTCHA 验证”的标记。
@@ -238,19 +238,19 @@ pub async fn run_search_on_page(
     })
 }
 
-/// M16：SearXNG 分流。未配置 searxng_url → NotConfigured（直接走 Google）。
+/// SearXNG 分流。未配置 searxng_url → NotConfigured（直接走 Google）。
 /// 翻页：pageno 从 1 递增，凑满 limit / 空页 / 打满 MAX_PAGES 收口。
 /// 每页先试 format=json；Err 或零结果时降级抓 HTML 结果页（同页重试一次），
 /// 都空才按空页语义收口。provider 语义不变（"searxng" 涵盖 json/html 两种来源）。
 ///
-/// zc6：json+html 双空/双失败不再无条件回退——先 TCP 预检 google:443（1.5s）。
+/// json+html 双空/双失败不再无条件回退——先 TCP 预检 google:443（1.5s）。
 /// IP 正常时 FallbackGoogle（老行为不变）；被墙/断网时段 CircuitBroken 熔断，
 /// 不再空耗 30s 等浏览器超时。
 ///
-/// af9：回退链插层为 SearXNG → DDG html → Google——SearXNG 失败先试 DDG 纯 HTTP
+/// 回退链插层为 SearXNG → DDG html → Google——SearXNG 失败先试 DDG 纯 HTTP
 ///（免浏览器），DDG 命中时 Results 携 provider="duckduckgo"；batch 不走此层（仍 SearXNG-only）。
 ///
-/// o1p：失败分类为 SearxFail{HealthyEmpty, SourceError}——源健康零结果与源故障分立，
+/// 失败分类为 SearxFail{HealthyEmpty, SourceError}——源健康零结果与源故障分立，
 /// FallbackGoogle/CircuitBroken 携带 SearXNG 真因（HTTP 错误码透传进诊断行）。
 #[derive(Debug)]
 pub enum SearxngAttempt {
@@ -270,19 +270,19 @@ pub enum SearxngAttempt {
     HealthyEmpty,
 }
 
-/// zc6：熔断诊断行（stderr，一行原则；元审计豁免未来任何静默策略）。
+/// 熔断诊断行（stderr，一行原则；元审计豁免未来任何静默策略）。
 pub const SEARXNG_CIRCUIT_MSG: &str =
     "SearXNG 零结果已熔断（基础设施降级，非查询无资料）；建议换短 query/跑 doctor/直接 fetch 已知源";
 
-/// o1p：recency 过滤后零结果（SearXNG 源健康）——与基础设施降级显式分立。
+/// recency 过滤后零结果（SearXNG 源健康）——与基础设施降级显式分立。
 pub const FILTERED_EMPTY_MSG: &str =
     "recency 过滤后零结果（SearXNG 源健康，非基础设施故障）；建议去掉 --recency、换时间窗或换词重试";
 
-/// o1p：查询无果（SearXNG 源健康）——非熔断非过滤空，换词重试即可。
+/// 查询无果（SearXNG 源健康）——非熔断非过滤空，换词重试即可。
 pub const NO_RESULTS_MSG: &str =
     "查询无结果（SearXNG 源健康，非基础设施故障）；建议换词或缩短查询重试";
 
-/// o1p：SearXNG 失败分类——零结果语义三态的判定依据。
+/// SearXNG 失败分类——零结果语义三态的判定依据。
 /// HealthyEmpty = json+html 双层 HTTP 200 零结果（源健康，查询真无果）；
 /// SourceError = HTTP 状态错/网络错/解析失败（携带真因链，如 HTTP 400）。
 #[derive(Debug)]
@@ -310,7 +310,7 @@ impl SearxFail {
     }
 }
 
-/// o1p：熔断诊断行组装——真因非空时透传追加（run.message 与 stderr 诊断行同源）。
+/// 熔断诊断行组装——真因非空时透传追加（run.message 与 stderr 诊断行同源）。
 pub fn circuit_diag(reason: &str) -> String {
     if reason.is_empty() {
         SEARXNG_CIRCUIT_MSG.to_string()
@@ -362,7 +362,7 @@ pub async fn try_searxng(cfg: &SearchConfig) -> SearxngAttempt {
     }
 }
 
-/// zc6：Google 回退预检——TCP 连 www.google.com:443，1.5s 封顶（与 doctor 第 5 项同款探测）。
+/// Google 回退预检——TCP 连 www.google.com:443，1.5s 封顶（与 doctor 第 5 项同款探测）。
 /// ponytail: 直连探测不感知 GSEARCH_PROXY（显式代理场景可能假熔断）；本部署走透明代理直出，无此形态。
 async fn google_fallback_precheck() -> bool {
     matches!(
@@ -377,7 +377,7 @@ async fn google_fallback_precheck() -> bool {
 
 /// SearXNG-only 收集内核（单查询与 batch 共用）：翻页凑 limit。
 /// Err(原因) = 未能凑到任何结果；中途双源失败但已有部分结果时有多少用多少。
-/// o1p：失败分类 SearxFail——json+html 双层 HTTP 200 零结果 = HealthyEmpty（源健康），
+/// 失败分类 SearxFail——json+html 双层 HTTP 200 零结果 = HealthyEmpty（源健康），
 /// HTTP 状态/网络/解析失败 = SourceError（真因链含 json 层 + html 层）。
 /// 回退 warn 不在此打——单查询措辞是"已回退 Google 直爬"，batch 无回退，由调用方决定。
 async fn searxng_collect(base: &str, cfg: &SearchConfig) -> Result<Vec<SearchResult>, SearxFail> {
@@ -469,7 +469,7 @@ pub async fn run_batch(
 
 /// json 不可用（Err / 零结果）时的单页降级：抓 HTML 结果页。
 /// Ok(results) = html 命中（整次查询首次命中打一行降级提示）；
-/// o1p：Err 携分类——html 亦 HTTP 200 零结果 = HealthyEmpty（源健康，查询真无果）；
+/// Err 携分类——html 亦 HTTP 200 零结果 = HealthyEmpty（源健康，查询真无果）；
 /// html 层故障 = SourceError（真因由调用方拼进全链）。
 async fn degrade_html(
     base: &str,
@@ -502,7 +502,7 @@ fn warn_searxng_fallback(base: &str, err: &str) {
     eprintln!("{msg}");
 }
 
-/// af9-e7c：similar 内核——从 URL 提取 title 关键词派生查询，SearXNG 单查（超采样 limit×3，
+/// similar 内核——从 URL 提取 title 关键词派生查询，SearXNG 单查（超采样 limit×3，
 /// 8..=15 条），title 词重合 ×2 + 同域 ×1 加权 stable 重排（同分保留 SearXNG 相关序）。
 /// **启发式派生查询，非 exa 神经 findSimilar**（README 预期管理）。返回（重排后条目，派生查询串）。
 pub async fn similar(
@@ -684,7 +684,7 @@ fn serp_url(query: &str, start: usize, recency: Option<Recency>) -> String {
 }
 
 /// ponytail: 查询串就几十字节，手写 10 行不引 percent_encoding crate。
-/// M16：searxng.rs 复用同一 URL 编码（q 参数语义相同），故 pub(crate)。
+/// searxng.rs 复用同一 URL 编码（q 参数语义相同），故 pub(crate)。
 pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {

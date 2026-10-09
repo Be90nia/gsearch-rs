@@ -281,7 +281,7 @@ fn effective_profile_raw() -> Option<String> {
     }
     crate::config::load().profile.clone()
 }
-/// M14-1B：取 meta 头部用的 profile 名（不创建目录、纯查询）。
+/// 取 meta 头部用的 profile 名（不创建目录、纯查询）。
 /// 绝对路径模式返回末段名（meta 里仍展示可读名字）。
 /// ponytail: profile_dir() 会 create_dir_all 在没设 env 时副作用意外；这里只读。
 pub fn profile_name_only() -> String {
@@ -505,7 +505,7 @@ pub async fn launch_with_kind_proxy(
 /// 扫新生 exe 的文件锁（OS error 5）、以及**多 agent 并发同 profile**（实测：3 个并发
 /// browse 只有 1 个能起，其余 ExitStatus(21)；browse 单次 5-15s，1s 单次重试必然再撞）。
 /// 退避序列 1/3/6/10/15s（累计 35s）盖住前一个实例的完整会话时长；打尽仍失败才上抛。
-/// 276：每轮重试打出上一次失败的**真实错误**（可见进度，不再静默五连）；打尽后列出
+/// 每轮重试打出上一次失败的**真实错误**（可见进度，不再静默五连）；打尽后列出
 /// 持 profile 锁的僵尸浏览器进程 PID——chromiumoxide Windows 子进程继承锁句柄，
 /// gsearch 退出后残留浏览器持续持锁，继续重试无效，只有精确 kill 才能解。
 async fn launch_with_retry(config: BrowserConfig, profile: &Path) -> Result<(Browser, Handler)> {
@@ -540,7 +540,7 @@ async fn launch_with_retry(config: BrowserConfig, profile: &Path) -> Result<(Bro
     Err(anyhow!(msg))
 }
 
-/// h90：profile 锁打尽重试后的裸失败消息（纯函数供单测锁出口建议）。
+/// profile 锁打尽重试后的裸失败消息（纯函数供单测锁出口建议）。
 /// B 受试者扣分点：干等 38s 失败后不知道「无需 Chrome 的 fetch」降级出口。
 fn lock_failure_msg(rounds: usize, last_err: &str) -> String {
     format!(
@@ -552,7 +552,7 @@ fn lock_failure_msg(rounds: usize, last_err: &str) -> String {
 /// 干等期每轮 warn 只有 handle.exe 指引，用户/agent 在第一轮就该看到降级出口。
 const LOCK_WARN_FETCH_EXIT: &str = "或用 `gsearch fetch <url>`（纯 HTTP 无需 Chrome）";
 
-/// 276：列出命令行引用了该 profile 的浏览器进程（僵尸持锁者），返回 "PID=… 进程名" 行集。
+/// 列出命令行引用了该 profile 的浏览器进程（僵尸持锁者），返回 "PID=… 进程名" 行集。
 /// 只诊断不 kill——精确 PID 交给用户处理（禁 taskkill /IM chrome.exe 全杀：OMP daemon 等
 /// 无关会话共用进程名，全杀误伤）。非 Windows / 枚举失败 / 无命中 → None。
 fn diagnose_lock_holders(profile: &Path) -> Option<String> {
@@ -661,7 +661,7 @@ async fn apply_stealth_patches(page: &chromiumoxide::Page) {
     }
 }
 /// 在独立 task 里持续 poll handler（chromiumoxide 要求，否则 CDP 通道会卡住）
-/// Low③：首个 error event 改 continue（仅致命 close 事件 break）——chromiumoxide 0.9.1
+/// 首个 error event 改 continue（仅致命 close 事件 break）——chromiumoxide 0.9.1
 /// Stream<Item = Result<()>> 偶尔会冒出瞬态 WS Invalid message 等非致命错误，旧版 break
 /// 让 handler 永久挂掉，所有后续 CDP 命令变成 -32000（接收端 gone）。改成 continue 后
 /// 让 handler 持续 poll；handler 自然在 closing 时返回 None 走完循环。
@@ -677,7 +677,7 @@ pub fn spawn_handler(handler: Handler) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// xt2：统一 new_page 入口——建 about:blank 页后立刻开 focus emulation（CDP
+/// 统一 new_page 入口——建 about:blank 页后立刻开 focus emulation（CDP
 /// Emulation.setFocusEmulationEnabled，jev-ultrafast 同款），防隐藏 tab 被 Chrome
 /// 定时器节流（shell 多 tab / swap_to_headed 重建页场景；headless 单页本就不节流，
 /// 开了无副作用）。emulation 失败只 warn 不 abort：防节流是性能加固不是正确性路径
@@ -696,14 +696,14 @@ pub async fn open_page(browser: &Browser) -> Result<chromiumoxide::Page> {
 ///
 /// M16 压测发现：chromiumoxide 0.9.1 在 Windows 上 close + wait 后 child 仍可能残留
 /// （handler 退出循环但未给 chrome 发 CDP Browser.close 命令，kill_on_drop 仅 Unix 生效）。
-/// Low②：曾有 `kill_residual_chrome_strict()` 跑 `taskkill /IM chrome.exe /T /F`——会误杀
+/// 曾有 `kill_residual_chrome_strict()` 跑 `taskkill /IM chrome.exe /T /F`——会误杀
 /// 用户主 Chrome（不是本 profile 的实例），已被审计删除。Chrome 残留收口一律走
 /// `graceful_close`（per-进程 close + wait + kill 兜底，不动用户主实例）。
 /// 关 Chrome 并等进程死透。chromiumoxide 0.9.1 的 close 只断 CDP 不保证杀子进程树；
 /// 调 kill() 兜底（公开 API，browser/mod.rs:315）。顶层命令（search/browse/login/dl）
 /// + shell 退出统一走这条，避免下一次 launch 撞 profile 锁。
 ///
-/// M1：wait 加 5s tokio 超时——chromiumoxide 的 wait 在 Windows 上挂死历史踩坑
+/// wait 加 5s tokio 超时——chromiumoxide 的 wait 在 Windows 上挂死历史踩坑
 /// （kill_on_drop 仅 Unix 生效；close 后子进程未必立刻退）；超时后强制走 kill 分支，
 /// 避免 graceful_close 自身成 hang 源。
 pub async fn graceful_close(browser: &mut Browser) {

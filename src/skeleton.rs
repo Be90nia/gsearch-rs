@@ -47,7 +47,7 @@ pub struct AdaptiveRead {
 
 const SEL_HEADINGS: &str = "h1, h2, h3";
 const SEL_P: &str = "p";
-/// 9as：代码块收集（<pre> 覆盖 docs.rs rustdoc 与 GitHub md 围栏块——内层 <code> 文本已被
+/// 代码块收集（<pre> 覆盖 docs.rs rustdoc 与 GitHub md 围栏块——内层 <code> 文本已被
 /// pre 的 text 覆盖；行内 <code> 本就在 <p> 文本里，不重复收）。
 const SEL_PRE: &str = "pre";
 /// ①打回轮1：GitHub issues/PR 主评论容器（新旧两代 markup 各占其一；URL gate 在调用方）。
@@ -61,7 +61,7 @@ const MEDIUM_TAKE: usize = 10;     // 10..=50 给前 MEDIUM_TAKE 段
 const LONG_TAKE: usize = 5;        // > 50 给前 LONG_TAKE 段
 const LONG_THRESHOLD: usize = 50;
 
-/// 9as：代码块预算——只收前 2 块（文档页首两块 = 函数签名 + 首个 Example）、
+/// 代码块预算——只收前 2 块（文档页首两块 = 函数签名 + 首个 Example）、
 /// 单块 1500 字符封顶（防 minified 巨块把摘要吃光），超长尾部标注截断。
 const CODE_EXAMPLE_MAX_BLOCKS: usize = 2;
 const CODE_EXAMPLE_BLOCK_MAX_CHARS: usize = 1500;
