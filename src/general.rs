@@ -86,15 +86,12 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
                 postproc::read_full_text(&page).await?
             };
             if opts.json {
-                let (browser_path, resolved_kind) = crate::resolve_browser_meta(opts.browser);
                 let meta = gsearch::types::MetaOutput {
                     tool: "gsearch",
                     version: env!("CARGO_PKG_VERSION"),
                     // browse 侧 query 恒空（schema 约定同 browse/dl）
                     query: String::new(),
                     profile: gsearch::browser::profile_name_only(),
-                    browser_kind: format!("{resolved_kind:?}"),
-                    browser_path: browser_path.to_string_lossy().into_owned(),
                     proxy: opts.proxy.clone(),
                     humanize: false,
                     limit: 0,

@@ -367,9 +367,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         return cmd_search_batch(args).await;
     }
     let started = std::time::Instant::now();
-    // M14-1B：早解析浏览器路径 → meta 头部字段（与 launch 实际选用的 kind 一致）。
     let browser_kind = browser_arg_to_kind(args.browser);
-    let (browser_path, resolved_kind) = resolve_browser_meta(browser_kind);
     // clap 保证位置参数 ≥1、上面分支保证 =1：单查询路径沿用原行为
     let query = args.query.first().cloned().unwrap_or_default();
     let recency = args.recency.map(gsearch::search::Recency::from);
@@ -386,7 +384,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     if matches!(searxng, gsearch::search::SearxngAttempt::CircuitBroken) {
         if json_mode {
             // stderr 诊断行已由 try_searxng 打（豁免未来任何静默策略）
-            emit_searxng_degraded_json(&query, &args, &browser_path, &resolved_kind, proxy.clone(), recency, started.elapsed().as_millis());
+            emit_searxng_degraded_json(&query, &args, proxy.clone(), recency, started.elapsed().as_millis());
         }
         // 人读模式 stdout 不打假结果；退出码 2 = 无结果语义族
         return Ok(ExitCode::from(2));
@@ -450,7 +448,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             gsearch::search::SearchOutcome::CaptchaTimeout => {
                 // 输出 captcha_timeout JSON（Agent 看到 status 字段就知道等人解超时）
                 if json_mode {
-                    emit_captcha_timeout_json(&query, &args, &browser_path, &resolved_kind, proxy.clone(), recency, started.elapsed().as_millis());
+                    emit_captcha_timeout_json(&query, &args, proxy.clone(), recency, started.elapsed().as_millis());
                 } else {
                     eprintln!("error: CAPTCHA 亲解超时（{}s）；profile 已养熟，再次执行会跳过 CAPTCHA",
                         gsearch::search::CAPTCHA_TIMEOUT_SECS);
@@ -477,8 +475,6 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         version: env!("CARGO_PKG_VERSION"),
         query: query.clone(),
         profile: gsearch::browser::profile_name_only(),
-        browser_kind: format!("{resolved_kind:?}"),
-        browser_path: browser_path.to_string_lossy().into_owned(),
         proxy: proxy.clone(),
         humanize: args.humanize,
         limit: args.limit,
@@ -583,29 +579,15 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     }
 }
 
-/// 早解析浏览器路径 → meta 头部字段（与 launch 实际选用的 kind 一致）；只探测不启动。
-/// batch 模式同样用它填 meta（batch 全程零浏览器）。
-fn resolve_browser_meta(
-    browser_kind: Option<gsearch::browser::BrowserKind>,
-) -> (std::path::PathBuf, gsearch::browser::BrowserKind) {
-    match browser_kind {
-        Some(k) => gsearch::browser::find_specific(k)
-            .or_else(|| gsearch::browser::find_browser().ok())
-            .unwrap_or_else(|| {
-                // 兜底：连 find_browser 都失败 → 留空让 launch 自己报错。
-                (std::path::PathBuf::new(), k)
-            }),
-        None => gsearch::browser::find_browser().unwrap_or_else(|_| {
-            (std::path::PathBuf::new(), gsearch::browser::BrowserKind::Chrome)
-        }),
-    }
-}
-
 /// e7c：`similar <url>`——启发式派生查询（title 关键词，SearXNG 单查 + 词重合/同域重排）。
 /// JSON 信封 = 常规 envelope + 顶层 similar_of/note 注解（0mf to_value 手法，不动公共结构）。
 async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode> {
+    // qbw：非 URL 入参会退化成 site:<garbage> 派生查询白烧 token，发起前拒掉
+    if !gsearch::search::looks_like_url(&url) {
+        eprintln!("error: 输入应为 URL（如 https://example.com/page）：{url}");
+        return Ok(ExitCode::from(2));
+    }
     let started = std::time::Instant::now();
-    let (browser_path, resolved_kind) = resolve_browser_meta(None);
     let (mut hits, derived_query) =
         gsearch::search::similar(&url, limit).await.map_err(anyhow::Error::msg)?;
     // cw8 同款：snippet cap 装配层统一
@@ -626,8 +608,6 @@ async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode>
         version: env!("CARGO_PKG_VERSION"),
         query: derived_query,
         profile: gsearch::browser::profile_name_only(),
-        browser_kind: format!("{resolved_kind:?}"),
-        browser_path: browser_path.to_string_lossy().into_owned(),
         proxy: None,
         humanize: false,
         limit,
@@ -662,7 +642,6 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
     // 3gw：JSON 默认，--human 切人读
     let json_mode = !args.human;
     let started = std::time::Instant::now();
-    let (browser_path, resolved_kind) = resolve_browser_meta(browser_arg_to_kind(args.browser));
     let recency = args.recency.map(gsearch::search::Recency::from);
     let outcomes = gsearch::search::run_batch(&args.query, args.limit, recency).await;
     let elapsed_ms = started.elapsed().as_millis();
@@ -691,8 +670,6 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
                 version: env!("CARGO_PKG_VERSION"),
                 query: query.clone(),
                 profile: profile.clone(),
-                browser_kind: format!("{resolved_kind:?}"),
-                browser_path: browser_path.to_string_lossy().into_owned(),
                 // batch 全程纯 HTTP 直连局域网 searxng（searxng.rs 固定 no_proxy），代理字段恒空
                 proxy: None,
                 humanize: args.humanize,
@@ -791,8 +768,6 @@ async fn ensure_search_browser<'a>(
 fn emit_captcha_timeout_json(
     query: &str,
     args: &SearchArgs,
-    browser_path: &std::path::Path,
-    resolved_kind: &gsearch::browser::BrowserKind,
     proxy: Option<String>,
     recency: Option<gsearch::search::Recency>,
     elapsed_ms: u128,
@@ -802,8 +777,6 @@ fn emit_captcha_timeout_json(
         version: env!("CARGO_PKG_VERSION"),
         query: query.to_string(),
         profile: gsearch::browser::profile_name_only(),
-        browser_kind: format!("{resolved_kind:?}"),
-        browser_path: browser_path.to_string_lossy().into_owned(),
         proxy,
         humanize: args.humanize,
         limit: args.limit,
@@ -829,8 +802,6 @@ fn emit_captcha_timeout_json(
 fn emit_searxng_degraded_json(
     query: &str,
     args: &SearchArgs,
-    browser_path: &std::path::Path,
-    resolved_kind: &gsearch::browser::BrowserKind,
     proxy: Option<String>,
     recency: Option<gsearch::search::Recency>,
     elapsed_ms: u128,
@@ -840,8 +811,6 @@ fn emit_searxng_degraded_json(
         version: env!("CARGO_PKG_VERSION"),
         query: query.to_string(),
         profile: gsearch::browser::profile_name_only(),
-        browser_kind: format!("{resolved_kind:?}"),
-        browser_path: browser_path.to_string_lossy().into_owned(),
         proxy,
         humanize: args.humanize,
         limit: args.limit,

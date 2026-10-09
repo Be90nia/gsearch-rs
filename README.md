@@ -32,7 +32,7 @@ gsearch search "..." --open 1
   - `score` 为 SearXNG 内部相关性分透传（agent 可按分筛序）；Google/DDG html 等无分来源此键缺席
   - `domain_class`：URL host 启发式（docs/github/wikipedia/blog/forum/video/news/qa/other），可按类筛权威源
 - 顶层 `run.status`：`ok / captcha_required / captcha_timeout / searxng_degraded / error`
-- `meta` 键缺席语义：`truncated:false`、空 `message`、`captcha_solved:false` 均不占键；`results_count` 已移除（`len(results)` 可推导）
+- `meta` 键缺席语义：`truncated:false`、空 `message`、`captcha_solved:false` 均不占键；`results_count` 已移除（`len(results)` 可推导）；`browser_path` / `browser_kind` 已移除（环境噪声，浏览器信息走 `gsearch doctor`）
 - `--compact-meta`（opt-in）：meta 裁到 query/limit/elapsed_ms/provider/recency 等少量键（`--verbose debug` 时强制全量排障）
 
 #### read 失败显式化
@@ -60,7 +60,7 @@ IP 可达时回退 Google 直爬；**若回退也零结果，信封 `run.status`
 gsearch similar "https://docs.rs/serde" --limit 3
 ```
 
-从 URL 提取 host 与 path 末段关键词派生查询（`docs.rs/serde` → 查 `serde`；纯域名退化 `site:<host>`），走 SearXNG 单查（超采样 limit×3，8..=15 条），按 **title 词重合 ×2 + 同域 ×1** 加权 stable 重排。**启发式派生查询，非 exa 神经 findSimilar**——预期管理：同主题词命中与同站相关页，不是语义相似。输出 = 常规搜索信封 + 每条 `similarity` 标注（启发来源，如 `title=serde; site=docs.rs`）+ 顶层 `similar_of`（源 URL）与 `note`。需配置 SearXNG（`searxng_url` / `GSEARCH_SEARXNG_URL`），不参与 Google/DDG 回退链。`meta.provider=searxng`、`meta.query` 回显派生查询。
+从 URL 提取 host 与 path 末段关键词派生查询（`docs.rs/serde` → 查 `serde`；纯域名退化 `site:<host>`），走 SearXNG 单查（超采样 limit×3，8..=15 条），按 **title 词重合 ×2 + 同域 ×1** 加权 stable 重排。**启发式派生查询，非 exa 神经 findSimilar**——预期管理：同主题词命中与同站相关页，不是语义相似。输入必须是 URL 形态：无 scheme 时接受 `docs.rs/serde` 这类 host/path 形态；明显非 URL（含空白、无点分 host 又无 path，如 `not-a-url`）**发起搜索前直接拒绝**（stderr 一行报错 + 退出码 2），不产出垃圾派生查询。输出 = 常规搜索信封 + 每条 `similarity` 标注（启发来源，如 `title=serde; site=docs.rs`）+ 顶层 `similar_of`（源 URL）与 `note`。需配置 SearXNG（`searxng_url` / `GSEARCH_SEARXNG_URL`），不参与 Google/DDG 回退链。`meta.provider=searxng`、`meta.query` 回显派生查询。
 
 ### read / browse 输出契约（供 agent 消费）
 
@@ -115,8 +115,8 @@ gsearch fetch https://docs-site/page --markdown # 正文 markdown（表格/标�
 | 退出码 | 含义 |
 |---|---|
 | 0 | 成功（batch = 全部条目成功；doctor = 全 PASS 或仅 WARN；verify 批量 = 全部 URL OK） |
-| 1 | 命令执行错误（error 链）/ batch 部分失败 / **search --read 读失败（JSON 顶层 read_error）** / **verify 批量部分失败** / doctor 有 FAIL / verify HTTP 状态不符 / **fetch JS 壳（预期行为，stderr 提示换 browse）** / **fetch 私网门拒（stderr 提示加 --allow-private）** |
-| 2 | 无结果 / batch 全部失败 / **verify 批量全部失败 / search SearXNG 熔断或回退后仍空（run.status=searxng_degraded）** / 启动早期错误（参数、配置、浏览器缺失） |
+| 1 | 命令执行错误（error 链）/ batch 部分失败 / **search --read 读失败（JSON 顶层 read_error）** / **verify 批量部分失败** / doctor 有 FAIL / **fetch JS 壳（预期行为，stderr 提示换 browse）** / **fetch 私网门拒（stderr 提示加 --allow-private）** |
+| 2 | 无结果 / batch 全部失败 / **verify 批量全部失败 / verify 单 URL HTTP 4xx/5xx（verdict=http_error）** / search SearXNG 熔断或回退后仍空（run.status=searxng_degraded） / 启动早期错误（参数、配置、浏览器缺失）/ **similar 输入非 URL 形态** |
 | 3 | search：CAPTCHA 亲解超时（约 120s，profile 已养熟重试可跳过）；**verify 特例**：SSL 握手失败 |
 | 4 | 仅 verify：DNS 解析失败（curl exit 6） |
 | 5 | 仅 verify：请求超时（curl exit 28；`--timeout` 可调，默认 5s） |
@@ -246,6 +246,8 @@ gsearch verify https://slow-cdn --timeout 10           # 超时秒数可调（�
 ```
 
 批量退出码对齐 batch search：`0` 全 OK / `1` 部分失败 / `2` 全失败；`--urls-file <path>` 每行一 URL（空行跳过）。
+
+verdict 分类语义（JSON `verdict` 键 / 单 URL 退出码）：`ok` = 2xx/3xx（curl -L 跟随后的终态，重定向链在 `redirect_chain`）；`http_error` = **4xx 与 5xx**（客户端或服务端错误，含 404/429/500/502/503——5xx 曾误判 ok，agent 应把非 ok 当故障处理）；`ssl_error` / `dns_error` / `timeout` / `other` = 传输层失败（curl exit 分类）。具体状态码看 `status` 字段，`error_detail` 带 `HTTP <code>` 简述。
 
 ### `gsearch update`（版本检查）
 

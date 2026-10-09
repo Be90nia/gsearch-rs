@@ -480,6 +480,19 @@ pub async fn similar(
     Ok((scored.into_iter().map(|(_, h)| h).collect(), query))
 }
 
+/// qbw：similar 入参形态闸——拒明显非 URL（含空白 / 无 scheme 又无点分 host 与 path 结构）。
+/// 宽松放行 `docs.rs/serde` 这类无 scheme 的 host/path 形态（与 split_site_keys 既有解析对齐）。
+pub fn looks_like_url(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.chars().any(char::is_whitespace) {
+        return false;
+    }
+    match s.split_once("://") {
+        Some((scheme, rest)) => !scheme.is_empty() && !rest.is_empty(),
+        None => s.contains('.') || s.contains('/'),
+    }
+}
+
 /// host 提取：去 scheme（含 protocol-relative //）、剥 www.、截 path 前；小写。解析不出返回空串。
 fn host_of(url: &str) -> String {
     let rest = url.split_once("//").map(|(_, r)| r).unwrap_or(url);
@@ -718,6 +731,20 @@ mod tests {
         assert_eq!(title_overlap("unrelated page", &kws), Vec::<String>::new());
         assert_eq!(host_of("https://docs.rs/serde?q=1"), "docs.rs");
         assert_eq!(host_of("https://www.Example.com/x"), "example.com", "www 剥离与同域比较归一一致");
+    }
+
+    /// qbw：验收点名用例——not-a-url 拒、带 scheme 过、无 scheme 的 host/path 形态
+    /// 向后兼容放行（既有 split_site_keys 接受），含空白句子拒。
+    #[test]
+    fn looks_like_url_gates_similar_input() {
+        use super::looks_like_url;
+        assert!(!looks_like_url("not-a-url"));
+        assert!(looks_like_url("https://tokio.rs"));
+        assert!(looks_like_url("docs.rs/serde"));
+        assert!(!looks_like_url("not a url"));
+        assert!(!looks_like_url(""));
+        assert!(!looks_like_url("https://"));
+        assert!(looks_like_url("https://docs.rs/serde"));
     }
 }
 

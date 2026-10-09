@@ -25,7 +25,7 @@ const MAX_REDIRECT_HOPS: u32 = 10;
 const FINAL_URL_MARKER: &str = "__GSEARCH_FINAL__";
 
 /// `gsearch verify <url>...`：HTTP HEAD（403/405 回退 GET）→ 5 项报告 + 分类退出码。
-/// 退出码：0=OK / 2=404 / 3=SSL 失败 / 4=DNS 失败 / 5=超时 / 1=其他；批量全 OK 0 / 否则 1。
+/// 退出码：0=OK / 2=HTTP 4xx/5xx / 3=SSL 失败 / 4=DNS 失败 / 5=超时 / 1=其他；批量全 OK 0 / 否则 1。
 pub fn cmd_verify(
     urls: &[String],
     json: bool,
@@ -419,9 +419,10 @@ fn classify_curl_exit(code: i32) -> u8 {
     }
 }
 
-/// spec 仅特判 404→2；其余拿到响应即 0，状态码由 report 携带（agent 读 status 字段）。
+/// 2xx/3xx（curl -L 跟随后的终态）= ok；4xx/5xx = http_error（buq：5xx 曾误判 ok，
+/// agent 把服务端故障当健康）。具体状态码由 report.status + error_detail 携带，不另设分类。
 fn exit_for_status(status: u16) -> u8 {
-    if status == 404 { 2 } else { 0 }
+    if status >= 400 { 2 } else { 0 }
 }
 
 #[cfg(test)]
@@ -491,11 +492,22 @@ content-type: text/html\r\n\
         assert_eq!(classify_curl_exit(1), 1);
     }
 
+    /// buq：verdict 分类表锁——2xx/3xx=ok（curl -L 终态），4xx/5xx 一律 http_error，
+    /// DNS/SSL/超时/other 分类不变（classify_curl_exit）。
     #[test]
-    fn exit_for_status_maps_404_only() {
+    fn exit_for_status_classification_table() {
         assert_eq!(exit_for_status(200), 0);
+        assert_eq!(exit_for_status(204), 0);
+        assert_eq!(exit_for_status(301), 0);
+        assert_eq!(exit_for_status(302), 0);
+        assert_eq!(exit_for_status(307), 0);
+        assert_eq!(exit_for_status(400), 2);
+        assert_eq!(exit_for_status(403), 2);
         assert_eq!(exit_for_status(404), 2);
-        assert_eq!(exit_for_status(500), 0);
+        assert_eq!(exit_for_status(429), 2);
+        assert_eq!(exit_for_status(500), 2);
+        assert_eq!(exit_for_status(502), 2);
+        assert_eq!(exit_for_status(503), 2);
     }
 
     /// 验收点名用例：超时 → ExitCode 5。回环起一个不 accept 的 listener，
@@ -590,7 +602,7 @@ content-type: text/html\r\n\
         assert_eq!(verdict_name(1), "other");
     }
 
-    /// 6a6：ok 无 error_detail；404 → HTTP 状态码简述；传输层失败 → 类别 + curl exit。
+    /// 6a6：ok 无 error_detail；4xx/5xx（buq）→ HTTP 状态码简述；传输层失败 → 类别 + curl exit。
     #[test]
     fn error_detail_classifies_failures() {
         let mut p = probe_fixture(false);

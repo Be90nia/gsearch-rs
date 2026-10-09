@@ -32,12 +32,6 @@ pub struct MetaOutput {
     #[serde(skip_serializing_if = "skip_compact_str")]
     /// `~/.gsearch/profiles/<name>/` 的末段名（未设 GSEARCH_PROFILE 时为 "default"）。
     pub profile: String,
-    #[serde(skip_serializing_if = "skip_compact_str")]
-    /// 浏览器大类："Chrome" 或 "Edge"。
-    pub browser_kind: String,
-    #[serde(skip_serializing_if = "skip_compact_str")]
-    /// 浏览器可执行文件绝对路径。
-    pub browser_path: String,
     #[serde(skip_serializing_if = "skip_compact_opt")]
     /// 代理 URL；直连时为 None → JSON null。
     pub proxy: Option<String>,
@@ -211,8 +205,6 @@ mod tests {
             version: "0.2.0",
             query: "python asyncio".into(),
             profile: "default".into(),
-            browser_kind: "Chrome".into(),
-            browser_path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
             proxy: None,
             humanize: false,
             limit: 10,
@@ -412,5 +404,15 @@ mod tests {
         assert!(arr[0].get("meta").is_none(), "v2 元素不应带 meta: {}", arr[0]);
         assert_eq!(arr[0]["status"], "ok");
         assert_eq!(arr[1]["status"], "error");
+    }
+
+    /// cm8：meta 不再携带 browser_path/browser_kind 环境噪声（77B×每命令的 token 税）；
+    /// 浏览器路径信息仍可经 `gsearch doctor` 获取。
+    #[test]
+    fn meta_omits_browser_keys() {
+        let meta = sample_meta();
+        let v: serde_json::Value = serde_json::to_value(&meta).unwrap();
+        assert!(v.get("browser_path").is_none(), "browser_path 应已移除: {}", v);
+        assert!(v.get("browser_kind").is_none(), "browser_kind 应已移除: {}", v);
     }
 }
