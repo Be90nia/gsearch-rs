@@ -771,13 +771,14 @@ dependencies = [
 
 [[package]]
 name = "gsearch"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chromiumoxide",
  "clap",
  "futures",
  "htmd",
+ "parking_lot",
  "reqwest",
  "scraper",
  "serde",

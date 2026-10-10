@@ -21,9 +21,11 @@ gsearch search "..." --open 1
 
 `--humanize` 默认随 stdout 自动（isatty 自动档）：**交互终端（人）默认启用**——搜索前随机访问 Wikipedia/GitHub/HN、滚动并短暂停留 + 指纹补丁；**管道/agent 调用（非 TTY）默认关闭**（快档，实测省 80s+）。显式 `--humanize` / `--no-humanize` 恒覆盖自动档；指纹补丁仅用于 search，不改变 browse/login。
 
-`--recency day|week|month|year` 时间过滤多 provider 生效：SearXNG 请求追加 `time_range`，Google SERP URL 追加 `tbs=qdr:d/w/m/y`，DDG html 表单追加 `df=d/w/m/y`；不传时请求 URL 与旧版逐字节一致。`site:` 等查询语法原样透传，无专属参数。batch 多查询同样生效（batch 仅 SearXNG 源）。`meta.recency` 回显本次过滤值；`meta.proxy` 回显代理——两者未传时**键真缺席**（ago：缺席语义执行到底，不输出 `null`）。
+`--recency day|week|month|year` 时间过滤多 provider 生效：SearXNG 请求追加 `time_range`，Google SERP URL 追加 `tbs=qdr:d/w/m/y`，DDG html 表单追加 `df=d/w/m/y`；不传时请求 URL 与旧版逐字节一致。`site:` 等查询语法原样透传，无专属参数。batch 多查询同样生效（batch 仅 SearXNG 源）。`meta.recency` 回显本次过滤值；`meta.proxy` 回显代理（**凭据脱敏**：`scheme://user:***@host`，v0.3.0）——两者未传时**键真缺席**（ago：缺席语义执行到底，不输出 `null`）。
 
 参数护栏：`--limit` 取 1..=100（SearXNG 单查最多 10 页×10 条，更大只会翻页白耗时）；`--read N` / `--browse N` 取 N≥1（`--read 0` / `--browse 0` 直接被 clap 拒绝）；`--read N` / `--browse N` 的 N > `--limit` 时在**发起搜索前**静态拒绝（结果数 ≤ limit 恒成立，参数校验 rc=2，d3u：零网络零浏览器）。空串/纯空白 query 在**发起任何网络前**拒绝（rc=2，单查询与 batch 两入口同拦，o1p）。
+
+**结果集导航门（v0.3.0）**：`--browse N` 的目标 URL 来自搜索结果 = 不可信输入（SEO 毒化防线），读前过与 `browse` 同款的 scheme 白名单 + 私网门；命中私网 rc=2 并提示 `--allow-private`（search 新增 flag，语义与 fetch/browse 对齐）。shell 会话 `click N` 同门。
 
 **L-1 `--read N` 与 `--browse N` 语义分立**：`--read N` 是 snippet-only（截前 N 条结果到输出，零浏览器，纯 HTTP 走完——盲测九 L 实测乱 URL 误用 `--read` 触浏览器 30s 超时已修）；`--browse N` 启浏览器读前 N 条结果的 URL（AdaptiveRead，承接旧 `--read N` 语义）。两者在 clap group "post" 互斥（`--read --browse` / `--browse --dl` 等同时传都拒）；`--headings-only` / `--from K` / `--excerpt N` / `--full` 仍只与 `--browse` 组合生效（snippet-only 路径下无视）。
 

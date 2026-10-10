@@ -631,6 +631,144 @@ mod tests {
         // --limit 缺值
     assert!(parse_search_args(&["q", "--limit"]).is_err());
     }
+
+    // ---------- P1-5：parse_shell_read_opts（read/browse 共用 flag 解析，纯函数） ----------
+
+    /// 合法 flag 全组合 + --from 0 边界（从头读是合法起点，非缺省态）+ 空参数全默认。
+    #[test]
+    fn parse_shell_read_opts_accepts_flags_and_from_zero() {
+        let o = parse_shell_read_opts(&["--full", "--json", "--headings-only", "--from", "100"], "read").unwrap();
+        assert!(o.full && o.json && o.headings_only);
+        assert_eq!(o.from, 100);
+        let o = parse_shell_read_opts(&["--from", "0"], "read").unwrap();
+        assert_eq!(o.from, 0);
+        let o = parse_shell_read_opts(&[], "browse").unwrap();
+        assert!(!o.full && !o.json && !o.headings_only && o.from == 0);
+    }
+
+    /// 未知 flag 必须报错（文案含 cmd 名 + flag 名）；--from 缺值/非数字必须报错。
+    /// 防 match 回归成 `_ => {}` 静默吞掉打错的 flag——`read --ful` 将静默按默认执行。
+    #[test]
+    fn parse_shell_read_opts_rejects_unknown_flag_and_bad_from() {
+        let e = parse_shell_read_opts(&["--ful"], "read").unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("read") && msg.contains("--ful"), "错误须含 cmd 名+flag: {msg}");
+        let e = parse_shell_read_opts(&["--jsonx"], "browse").unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("browse") && msg.contains("--jsonx"), "browse 同模板: {msg}");
+        assert!(format!("{:#}", parse_shell_read_opts(&["--from"], "read").unwrap_err()).contains("缺值"));
+        assert!(format!("{:#}", parse_shell_read_opts(&["--from", "abc"], "read").unwrap_err()).contains("非数字"));
+    }
+
+    // ---------- P1-6 / P1-7：cmd_dl 解析契约与 REPL 状态整替 ----------
+    // ShellCtx 持有 chromiumoxide Browser/Page，离线无法构造 → 契约以 #[ignore] live
+    // 锚点形式落盘（CI 不跑，手工验证有锚；postproc_live 同款先例）。
+    // 断言全部落在触网之前：解析错误 / N 越界 / 空态守卫 / scheme 门，零外网。
+
+    fn live_shell_ctx(
+        browser: Browser,
+        page: Page,
+        handler_task: Option<tokio::task::JoinHandle<()>>,
+        last_results: Vec<SearchResult>,
+    ) -> ShellCtx {
+        ShellCtx {
+            browser,
+            page,
+            last_results,
+            last_snap: Vec::new(),
+            current_url: String::new(),
+            handler_task,
+            human_solved: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn fixture_result(url: &str) -> SearchResult {
+        SearchResult {
+            title: "t".into(),
+            url: url.into(),
+            snippet: String::new(),
+            score: None,
+            domain_class: "other",
+        }
+    }
+
+    /// P1-6 + P1-7 离线契约（真 Chrome、零外网）：
+    /// dl 多余位置参数 / N=0 / N 越界 / -o 缺值 / 无 N 且 current_url 空 / scheme 门；
+    /// 空结果集 click 1 必越界（「旧结果复活」防线）；snap 空列表整替清旧 @eN refs。
+    /// 跑法：cargo test --bin gsearch shell_dl_parse_and_repl_state_live -- --ignored
+    #[ignore]
+    #[tokio::test]
+    async fn shell_dl_parse_and_repl_state_live() {
+        // chromiumoxide 0.9 铁序：launch → spawn_handler → open_page（不 spawn 则 new_page 永不 resolve）
+        let (browser, handler) = gsearch::browser::launch(true).await.expect("launch Chrome");
+        let handler_task = Some(gsearch::browser::spawn_handler(handler));
+        let page = gsearch::browser::open_page(&browser).await.expect("open page");
+        let mut ctx = live_shell_ctx(
+            browser,
+            page,
+            handler_task,
+            vec![fixture_result("ftp://x/a")], // scheme 白名单外 → dl 1 在触网前被拒
+        );
+
+        // P1-6：多余位置参数拒绝（不暗中吞掉 → `dl 1 2` 不得静默下第 2 条）
+        let e = cmd_dl(&["1", "2"], &mut ctx).await.unwrap_err();
+        assert!(format!("{e:#}").contains("多余位置参数"), "{e:#}");
+        // P1-6：N=0 与越界必须报错（不 panic、不错位下载）
+        assert!(format!("{:#}", cmd_dl(&["0"], &mut ctx).await.unwrap_err()).contains("越界"));
+        assert!(format!("{:#}", cmd_dl(&["99"], &mut ctx).await.unwrap_err()).contains("越界（结果数 1）"));
+        // P1-6：-o 缺值
+        assert!(format!("{:#}", cmd_dl(&["-o"], &mut ctx).await.unwrap_err()).contains("缺值"));
+        // P1-6：无 N 且 current_url 空
+        assert!(format!("{:#}", cmd_dl(&[], &mut ctx).await.unwrap_err()).contains("缺 N/URL"));
+        // P1-6：dl 1 与顶层 dl 同款 scheme 门（ftp 白名单外，触网前拒绝）
+        let e = cmd_dl(&["1"], &mut ctx).await.unwrap_err();
+        assert!(format!("{e:#}").contains("拒绝非 http/https"), "{e:#}");
+
+        // P1-7：空结果集守卫——search 空结果后 last_results 整替为 []，click 1 必越界报错。
+        // 若整替回归成「空时保留旧结果」，agent 会点到上一条查询的死链接。
+        ctx.last_results.clear();
+        let e = cmd_click(&["1"], &mut ctx).await.unwrap_err();
+        assert!(format!("{e:#}").contains("越界"), "空结果集 click 1 必须越界报错: {e:#}");
+
+        // P1-7③：snap 空列表也整替（旧 @eN ref 对新页面失效必须清掉；about:blank 离线可达）
+        ctx.last_snap = vec![SnapElem {
+            ref_id: "e1".into(),
+            tag: "a".into(),
+            text: "old".into(),
+            href: "https://stale.example/x".into(),
+            id: String::new(),
+            index: 0,
+        }];
+        cmd_snap(&mut ctx).await.expect("snap about:blank 应成功");
+        assert!(ctx.last_snap.is_empty(), "空 snap 必须整替清空旧 @eN refs");
+
+        gsearch::browser::graceful_close(&mut ctx.browser).await;
+    }
+
+    /// P1-7① 真链路锚点：真 search 空词路径后 last_results 必须整替为空 → click 1 越界。
+    /// 需真 Chrome + 外网（Google 直爬或已配置 SearXNG）；CI 不跑，手工验证有锚。
+    /// 跑法：cargo test --bin gsearch shell_search_empty_replaces_results_live -- --ignored
+    #[ignore]
+    #[tokio::test]
+    async fn shell_search_empty_replaces_results_live() {
+        // chromiumoxide 0.9 铁序：launch → spawn_handler → open_page
+        let (browser, handler) = gsearch::browser::launch(true).await.expect("launch Chrome");
+        let handler_task = Some(gsearch::browser::spawn_handler(handler));
+        let page = gsearch::browser::open_page(&browser).await.expect("open page");
+        let mut ctx = live_shell_ctx(browser, page, handler_task, vec![fixture_result("https://old.example/a")]);
+
+        cmd_search(&["gsearchb39-empty-probe-zzzzqqqq", "--limit", "3"], &mut ctx)
+            .await
+            .expect("空词探测查询应成功返回（需外网；撞码/熔断时换环境手跑）");
+        assert!(
+            ctx.last_results.is_empty(),
+            "空 search 必须整替清空旧结果（不得保留上一条查询的结果）"
+        );
+        let e = cmd_click(&["1"], &mut ctx).await.unwrap_err();
+        assert!(format!("{e:#}").contains("越界"), "空结果后 click 1 必须越界报错: {e:#}");
+
+        gsearch::browser::graceful_close(&mut ctx.browser).await;
+    }
 }
 
 
