@@ -100,7 +100,9 @@ enum EnvelopeArg {
 enum Command {
     /// Google/SearXNG 搜索（`--browse N` 默认 AdaptiveRead；`--read N` 仅截前 N 条 snippet 不启浏览器）
     Search(SearchArgs),
-    /// 任意 URL → 渲染后页面正文（默认 AdaptiveRead）
+    /// 任意 URL → 渲染后页面正文（默认 AdaptiveRead）。别名 read：
+    /// 本命令 = 完整正文（Chrome 渲染）；`search --read N` 是另一语义（取搜索结果 snippet），勿混淆。
+    #[command(visible_alias = "read")]
     Browse {
         url: String,
         /// 纯 innerText 全文（50000 cap）；与 --headings-only 互斥
@@ -207,6 +209,10 @@ enum Command {
         /// meta.format="markdown" 标注；无 flag 输出逐字节不变。
         #[arg(long, default_value_t = false)]
         markdown: bool,
+        /// 正文 = HTTP 响应体原样（零提取/零清洗）——精确性自证的逃生门，提取器动了什么对比它即可自证。
+        /// 与 --markdown/--include/--json-keys 互斥；--max-chars 仍约束 text（截断 meta 如实标注）。
+        #[arg(long, default_value_t = false, conflicts_with_all = ["markdown", "include", "json_keys"])]
+        raw: bool,
         /// 正文字符预算（text 字段上限；超限截断并在 meta.truncated/omitted 如实标注）。
         /// 作用顺序：--json-keys 投影先替换 text，本预算再对投影产物计（截断按投影后长度算）。
         #[arg(long, default_value_t = 50_000, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=10_000_000))]
@@ -391,13 +397,14 @@ async fn main() -> ExitCode {
         Command::Verify { url, human, timeout, urls_file, .. } => {
             gsearch::verify::cmd_verify(&url, !human, proxy.as_deref(), timeout, urls_file.as_deref())
         }
-        Command::Fetch { url, human, allow_private, include, markdown, max_chars, timeout, retry, json_keys, .. } => {
+        Command::Fetch { url, human, allow_private, include, markdown, raw, max_chars, timeout, retry, json_keys, .. } => {
             fetch::cmd_fetch(&url, &fetch::FetchOpts {
                 json: !human,
                 proxy: proxy.clone(),
                 allow_private,
                 include,
                 markdown,
+                raw,
                 max_chars,
                 timeout_secs: timeout,
                 retry,
@@ -1826,5 +1833,44 @@ mod tests {
         let mc = help_of("max_chars");
         assert!(mc.contains("投影先替换 text"), "作用顺序句缺失: {mc}");
         assert!(mc.contains("投影后长度"), "顺序细节句缺失: {mc}");
+    }
+
+    /// FixG19 JJ：--raw 与 --markdown/--include 互斥（逃生门不容提取参数混入；
+    /// --json-keys 同理——投影也是变换，静默忽略会成 silent failure）。
+    #[test]
+    fn fetch_raw_conflicts_with_extraction_flags() {
+        assert!(
+            Cli::try_parse_from(["gsearch", "fetch", "https://e.test/", "--raw", "--markdown"]).is_err(),
+            "--raw --markdown 必须被拒"
+        );
+        assert!(
+            Cli::try_parse_from(["gsearch", "fetch", "https://e.test/", "--raw", "--include", "main"]).is_err(),
+            "--raw --include 必须被拒"
+        );
+        assert!(
+            Cli::try_parse_from(["gsearch", "fetch", "https://e.test/", "--raw", "--json-keys", "a.b"]).is_err(),
+            "--raw --json-keys 必须被拒"
+        );
+        let cli = Cli::try_parse_from(["gsearch", "fetch", "https://e.test/", "--raw"]).unwrap();
+        let Command::Fetch { raw, .. } = cli.cmd else { panic!("expected fetch") };
+        assert!(raw, "--raw 单独使用必须解析成功且置位");
+    }
+
+    /// FixG19 II/LL：read 是 browse 的 visible_alias——`gsearch read <url>` 与
+    /// `gsearch browse <url>` 解析完全等价，且顶层命令列表可见 read。
+    #[test]
+    fn read_alias_parses_equivalent_to_browse() {
+        let via_read = Cli::try_parse_from(["gsearch", "read", "https://e.test/a.html", "--markdown"]).unwrap();
+        let via_browse =
+            Cli::try_parse_from(["gsearch", "browse", "https://e.test/a.html", "--markdown"]).unwrap();
+        assert_eq!(
+            format!("{:?}", via_read.cmd),
+            format!("{:?}", via_browse.cmd),
+            "read 与 browse 解析结果必须完全等价"
+        );
+        // 顶层 help 命令列表含 read（visible_alias 渲染进子命令列表）
+        use clap::CommandFactory;
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("read"), "顶层 help 应含 read 别名: {}", &help[..help.len().min(2000)]);
     }
 }

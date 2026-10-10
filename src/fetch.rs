@@ -50,6 +50,11 @@ pub struct FetchOpts {
     /// 正文以 markdown 输出（表格/标题/链接保结构）。--json 下 text 字段换源为 markdown，
     /// meta.format="markdown" 标注；无 flag 时逐字节不变。
     pub markdown: bool,
+    /// FixG19 JJ：--raw 逃生门——text = HTTP 响应体原样（零提取/零清洗，meta.format="raw"）。
+    /// 精确性自证用：对比提取器改了什么全靠它。提取漏斗全部跳过（json_keys 投影/summary 剥除/
+    /// 正文提取/markdown/host 路由/include/锚点裁剪/JS 壳判定）；--max-chars 仍截断（meta 如实）；
+    /// 与 --markdown/--include/--json-keys 互斥（clap 拒）。PDF/二进制拒与 SSRF 门不绕（共享 GET 路径）。
+    pub raw: bool,
     /// 正文字符预算（text 上限；超限截断，meta.truncated/omitted 如实标注）。CLI 默认 50000。
     pub max_chars: usize,
     /// FixG10 J-1 + FixG11：单请求超时（秒）；CLI 默认 30（盲测十 P0-3 GitHub 抖动自愈），
@@ -77,6 +82,7 @@ impl Default for FetchOpts {
             allow_private: false,
             include: None,
             markdown: false,
+            raw: false,
             max_chars: 50_000,
             timeout_secs: 30,
             retry: 1,
@@ -412,6 +418,12 @@ async fn fetch_one_attempt(
     }
     drop(stream);
     let mut html = String::from_utf8_lossy(&buf).into_owned();
+    let limit = opts.max_chars;
+    // FixG19 JJ：--raw 逃生门——body 原样进 text，提取漏斗全部跳过（含 JS 壳判定：
+    // 用户显式要原始字节时「正文太短需渲染」的提示无意义）。body 硬上限截断照常如实进 meta。
+    if opts.raw {
+        return Ok(FetchOne::Done(raw_fetched(url, &html, limit, truncated)));
+    }
     let mut json_projected = false;
     // FixG10 J-2：--json-keys 在 process_html 前投影——先把 body 按 JSONPath 缩成小子集，
     // 再交给 cap_chars_json 走 brace 边界截断；不投影直接走 5000 字符截断会切到 JSON
@@ -438,7 +450,6 @@ async fn fetch_one_attempt(
     if is_html {
         html = strip_summary_elements(&html);
     }
-    let limit = opts.max_chars;
     let mut fetched = process_html(url, &html, is_html, limit);
     fetched.truncated_by_json_keys = json_projected;
     fetched.github_comment_hint = github_thread_comment_gap(url);
@@ -490,6 +501,7 @@ async fn fetch_one_attempt(
                 include_hit: Some(true),
                 include_hits: Some(hits),
                 markdown: opts.markdown,
+                raw: false,
                 github_comment_hint: fetched.github_comment_hint,
                 anchor_crop_range: None,
                 truncated_by_json_keys: false,
@@ -531,6 +543,34 @@ async fn fetch_one_attempt(
         return Ok(FetchOne::JsShell);
     }
     Ok(FetchOne::Done(fetched))
+}
+
+/// FixG19：--raw 逃生门的产物构造——body 逐字符原样进 text（cap_chars 截断 meta 如实），
+/// body 硬上限截断（FETCH_BODY_LIMIT）照常累计进 truncated/omitted。
+fn raw_fetched(url: &str, body: &str, limit: usize, body_truncated: bool) -> Fetched {
+    let (text, t, o, off) = cap_chars(body, limit);
+    let mut f = Fetched {
+        url: url.to_string(),
+        title: String::new(),
+        text,
+        truncated: t,
+        omitted: o,
+        truncated_at_offset: t.then_some(off),
+        include_hit: None,
+        include_hits: None,
+        markdown: false,
+        raw: true,
+        github_comment_hint: None,
+        anchor_crop_range: None,
+        truncated_by_json_keys: false,
+        auto_include_applied: None,
+        include_overridden_by_user: false,
+    };
+    if body_truncated {
+        f.truncated = true;
+        f.omitted = f.omitted.saturating_add(FETCH_BODY_LIMIT);
+    }
+    f
 }
 
 /// `gsearch fetch <url>...`：GET → 轻量正文提取 → 人读 / --json 输出。
@@ -699,6 +739,9 @@ fn fetched_json(f: &Fetched) -> serde_json::Value {
     if f.markdown {
         meta["format"] = serde_json::json!("markdown");
     }
+    if f.raw {
+        meta["format"] = serde_json::json!("raw");
+    }
     if let Some(hint) = &f.github_comment_hint {
         meta["github_comments_missing"] = serde_json::json!(true);
         meta["github_comments_hint"] = serde_json::json!(hint);
@@ -761,6 +804,8 @@ struct Fetched {
     include_hits: Option<usize>,
     /// text 字段是否已是 markdown（--json 据此写 meta.format）。
     markdown: bool,
+    /// FixG19：--raw 逃生门标记（--json 据此写 meta.format="raw"；与 markdown 互斥）。
+    raw: bool,
     /// GitHub issue/PR 页的评论区缺失信号（None = 非 thread 页，键缺席）。
     github_comment_hint: Option<String>,
     /// FixG10 L-2：URL `#N-M` 锚点裁剪范围（1-based 行号，含端点）；未命中锚点 None。
@@ -1194,6 +1239,7 @@ fn process_html(url: &str, html: &str, is_html: bool, limit: usize) -> Fetched {
         include_hit: None,
         include_hits: None,
         markdown: false,
+        raw: false,
         github_comment_hint: None,
         anchor_crop_range: None,
         truncated_by_json_keys: false,
@@ -1927,6 +1973,7 @@ mod tests {
             include_hit: None,
             include_hits: None,
             markdown: false,
+            raw: false,
             github_comment_hint: github_thread_comment_gap("https://github.com/tokio-rs/tokio/issues/7787"),
             anchor_crop_range: None,
             truncated_by_json_keys: false,
@@ -1937,7 +1984,7 @@ mod tests {
         assert_eq!(v["meta"]["github_comments_missing"], serde_json::json!(true));
         assert!(v["meta"]["github_comments_hint"].as_str().unwrap().contains("api.github.com"));
 
-        let f2 = Fetched { url: "https://e.test/".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
+        let f2 = Fetched { url: "https://e.test/".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
         let v2 = fetched_json(&f2);
         assert!(v2["meta"].get("github_comments_missing").is_none(), "非 thread 页不得出键");
         assert!(v2["meta"].get("github_comments_hint").is_none());
@@ -1947,11 +1994,11 @@ mod tests {
     #[test]
     fn fetched_json_truncated_by_json_keys_flag() {
         // true：键出
-        let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: true, auto_include_applied: None, include_overridden_by_user: false };
+        let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: true, auto_include_applied: None, include_overridden_by_user: false };
         let v = fetched_json(&f);
         assert_eq!(v["meta"]["truncated_by_json_keys"], serde_json::json!(true));
         // false：键缺席
-        let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
+        let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
         let v2 = fetched_json(&f2);
         assert!(v2["meta"].get("truncated_by_json_keys").is_none(), "默认不得出键");
     }
@@ -1970,6 +2017,7 @@ mod tests {
             include_hit: None,
             include_hits: None,
             markdown: false,
+            raw: false,
             github_comment_hint: None,
             anchor_crop_range: None,
             truncated_by_json_keys,
@@ -2000,6 +2048,7 @@ mod tests {
             include_hit: None,
             include_hits: None,
             markdown: false,
+            raw: false,
             github_comment_hint: None,
             anchor_crop_range: None,
             truncated_by_json_keys,
@@ -2022,15 +2071,15 @@ mod tests {
     #[test]
     fn fetched_json_truncated_at_offset_emits_when_truncated() {
         // truncated=true + Some(off) → meta 出键
-        let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: true, omitted: 100, truncated_at_offset: Some(3000), include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
+        let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: true, omitted: 100, truncated_at_offset: Some(3000), include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
         let v = fetched_json(&f);
         assert_eq!(v["meta"]["truncated_at_offset"], serde_json::json!(3000));
         // truncated=true + None → 键缺席（不与 truncated 键语义重叠）
-        let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: true, omitted: 100, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
+        let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: true, omitted: 100, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
         let v2 = fetched_json(&f2);
         assert!(v2["meta"].get("truncated_at_offset").is_none());
         // truncated=false → 键缺席
-        let f3 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
+        let f3 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
         let v3 = fetched_json(&f3);
         assert!(v3["meta"].get("truncated_at_offset").is_none());
     }
@@ -2223,11 +2272,11 @@ mod tests {
     /// 覆盖发生时 auto_include_applied 恒在（label 保留）。
     #[test]
     fn fetched_json_include_overridden_by_user_emits_only_when_true() {
-        let overridden = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: Some(true), include_hits: Some(1), markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: Some("docs.rs".into()), include_overridden_by_user: true };
+        let overridden = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: Some(true), include_hits: Some(1), markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: Some("docs.rs".into()), include_overridden_by_user: true };
         let v = fetched_json(&overridden);
         assert_eq!(v["meta"]["auto_include_applied"], serde_json::json!("docs.rs"), "覆盖时 label 恒在");
         assert_eq!(v["meta"]["include_overridden_by_user"], serde_json::json!(true));
-        let plain = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
+        let plain = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
         let v2 = fetched_json(&plain);
         assert!(v2["meta"].get("include_overridden_by_user").is_none(), "无覆盖不得出键");
         assert!(v2["meta"].get("auto_include_applied").is_none(), "host 未命中不得出键");
@@ -2290,6 +2339,7 @@ mod tests {
             include_hit: None,
             include_hits: None,
             markdown: false,
+            raw: false,
             github_comment_hint: None,
             anchor_crop_range: None,
             truncated_by_json_keys: false,
@@ -2313,6 +2363,7 @@ mod tests {
             include_hit: None,
             include_hits: None,
             markdown: false,
+            raw: false,
             github_comment_hint: None,
             anchor_crop_range: None,
             truncated_by_json_keys: false,
@@ -2348,6 +2399,7 @@ mod tests {
             include_hit: None,
             include_hits: None,
             markdown: false,
+            raw: false,
             github_comment_hint: None,
             anchor_crop_range: None,
             truncated_by_json_keys: false,
@@ -2386,6 +2438,7 @@ mod tests {
             include_hit: None,
             include_hits: None,
             markdown: false,
+            raw: false,
             github_comment_hint: None,
             anchor_crop_range: None,
             truncated_by_json_keys: false,
@@ -2425,6 +2478,7 @@ mod tests {
             include_hit: None,
             include_hits: None,
             markdown: false,
+            raw: false,
             github_comment_hint: None,
             anchor_crop_range: None,
             truncated_by_json_keys: false,
@@ -2455,15 +2509,15 @@ mod tests {
     #[test]
     fn fetched_json_auto_include_applied_emits_when_set() {
         // Some("github")：meta 出键
-        let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: Some("github".into()), include_overridden_by_user: false };
+        let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: Some("github".into()), include_overridden_by_user: false };
         let v = fetched_json(&f);
         assert_eq!(v["meta"]["auto_include_applied"], serde_json::json!("github"));
         // Some("docs.rs")：meta 出键
-        let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: Some("docs.rs".into()), include_overridden_by_user: false };
+        let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: Some("docs.rs".into()), include_overridden_by_user: false };
         let v2 = fetched_json(&f2);
         assert_eq!(v2["meta"]["auto_include_applied"], serde_json::json!("docs.rs"));
         // None：键缺席（默认输出逐键不变）
-        let f3 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
+        let f3 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
         let v3 = fetched_json(&f3);
         assert!(v3["meta"].get("auto_include_applied").is_none(), "默认不得出键");
     }
@@ -2653,6 +2707,7 @@ mod tests {
             include_hit: Some(false),
             include_hits: None,
             markdown: false,
+            raw: false,
             github_comment_hint: None,
             anchor_crop_range: None,
             truncated_by_json_keys: false,
@@ -2680,6 +2735,7 @@ mod tests {
             include_hit: Some(true),
             include_hits: Some(1),
             markdown: false,
+            raw: false,
             github_comment_hint: None,
             anchor_crop_range: None,
             truncated_by_json_keys: false,
@@ -2772,5 +2828,35 @@ mod tests {
         let single = project_json_paths(&payload, &["items.0.title".into()]).unwrap();
         assert_eq!(single["title"], serde_json::json!("a"));
         assert_eq!(single.as_object().unwrap().len(), 1);
+    }
+
+    /// FixG19 JJ：--raw 逃生门——text = body 逐字符原样（标签/实体/NBSP 全保留，零提取零清洗）；
+    /// --max-chars 照常约束 raw（截断 meta 如实）；body 硬上限（FETCH_BODY_LIMIT）截断照常累计。
+    #[test]
+    fn raw_fetched_keeps_body_verbatim() {
+        let body = "<!DOCTYPE html>\n<html><body>  raw &amp; <b>tags</b>\u{a0}</body></html>";
+        let f = raw_fetched("https://e.test/x", body, 50_000, false);
+        assert_eq!(f.text, body, "raw 模式 text 必须逐字符等于响应体");
+        assert!(f.raw && !f.markdown, "raw 置位、markdown 不置位");
+        assert!(!f.truncated && f.omitted == 0 && f.truncated_at_offset.is_none(), "未截断时 meta 零标记");
+        // --max-chars 照常约束 raw
+        let f2 = raw_fetched("https://e.test/x", body, 10, false);
+        assert!(f2.truncated && f2.omitted > 0 && f2.truncated_at_offset == Some(10), "cap 截断如实标注");
+        assert_eq!(f2.text.chars().count(), 10, "text 截到预算内");
+        // body 硬上限截断（字节级）如实累计进 meta
+        let f3 = raw_fetched("https://e.test/x", body, 50_000, true);
+        assert!(f3.truncated && f3.omitted >= FETCH_BODY_LIMIT, "body 硬上限截断累计: omitted={}", f3.omitted);
+    }
+
+    /// FixG19：--json 下 meta.format="raw"（与 format="markdown" 同键位；两者互斥由 clap 保证）。
+    #[test]
+    fn fetched_json_marks_raw_format() {
+        let f = raw_fetched("https://e.test/x", "<html>hi</html>", 50_000, false);
+        let v = fetched_json(&f);
+        assert_eq!(v["meta"]["format"], serde_json::json!("raw"));
+        assert_eq!(v["meta"]["content_untrusted"], serde_json::json!(true), "content_untrusted 恒在");
+        // 非 raw 路径不得出 format="raw" 键（默认输出结构不变）
+        let plain = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
+        assert!(fetched_json(&plain)["meta"].get("format").is_none(), "非 raw 非 markdown 不得出 format 键");
     }
 }
