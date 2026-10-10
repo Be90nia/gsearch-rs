@@ -188,6 +188,8 @@ enum Command {
     },
     /// `gsearch fetch <url>...`：GET → 轻量正文提取 → 人读 / --json 输出。
     /// 单 URL = JSON 扁平对象（含 status:"ok"）；多 URL = batch 并发数组（元素含 status；上限 5、单条失败不阻塞，退出码 0 全成功 / 1 部分失败 / 2 全失败）。
+    /// batch 与 --json-keys 组合：投影对每个 URL 独立生效，batch 元素 text 为**逐元素对象**（如 [{"tag_name":"v1",…},…]），
+    /// 与单 URL `[*].field` 的按字段并列数组形态不同；两者均 meta.truncated_by_json_keys=true。
     Fetch {
         #[arg(required = true, num_args = 1..)]
         url: Vec<String>,
