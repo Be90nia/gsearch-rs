@@ -25,7 +25,7 @@ const LOGIN_WALL_TIMEOUT_SECS: u64 = 180;
 const LOGIN_WALL_SHORT_BODY: usize = 400;
 /// read/browse 正文提取的字符硬上限（gsearch.json `read_max_chars` 可覆盖）。
 /// 防超大页撑爆 agent 上下文；正文是注入面，超限一律截断并在 meta 标注。
-const READ_BODY_MAX_CHARS: usize = 8_000;
+const READ_BODY_MAX_CHARS: usize = 50_000;
 /// uhp/j44：原子快照 visibleText 的字符硬顶（jev snapshot.js 同配方；只作 marker/登录墙判定，
 /// 不作正文输出源，read_full 仍走独立 innerText 求值）。
 const SNAPSHOT_MAX_TEXT_CHARS: usize = 6000;

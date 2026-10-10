@@ -55,7 +55,7 @@ pub struct FetchOpts {
     /// 正文提取/markdown/host 路由/include/锚点裁剪/JS 壳判定）；--max-chars 仍截断（meta 如实）；
     /// 与 --markdown/--include/--json-keys 互斥（clap 拒）。PDF/二进制拒与 SSRF 门不绕（共享 GET 路径）。
     pub raw: bool,
-    /// 正文字符预算（text 上限；超限截断，meta.truncated/omitted 如实标注）。CLI 默认 8000（v0.3.1，AI 视角 token 控本：约 2000 token）。
+    /// 正文字符预算（text 上限；超限截断，meta.truncated/omitted 如实标注）。CLI 默认 50000。
     pub max_chars: usize,
     /// FixG10 J-1 + FixG11：单请求超时（秒）；CLI 默认 30（盲测十 P0-3 GitHub 抖动自愈），
     /// 范围 1..=300。改默认是 breaking：理由是 GitHub .diff / tag 页偶发握手失败吃满 10s 才退，
@@ -80,7 +80,7 @@ impl Default for FetchOpts {
             include: None,
             markdown: false,
             raw: false,
-            max_chars: 8_000,
+            max_chars: 50_000,
             timeout_secs: 30,
             retry: 1,
             json_keys: Vec::new(),
@@ -2622,13 +2622,13 @@ mod tests {
     }
 
     /// FixG11：FetchOpts::default() 改 timeout=30 retry=1（盲测十 P0-3：GitHub 抖动自愈）。
-    /// 其他字段保持原 FixG10 默认（max_chars=8000（v0.3.1，AI 视角 token 控本）、json=false、markdown=false 等）。
+    /// 其他字段保持原 FixG10 默认（max_chars=50000、json=false、markdown=false 等）。
     #[test]
     fn fetch_opts_default_timeout_30_retry_1() {
         let opts = FetchOpts::default();
         assert_eq!(opts.timeout_secs, 30, "默认 timeout 30（FixG11 给 GitHub 抖动自愈留余量）");
         assert_eq!(opts.retry, 1, "默认 retry 1（FixG11 公网抖动 1 次自愈）");
-        assert_eq!(opts.max_chars, 8_000);
+        assert_eq!(opts.max_chars, 50_000);
         assert!(!opts.json);
         assert!(!opts.markdown);
         assert!(opts.include.is_none());

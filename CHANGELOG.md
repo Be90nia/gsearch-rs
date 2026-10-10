@@ -2,21 +2,6 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本遵循语义化版本。
 
-## [0.3.1] - 2026-10-10
-
-AI 视角 token 控本 patch。
-
-### Changed
-
-- **fetch / browse `--max-chars` 默认 50000 → 8000**（约 2000 token）：v0.3.0 评估中识别的「不调 flag 一次输出 5000-15000 token」隐藏坑。90% agent 任务（取要点/确认 URL/看标题）8K 字符已够，撞限的极少数场景 agent 显式 `--max-chars 50000` 升档。browse --full 的 innerText cap 同步降级（共用 `READ_BODY_MAX_CHARS`）。gsearch.json `read_max_chars` 可配覆盖（保持不变）。
-- SKILL/README/CHANGELOG 同步默认调整与「AI 视角 token 控本」说明。
-
-### 非破坏
-
-- 显式 `--max-chars N` 仍生效（盲测/老脚本不受影响）
-- `meta.truncated` / `meta.omitted` 截断标注契约不变
-- `gsearch.json` `read_max_chars` 配置项保持原行为
-
 ## [0.3.0] - 2026-10-10
 
 安全审计硬化里程碑：全库三轮深度审计（安全 / 静默失败 / 测试缺口 / 内存 / 性能 / lean）后的集中修复批次。

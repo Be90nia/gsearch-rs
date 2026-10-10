@@ -43,7 +43,7 @@ pub struct BrowseOpts {
     pub proxy: Option<String>,
     /// pkp：放行私网地址（仅 browse 子命令挂此 flag；语义与 fetch --allow-private 对齐）。
     pub allow_private: bool,
-    /// n76：正文字符预算（HTML/innerText/markdown 上限；超限截断 meta.truncated 如实）。CLI 默认 8000（v0.3.1，AI 视角 token 控本：约 2000 token）。
+    /// n76：正文字符预算（HTML/innerText/markdown 上限；超限截断 meta.truncated 如实）。CLI 默认 50000。
     pub max_chars: usize,
 }
 
@@ -110,7 +110,7 @@ fn needs_empty_body_hint(summary_len: usize, headings_only: bool, omitted: usize
     summary_len == 0 && !headings_only && (omitted > 0 || raw_content_empty)
 }
 
-/// `browse <url>`：headless 渲染 → 默认 AdaptiveRead（M9），`--full` 纯 innerText（8000 cap，
+/// `browse <url>`：headless 渲染 → 默认 AdaptiveRead（M9），`--full` 纯 innerText（50000 cap，
 /// fve：--json 走 0mf 同款信封 + content_text；与 --headings-only clap 互斥）。
 /// CAPTCHA 路径：撞码报错退出，提示用 login 手工验证。
 /// H2+M2：launch 后所有 ? 早返回路径（new_page / goto / evaluate / content / parse）由外层
@@ -159,7 +159,7 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
             ));
         }
 
-        // fve：--full 纯 innerText（READ_BODY_MAX_CHARS 8000 cap，截断照标，v0.3.1 默认）；
+        // fve：--full 纯 innerText（READ_BODY_MAX_CHARS 50000 cap，截断照标）；
         // xih：--markdown 隐含全文模式，源换渲染后 HTML→markdown（转换在截断前的完整 HTML 上做，
         // md 产物再过同一字符上限——先截 HTML 会把表格腰斩）。
         // --json 对齐 0mf search 契约：信封（meta.truncated 标内容截断）+ content_text 单文档

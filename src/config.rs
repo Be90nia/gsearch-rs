@@ -22,7 +22,7 @@ pub struct GsearchConfig {
     pub chrome: Option<String>,
     /// M16 SearXNG 实例 base URL（语义同 GSEARCH_SEARXNG_URL）；None = 走 Google 直爬。
     pub searxng_url: Option<String>,
-    /// jp4：read/browse 正文提取的字符硬上限；None = 缺省 8000（postproc::READ_BODY_MAX_CHARS，v0.3.1）。
+    /// jp4：read/browse 正文提取的字符硬上限；None = 缺省 50000（postproc::READ_BODY_MAX_CHARS）。
     /// 防超大页正文撑爆 agent 上下文。
     pub read_max_chars: Option<usize>,
 }
