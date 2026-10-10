@@ -126,7 +126,7 @@ enum Command {
         #[arg(long, default_value_t = false, conflicts_with = "headings_only")]
         markdown: bool,
         /// 正文字符预算（HTML/innerText/markdown 上限；超限截断并在 meta.truncated 如实标注）。
-        #[arg(long, default_value_t = 50_000, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=10_000_000))]
+        #[arg(long, default_value_t = 8_000, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=10_000_000))]
         max_chars: usize,
         /// 放行私网地址（loopback / RFC1918 / link-local / 云 metadata），语义与 fetch 对齐。
         /// 默认拒（SSRF 门）：browse 的 URL 可能来自 LLM 输出（搜索结果/页面内容间接注入），
@@ -220,7 +220,7 @@ enum Command {
         raw: bool,
         /// 正文字符预算（text 字段上限；超限截断并在 meta.truncated/omitted 如实标注）。
         /// 作用顺序：--json-keys 投影先替换 text，本预算再对投影产物计（截断按投影后长度算）。
-        #[arg(long, default_value_t = 50_000, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=10_000_000))]
+        #[arg(long, default_value_t = 8_000, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=10_000_000))]
         max_chars: usize,
         /// 单请求超时（秒）；默认 30、范围 1..=300。
         /// 慢站（如 GitHub 偶发握手慢）给单 URL 留更长的握手/读体窗口；与 --retry 配合使用。
