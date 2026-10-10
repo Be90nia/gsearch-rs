@@ -187,7 +187,7 @@ enum Command {
         urls_file: Option<std::path::PathBuf>,
     },
     /// `gsearch fetch <url>...`：GET → 轻量正文提取 → 人读 / --json 输出。
-    /// 单 URL = 原行为；多 URL = batch 并发（上限 5、单条失败不阻塞，退出码 0 全成功 / 1 部分失败 / 2 全失败）。
+    /// 单 URL = JSON 扁平对象（含 status:"ok"）；多 URL = batch 并发数组（元素含 status；上限 5、单条失败不阻塞，退出码 0 全成功 / 1 部分失败 / 2 全失败）。
     Fetch {
         #[arg(required = true, num_args = 1..)]
         url: Vec<String>,
@@ -263,7 +263,8 @@ struct SearchArgs {
     /// 多查询 = batch 模式（并发 searxng、单条失败不阻塞、禁浏览器回退——浏览器单例不可并发）。
     #[arg(required = true, num_args = 1..)]
     query: Vec<String>,
-    /// 1..=100——SearXNG 单查最多 10 页×10 条，更大的值只会翻页白耗时（实测 10000→18s）
+    /// 1..=100——SearXNG 单查最多 10 页×10 条，更大的值只会翻页白耗时（实测 10000→18s）。
+    /// 触顶时 meta.truncated=true = 结果集封顶（必附 truncated_detail；与 fetch/read/browse 的正文截断同名不同义）
     #[arg(long, default_value_t = 10, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=100))]
     limit: usize,
     /// 时间过滤：只看 day/week/month/year 内的结果。SearXNG 加 time_range，Google SERP 加 tbs=qdr。

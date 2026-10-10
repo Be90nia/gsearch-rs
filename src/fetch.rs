@@ -660,9 +660,8 @@ async fn cmd_fetch_batch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> 
         match result {
             Ok(FetchOne::Done(f)) => {
                 ok_count += 1;
-                let mut v = fetched_json(f);
-                v["status"] = serde_json::json!("ok");
-                entries.push(v);
+                // status:"ok" 由 fetched_json 统一注入（FixG20 NN，单/批同源）
+                entries.push(fetched_json(f));
             }
             Ok(FetchOne::JsShell) => entries.push(serde_json::json!({
                 "url": url,
@@ -780,11 +779,14 @@ fn fetched_json(f: &Fetched) -> serde_json::Value {
         Some(serde_json::Value::String(s)) => s.clone(),
         _ => f.title.clone(),
     };
+    // FixG20 NN：顶层补 status:"ok"——单 URL 扁平形态与 batch 数组元素同键，消费方按
+    // URL 数无需分支解析（NN 曾按 batch 形态解析单 URL 撞 KeyError）；只增不删。
     serde_json::json!({
         "url": f.url,
         "title": title,
         "text": text,
         "meta": meta,
+        "status": "ok",
     })
 }
 
@@ -1939,6 +1941,15 @@ mod tests {
         let v = fetched_json(&f);
         assert_eq!(v["meta"]["truncated"], serde_json::json!(true));
         assert!(v["meta"]["omitted"].as_u64().unwrap() > 0);
+    }
+
+    /// FixG20 NN：单 URL 扁平形态与 batch 数组元素共有顶层 status 键（消费方按 URL 数
+    /// 无需分支解析）——fetched_json 只在成功路径被调，恒 "ok"，只增不删。
+    #[test]
+    fn fetched_json_includes_status_ok() {
+        let f = Fetched { url: "u".into(), title: "t".into(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
+        let v = fetched_json(&f);
+        assert_eq!(v["status"], serde_json::json!("ok"), "单/批两形态都应有顶层 status: {v}");
     }
 
     /// GitHub issue/PR 页评论区不在 SSR HTML 里（盲测七 wqm），meta 必打缺失信号 +

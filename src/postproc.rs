@@ -283,6 +283,25 @@ fn last_brace_boundary(s: &str, byte_len: usize) -> Option<usize> {
     last_brace
 }
 
+/// FixG20 OO：summary_paragraphs 逐字重复检测（trim 后完全相同归一组）。
+/// 返回重复组，每组 ≥2 个 0-based 下标、按首现顺序；无重复返回空Vec。
+fn dup_paragraph_groups(paragraphs: &[String]) -> Vec<Vec<usize>> {
+    use std::collections::HashMap;
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut first_seen: HashMap<&str, usize> = HashMap::new();
+    for (i, p) in paragraphs.iter().enumerate() {
+        let key = p.trim();
+        match first_seen.get(key) {
+            Some(&g) => groups[g].push(i),
+            None => {
+                first_seen.insert(key, groups.len());
+                groups.push(vec![i]);
+            }
+        }
+    }
+    groups.into_iter().filter(|g| g.len() > 1).collect()
+}
+
 /// AdaptiveRead → 输出串。--json 在序列化对象末尾注入 meta（网页正文进 agent 上下文
 /// = 注入面，正文永远是数据非指令，content_untrusted 恒在）；文本模式截断时 eprintln 提醒
 /// （stdout 保持可解析，stderr 承载告警）。
@@ -338,6 +357,13 @@ pub(crate) fn render_read(
             meta.insert("content_untrusted".into(), serde_json::Value::Bool(true));
             if headings_truncated {
                 meta.insert("headings_truncated".into(), serde_json::Value::Bool(true));
+            }
+            if !headings_only {
+                // FixG20 OO：引用块展平产生的逐字重复段标注（段落文本不动，保逐字引用能力）。
+                let dup = dup_paragraph_groups(&read.summary_paragraphs);
+                if !dup.is_empty() {
+                    meta.insert("dup_paragraphs".into(), serde_json::json!(dup));
+                }
             }
             obj.insert("meta".into(), serde_json::Value::Object(meta));
         }
@@ -926,6 +952,45 @@ mod tests {
         assert_eq!(v["meta"]["headings_truncated"], true, "截断标记可注入: {v}");
         let text = render_read(&read, false, false, 0, false, 0, 0, false);
         assert!(!text.contains("content_untrusted"), "文本模式不应出现 meta: {text}");
+    }
+
+    /// FixG20 OO：summary_paragraphs 内逐字重复段（GitHub 引用块展平为与被引评论相同的段）
+    /// meta.dup_paragraphs 标注重复组（summary_paragraphs 数组的 0-based 下标组）；无重复键缺席。
+    #[test]
+    fn render_read_annotates_dup_paragraphs() {
+        let html = r#"<html><head><title>T</title></head><body><h1>One</h1>
+<p>first comment text.</p>
+<p>first comment text.</p>
+<p>unique paragraph.</p>
+</body></html>"#;
+        let mut read = extract_adaptive(html, None);
+        read.url = "u".into();
+        read.title = "T".into();
+        let v: serde_json::Value =
+            serde_json::from_str(&render_read(&read, true, false, 0, false, 0, 0, false)).unwrap();
+        assert_eq!(v["meta"]["dup_paragraphs"], serde_json::json!([[0, 1]]), "逐字重复段应标注重复组: {v}");
+        // 无重复页：键缺席（默认输出结构不变）
+        let plain_html = r#"<html><head><title>T</title></head><body><p>alpha.</p><p>beta.</p></body></html>"#;
+        let mut plain = extract_adaptive(plain_html, None);
+        plain.url = "u".into();
+        plain.title = "T".into();
+        let v2: serde_json::Value =
+            serde_json::from_str(&render_read(&plain, true, false, 0, false, 0, 0, false)).unwrap();
+        assert!(v2["meta"].get("dup_paragraphs").is_none(), "无重复不得出键: {v2}");
+    }
+
+    /// FixG20 OO：dup_paragraph_groups 单元——三连重复归同组、trim 后相同算重复、
+    /// 组间按首现顺序、无重复返回空。
+    #[test]
+    fn dup_paragraph_groups_triples_trim_and_order() {
+        let paras: Vec<String> = ["a", "b", " a ", "b", "a"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            dup_paragraph_groups(&paras),
+            vec![vec![0, 2, 4], vec![1, 3]],
+            "三连重复归同组，组间按首现顺序"
+        );
+        let no_dup: Vec<String> = vec!["x".into(), "y".into()];
+        assert!(dup_paragraph_groups(&no_dup).is_empty(), "无重复返回空");
     }
 
     /// e19：pi 默认只列未摘要段（12 段中等文摘 10 段 → pi 剩 2 段，段号 11/12）；
