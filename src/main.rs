@@ -336,6 +336,10 @@ struct SearchArgs {
     #[arg(long, value_enum, default_value_t = BrowserArg::Auto)]
     /// 选择浏览器：auto = Chrome 优先缺则 Edge，强制选 chrome/edge。
     browser: BrowserArg,
+    /// 放行私网结果页（--browse N 读内网 URL 的显式出口；语义与 browse/fetch --allow-private
+    /// 对齐）。4bq M3：--browse N 的结果 URL 过 browse 私网门后新增的透传 flag。
+    #[arg(long, default_value_t = false)]
+    allow_private: bool,
 }
 
 fn init_tracing(level: &str) {
@@ -415,7 +419,6 @@ async fn main() -> ExitCode {
                 timeout_secs: timeout,
                 retry,
                 json_keys,
-                anchor_pad_lines: 0,
             }).await
         }
         Command::Similar { url, limit, human, .. } => cmd_similar(url, limit, human).await,
@@ -703,7 +706,8 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         version: env!("CARGO_PKG_VERSION"),
         query: query.clone(),
         profile: gsearch::browser::profile_name_only(),
-        proxy: proxy.clone(),
+        // 4bq M2：meta.proxy 进 JSON 输出前脱敏凭据（键不变值脱敏，与日志侧 bfa3efe 同源）
+        proxy: proxy.as_deref().map(gsearch::util::redact_proxy),
         humanize: args.humanize_effective(),
         // FixG18 HH：--read N 已 truncate 结果集，meta.limit 如实回写 N（契约字段 =
         // 返回集大小，下游分页/预算按它判断不再误判）；N ≤ --limit 已前置校验。
@@ -750,6 +754,7 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
                 headings_only: args.headings_only,
                 from: args.from.unwrap_or(0),
                 excerpt: args.excerpt,
+                allow_private: args.allow_private,
             };
             let content = if opts.full {
                 postproc::read_full(browser, &mut h_slot, &results, n, &opts).await?
@@ -1041,7 +1046,8 @@ fn emit_captcha_timeout_json(
         version: env!("CARGO_PKG_VERSION"),
         query: query.to_string(),
         profile: gsearch::browser::profile_name_only(),
-        proxy,
+        // 4bq M2：meta.proxy 进 JSON 输出前脱敏凭据（与日志侧 bfa3efe 同源）
+        proxy: proxy.as_deref().map(gsearch::util::redact_proxy),
         humanize: args.humanize_effective(),
         limit: args.limit,
         elapsed_ms,
@@ -1080,7 +1086,8 @@ fn emit_searxng_degraded_json(
         version: env!("CARGO_PKG_VERSION"),
         query: query.to_string(),
         profile: gsearch::browser::profile_name_only(),
-        proxy,
+        // 4bq M2：meta.proxy 进 JSON 输出前脱敏凭据（与日志侧 bfa3efe 同源）
+        proxy: proxy.as_deref().map(gsearch::util::redact_proxy),
         humanize: args.humanize_effective(),
         limit: args.limit,
         elapsed_ms,

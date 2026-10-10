@@ -2,6 +2,24 @@
 
 use anyhow::{Result, anyhow};
 
+/// 代理串凭据脱敏：`scheme://user:pass@host` 的 userinfo 段（含只有 user 的形态）
+/// 整段替换为 `***`，无凭据原样返回。打日志前必走，防凭据进 CI/用户贴出的日志。
+/// 4bq M2：meta.proxy 的 JSON 输出信封同走本函数（bfa3efe 只盖了日志侧）。
+pub fn redact_proxy(proxy: &str) -> String {
+    let Some(scheme_end) = proxy.find("://") else {
+        return proxy.to_owned();
+    };
+    let auth_start = scheme_end + 3;
+    // authority 段止于首个 '/'；密码里未编码的 '@' 按 URL 惯例取最后一个
+    let auth_end = proxy[auth_start..]
+        .find('/')
+        .map_or(proxy.len(), |i| auth_start + i);
+    match proxy[auth_start..auth_end].rfind('@') {
+        Some(at) => format!("{}***{}", &proxy[..auth_start], &proxy[auth_start + at..]),
+        None => proxy.to_owned(),
+    }
+}
+
 /// 文件名 = URL 路径最后一段（去 query/hash、剥 scheme://authority）；为空（裸 origin/尾斜杠）则 download.bin。
 ///
 /// 安全门（I9，cmd_dl -o 路径安全）：URL 派生的文件名是潜在注入面——
@@ -12,6 +30,8 @@ use anyhow::{Result, anyhow};
 ///   - 控制字符 / 过长 → 文件系统拒绝 / 静默截断
 ///
 /// 策略：把可疑字符替换为 `_`，整段为 `..`/纯分隔/过长（>200 字节）则落到 `download.bin`。
+/// cgp L1：命中 Windows 保留设备名（含 `NUL.txt` 形态）同样降级 `download.bin`——
+/// `fs::write("NUL")` 在 Windows 返回成功但零文件，静默数据丢失。
 /// 原本 postproc.rs / general.rs / shell.rs 各一份（M4/M6/M7 各加的），现在统一。
 pub fn filename_from_url(url: &str) -> String {
     let path = url.split(['#', '?']).next().unwrap_or(url);
@@ -24,7 +44,7 @@ pub fn filename_from_url(url: &str) -> String {
         return "download.bin".into();
     }
     let safe = sanitize_filename(last);
-    if safe.is_empty() || safe == ".." {
+    if safe.is_empty() || safe == ".." || crate::browser::is_windows_reserved(&safe) {
         "download.bin".into()
     } else {
         safe
@@ -336,6 +356,37 @@ mod tests {
             enc.push(if chunk.len() > 2 { TBL[(n & 0x3f) as usize] as char } else { '=' });
         }
         assert_eq!(b64_decode(&enc).unwrap(), raw);
+    }
+
+    #[test]
+    fn redact_proxy_masks_userinfo() {
+        // 带凭据 / 只有 user：userinfo 段整段替换为 ***
+        assert_eq!(redact_proxy("http://user:pass@proxy.example.com:8080"), "http://***@proxy.example.com:8080");
+        assert_eq!(redact_proxy("socks5://alice@10.0.0.1:1080"), "socks5://***@10.0.0.1:1080");
+        assert_eq!(redact_proxy("http://u:p@h:1/api"), "http://***@h:1/api");
+    }
+
+    #[test]
+    fn redact_proxy_keeps_credential_free_input() {
+        assert_eq!(redact_proxy("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
+    }
+
+    /// cgp L1：URL 末段命中 Windows 保留设备名（含 NUL.txt 带扩展 / com1 小写形态）→
+    /// 降级 download.bin（fs::write("NUL") 在 Windows 返回成功但零文件，静默数据丢失）。
+    #[test]
+    fn filename_from_url_downgrades_windows_reserved_names() {
+        for url in [
+            "https://x.com/NUL",
+            "https://x.com/con",
+            "https://x.com/NUL.txt",
+            "https://x.com/COM1",
+            "https://x.com/lpt9.bin",
+            "https://x.com/AUX.tar.gz",
+        ] {
+            assert_eq!(filename_from_url(url), "download.bin", "保留名应降级: {url}");
+        }
+        // 非保留名不受影响（nullify 的 stem 是 NULLIFY，不是 NUL）
+        assert_eq!(filename_from_url("https://x.com/nullify.txt"), "nullify.txt");
     }
 
 }

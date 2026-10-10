@@ -42,6 +42,11 @@ Thumbs.db
 .env.*
 !.env.example
 
+# dh3：运行产物目录防新增（reports/ 下已追踪的 104 文件不受影响；exe 历史迁出另拍板）
+/e2e/
+/_search_runs/
+/devil-dl/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db

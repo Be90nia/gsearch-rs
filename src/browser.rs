@@ -229,13 +229,6 @@ pub fn find_specific(kind: BrowserKind) -> Option<(PathBuf, BrowserKind)> {
 }
 
 
-/// 仅返回 Chrome 路径的便捷别名（M11 兼容旧调用方）。Chrome 不可用时回落到 Edge，
-/// 但 launch(BrowserKind) 推荐显式接收 `(path, kind)`。
-pub fn find_chrome() -> Result<PathBuf> {
-    let (p, _kind) = find_browser()?;
-    Ok(p)
-}
-
 /// Profile 目录：env `GSEARCH_PROFILE` > 配置文件 profile 键 > default。
 /// 值为**已存在的绝对路径**时直接用作 profile 目录（换盘符存放）；
 /// 否则视为 profile 名，放进 `~/.gsearch/profiles/<名>/`。
@@ -473,7 +466,7 @@ fn profile_name(raw: &str) -> Result<String> {
 
 /// Windows 保留设备名（CON/NUL/PRN/AUX/COM1-9/LPT1-9，含 `CON.txt` 带扩展形态）：
 /// 作目录名在 Windows 上非法/行为未定义；profile 会 zip 换机携带，全平台统一拒绝。
-fn is_windows_reserved(name: &str) -> bool {
+pub(crate) fn is_windows_reserved(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or_default().to_ascii_uppercase();
     match stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT")) {
         Some(d) => d.len() == 1 && (b'1'..=b'9').contains(&d.as_bytes()[0]),
@@ -531,7 +524,8 @@ pub fn cleanup_stale_locks(dir: &Path) -> Result<()> {
 /// 启动浏览器，默认走自动兑底（Chrome 优先，回落 Edge）；兼容旧调用方。
 /// handler 是 Stream<Item = Result<()>>，必须 spawn 到独立 task 持续 poll，否则 CDP 通信会卡死。
 pub async fn launch(headless: bool) -> Result<(Browser, Handler)> {
-    launch_with_kind(headless, None).await
+    let proxy = std::env::var("GSEARCH_PROXY").ok().filter(|s| !s.is_empty());
+    launch_with_kind_proxy(headless, None, proxy).await
 }
 
 /// close 当前 browser 并同 profile 起重起**有头**实例。
@@ -573,28 +567,6 @@ pub async fn swap_to_headless(
     *browser = new_browser;
     Ok(())
 }
-pub async fn launch_with_kind(headless: bool, kind: Option<BrowserKind>) -> Result<(Browser, Handler)> {
-    let proxy = std::env::var("GSEARCH_PROXY").ok().filter(|s| !s.is_empty());
-    launch_with_kind_proxy(headless, kind, proxy).await
-}
-
-
-/// 代理串凭据脱敏：`scheme://user:pass@host` 的 userinfo 段（含只有 user 的形态）
-/// 整段替换为 `***`，无凭据原样返回。打日志前必走，防凭据进 CI/用户贴出的日志。
-fn redact_proxy(proxy: &str) -> String {
-    let Some(scheme_end) = proxy.find("://") else {
-        return proxy.to_owned();
-    };
-    let auth_start = scheme_end + 3;
-    // authority 段止于首个 '/'；密码里未编码的 '@' 按 URL 惯例取最后一个
-    let auth_end = proxy[auth_start..]
-        .find('/')
-        .map_or(proxy.len(), |i| auth_start + i);
-    match proxy[auth_start..auth_end].rfind('@') {
-        Some(at) => format!("{}***{}", &proxy[..auth_start], &proxy[auth_start + at..]),
-        None => proxy.to_owned(),
-    }
-}
 /// 启动浏览器并返回 (Browser, Handler)。`kind = None` 自动兑底；`proxy = None` 不走代理。
 /// ponytail: 拆出 `proxy` 参数主要为了让上层调用不关心 env 细节（CLI 也走同一路径）。
 pub async fn launch_with_kind_proxy(
@@ -625,7 +597,7 @@ pub async fn launch_with_kind_proxy(
         .disable_default_args();
     if let Some(proxy) = &proxy {
         // ponytail: Chrome 只识别 --proxy-server=protocol://host:port；不引 chromiumoxide proxy builder（M12 调试期足以）。
-        tracing::info!("代理: {}", redact_proxy(proxy));
+        tracing::info!("代理: {}", crate::util::redact_proxy(proxy));
         builder = builder.arg(format!("proxy-server={proxy}"));
     }
     let safe_args: &[&str] = if headless {
@@ -689,7 +661,7 @@ fn rebuild_browser_config(
         .arg(format!("user-agent={UA}"))
         .disable_default_args();
     if let Some(p) = proxy {
-        tracing::info!("代理: {}", redact_proxy(p));
+        tracing::info!("代理: {}", crate::util::redact_proxy(p));
         builder = builder.arg(format!("proxy-server={p}"));
     }
     let safe_args: &[&str] = if headless {
@@ -989,7 +961,7 @@ pub async fn graceful_close(browser: &mut Browser) {
 
 #[cfg(test)]
 mod tests {
-    use super::{profile_name, redact_proxy};
+    use super::profile_name;
     #[cfg(windows)]
     use super::user_scope_path_in;
 
@@ -1007,19 +979,6 @@ mod tests {
             assert!(profile_name(bad).is_err(), "应拒绝 Windows 保留名: {bad}");
         }
         assert!(profile_name("C:/x/CON.txt").is_err(), "带扩展名的保留名形态也应拒绝");
-    }
-
-    #[test]
-    fn redact_proxy_masks_userinfo() {
-        // 带凭据 / 只有 user：userinfo 段整段替换为 ***
-        assert_eq!(redact_proxy("http://user:pass@proxy.example.com:8080"), "http://***@proxy.example.com:8080");
-        assert_eq!(redact_proxy("socks5://alice@10.0.0.1:1080"), "socks5://***@10.0.0.1:1080");
-        assert_eq!(redact_proxy("http://u:p@h:1/api"), "http://***@h:1/api");
-    }
-
-    #[test]
-    fn redact_proxy_keeps_credential_free_input() {
-        assert_eq!(redact_proxy("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
     }
 
     /// 用户级安装探测（换机兼容）：vendor 目录按 exe 区分（Google\Chrome vs Microsoft\Edge）。

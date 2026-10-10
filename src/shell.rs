@@ -25,6 +25,7 @@ use gsearch::skeleton::extract_adaptive;
 use gsearch::types::SearchResult;
 use gsearch::util::filename_from_url;
 
+use crate::general::browser_alive;
 use crate::postproc::{cap_chars, content_retry, read_max_chars, render_read, wait_content_stable};
 
 const TEXT_MAX_CHARS: usize = 5000;
@@ -277,6 +278,8 @@ async fn cmd_click(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
                 return Err(anyhow!("click {n} 越界（结果数 {}）", ctx.last_results.len()));
             }
             let url = ctx.last_results[n - 1].url.clone();
+            // 4bq M3 收尾：结果集 URL = 不可信输入，与顶层 search --read N 同门（SEO 毒化防一线）
+            let url = crate::general::ensure_browsable_url(&url, false)?;
             goto(&ctx.page, &url).await?;
             ctx.current_url = url.clone();
             println!("已跳转到: {url}");
@@ -479,7 +482,7 @@ async fn cmd_login(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     // 3t9：与顶层 login 同门——仅 scheme 白名单（login/dl 无私网门，内网登录页是合法场景）
     let url = crate::general::browsable_scheme_ok(url)?;
     // 先切有头（close + 同 profile 重起），保持 cookie 不丢
-    swap_to_headed(&mut ctx.browser, &mut ctx.handler_task).await?;
+    browser::swap_to_headed(&mut ctx.browser, &mut ctx.handler_task).await?;
     // 有头模式下旧 page 已随旧 browser 关闭，新开一个
     ctx.page = browser::open_page(&ctx.browser)
         .await
@@ -538,16 +541,6 @@ async fn cmd_login(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
         println!("保持有头模式，shell 继续（按需退出）");
     }
     Ok(())
-}
-/// close 当前 browser 并同 profile 起重起有头实例。
-/// 等价 plsearch AppContext.reveal_for_captcha（main.py:133-137）。
-async fn swap_to_headed(browser: &mut Browser, h_slot: &mut Option<tokio::task::JoinHandle<()>>) -> Result<()> {
-    browser::swap_to_headed(browser, h_slot).await
-}
-
-
-async fn browser_alive(browser: &Browser) -> bool {
-    browser.version().await.is_ok()
 }
 
 async fn cmd_back(ctx: &mut ShellCtx) -> Result<()> {

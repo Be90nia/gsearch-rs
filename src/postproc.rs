@@ -203,6 +203,35 @@ pub(crate) fn cap_extract_source(
     cap_chars(html_full, limit)
 }
 
+/// 2se：先截后提取 + head/nav 重站尾部补救。GitHub 外 URL 的 head/nav/SVG sprite 占满
+/// 截断预算时首个正文节点被吃光（wikipedia WWII 实测首个 <p> 在 byte 164035）→
+/// summary 全空、rc=0 只剩 meta.truncated。summary 空 + truncated + omitted 超阈值时，
+/// 从源 HTML 尾部取同预算的第二片窗口重跑 extract_adaptive（内存有界，勿全量建树）；
+/// 仍空维持第一片结果（hint 链照旧）。truncated/omitted 语义保持诚实：始终反映第一片
+/// 预算截断，不因补救改写。原本输出非空的页面不进补救分支，stdout 逐字节不变。
+pub(crate) fn extract_adaptive_capped(
+    html_full: &str,
+    limit: usize,
+    url: &str,
+    excerpt: Option<usize>,
+) -> (gsearch::skeleton::AdaptiveRead, bool, usize, usize) {
+    let (html, truncated, omitted, truncated_at_offset) = cap_extract_source(html_full, limit, url);
+    let mut read = extract_adaptive(&html, excerpt);
+    const TAIL_FALLBACK_MIN_OMITTED: usize = 10_000;
+    if truncated && omitted > TAIL_FALLBACK_MIN_OMITTED && read.summary_paragraphs.is_empty() {
+        // 第一片 = 源前 limit 字符（cap_chars 语义），总字符数 = limit + omitted；
+        // 第二片窗口 = 源尾部同预算字符段（起点 = total-limit = omitted），
+        // char→byte 换算后切片（不劈 UTF-8）
+        let tail_start = char_to_byte_offset(html_full, omitted);
+        let (tail_html, _, _, _) = cap_chars(&html_full[tail_start..], limit);
+        let retry = extract_adaptive(&tail_html, excerpt);
+        if !retry.summary_paragraphs.is_empty() {
+            read = retry;
+        }
+    }
+    (read, truncated, omitted, truncated_at_offset)
+}
+
 /// 字符级硬截断（按 chars 计，不劈 UTF-8）。返回 (截后文本, 是否截断, 省略字符数, 截断字节偏移)。
 /// 9jx：第四个值是截断点在源里的 byte offset（meta.truncated_at_offset 用）；
 /// 未截断时 offset=0 让缺席语义（0=缺席）自然生效。
@@ -390,6 +419,9 @@ pub struct ReadOpts {
     pub from: usize,
     /// e1i：Some(N) = paragraph_index 每项附前 N 字符 excerpt（--json 生效）；None 行为不变。
     pub excerpt: Option<usize>,
+    /// 4bq M3：结果集 URL 来自搜索/抓取结果 = 不可信——open_page 前过 ensure_browsable_url
+    /// 私网门（与 browse 初始门对齐）；--allow-private（search 子命令）透传放行。
+    pub allow_private: bool,
 }
 
 /// read --json 的 headings 载荷上限（超过截断，meta.headings_truncated 标记）。
@@ -421,14 +453,13 @@ pub async fn read(
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
     // c5f：正文复用 open_page 的 captcha 检查取，不再二次 content_retry。
-    let (page, snap, html_full) = open_page(browser, h_slot, url).await?;
+    let (page, snap, html_full) = open_page(browser, h_slot, url, opts.allow_private).await?;
     let title = match &snap {
         Some(s) => s.title.clone(),
         None => eval_string_retry(&page, "document.title").await,
     };
-    let (html, truncated, omitted, truncated_at_offset) =
-        cap_extract_source(&html_full, read_max_chars(), url);
-    let mut read = extract_adaptive(&html, opts.excerpt);
+    let (mut read, truncated, omitted, truncated_at_offset) =
+        extract_adaptive_capped(&html_full, read_max_chars(), url, opts.excerpt);
     read.url = url.to_string();
     read.title = title;
 
@@ -473,7 +504,7 @@ pub async fn read_full(
     opts: &ReadOpts,
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
-    let (page, _, _) = open_page(browser, h_slot, url).await?;
+    let (page, _, _) = open_page(browser, h_slot, url, opts.allow_private).await?;
     let (txt, _, _, _) = read_full_text(&page, read_max_chars()).await?;
     if !opts.json {
         println!("=== {url} ===\n{txt}");
@@ -512,7 +543,11 @@ async fn open_page(
     browser: &mut Browser,
     h_slot: &mut Option<tokio::task::JoinHandle<()>>,
     url: &str,
+    allow_private: bool,
 ) -> Result<(chromiumoxide::Page, Option<PageSnapshot>, String)> {
+    // 4bq M3：URL 来自搜索/抓取结果集 = 不可信——与 browse 初始门对齐（scheme 白名单
+    // + 私网门），防结果集里的 SEO 恶意页把内网页面渲染后全文打进 agent 上下文。
+    let url: &str = &crate::general::ensure_browsable_url(url, allow_private)?;
     let (page, snap) = goto_page(browser, url).await?;
     let html_full = content_retry(&page).await;
     if is_captcha(&html_full) {
@@ -765,6 +800,16 @@ pub(crate) async fn fetch_in_page(page: &chromiumoxide::Page, url: &str) -> Resu
     let b64 = raw
         .into_value::<String>()
         .map_err(|e| anyhow!("fetch 返回值非字符串（{url}）: {e}"))?;
+    // 4bq M4：32MB 上限原只在 JS 侧——同上下文页面 JS 可 patch btoa/返回值绕过，
+    // Rust 侧收货复核 base64 长度（明文 N 字节 ≈ 4/3·N + padding），超限拒绝解码。
+    if b64.len() > FETCH_IN_PAGE_MAX_BYTES / 3 * 4 + 4 {
+        anyhow::bail!(
+            "页内 fetch 返回数据超限（base64 {} bytes > 上限 {}，约 {}MB 明文）；页面 JS 可能篡改了返回值，已拒绝（{url}）",
+            b64.len(),
+            FETCH_IN_PAGE_MAX_BYTES / 3 * 4 + 4,
+            FETCH_IN_PAGE_MAX_BYTES / 1024 / 1024
+        );
+    }
     gsearch::util::b64_decode(&b64).map_err(|e| anyhow!("页内 fetch base64 解码失败（{url}）: {e}"))
 }
 
@@ -942,6 +987,39 @@ mod tests {
         // GitHub 非 issues|pull 页：不启用容器抽取
         let (html4, _, _, _) = cap_extract_source(&html, 200, "https://github.com/tokio-rs/tokio");
         assert!(!html4.contains("real issue body"), "仓库主页不走容器抽取");
+    }
+
+    /// 2se：head/nav 占满截断预算（head>50KB）时正文全空 → 从源尾部第二片窗口补救，
+    /// truncated/omitted 语义保持第一片的诚实值。
+    #[test]
+    fn extract_adaptive_capped_recovers_body_from_tail_window() {
+        // head 60KB junk（> 50K 默认预算）+ 正文在文档尾部（wikipedia WWII 同构）
+        let html = format!(
+            "<html><head><style>{}</style></head><body><article><h1>Tail Body</h1><p>real body text after huge head</p></article></body></html>",
+            "x".repeat(60_000)
+        );
+        let limit = 50_000;
+        let (read, truncated, omitted, _off) =
+            extract_adaptive_capped(&html, limit, "https://example.com/heavy", None);
+        assert!(truncated, "60KB head 超预算必须截断");
+        assert!(omitted > 10_000, "omitted 应超补救阈值: {omitted}");
+        assert!(!read.summary_paragraphs.is_empty(), "尾部窗口应补救出正文");
+        let joined = read.summary_paragraphs.join("\n");
+        assert!(joined.contains("real body text"), "正文应含尾部 marker: {joined:?}");
+        // meta 语义诚实：补救不改写截断事实
+        assert_eq!(read.url, "", "url/title 由调用方补（helper 不越权）");
+    }
+
+    /// 2se 对照组：正文在预算内（不截断/正文非空）→ 不进补救分支，行为与直连 cap+extract 一致。
+    #[test]
+    fn extract_adaptive_capped_matches_plain_path_when_body_present() {
+        let html = "<html><body><article><h1>Early</h1><p>body early in page</p></article></body></html>";
+        let (read, truncated, omitted, off) =
+            extract_adaptive_capped(html, 50_000, "https://example.com/", None);
+        assert!(!truncated);
+        assert_eq!(omitted, 0);
+        assert_eq!(off, 0);
+        assert!(!read.summary_paragraphs.is_empty());
     }
 
     /// jp4：render_read 仅 --json 注入 meta（追加不覆盖既有字段）；文本模式不加任何 JSON 键，

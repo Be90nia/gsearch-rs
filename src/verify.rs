@@ -331,6 +331,8 @@ fn curl_args(url: &str, proxy: Option<&str>, timeout: u64, head: bool) -> Vec<St
         "-L".to_owned(),
         "--max-redirs".to_owned(),
         MAX_REDIRECT_HOPS.to_string(),
+        // cgp L4：URL 含 [] {} 时禁 curl globbing（不加工请求语义）
+        "--globoff".to_owned(),
         "-D".to_owned(),
         "-".to_owned(),
         "-o".to_owned(),
@@ -349,6 +351,8 @@ fn curl_args(url: &str, proxy: Option<&str>, timeout: u64, head: bool) -> Vec<St
         args.push("--proxy".to_owned());
         args.push(p.to_owned());
     }
+    // cgp L4：`--` 终结选项解析——来自不可信内容的 URL 以 `-` 开头不得被 curl 当选项
+    args.push("--".to_owned());
     args.push(url.to_owned());
     args
 }
@@ -548,6 +552,20 @@ content-type: text/html\r\n\
         let head = curl_args("https://x/", None, 5, true);
         assert!(head.iter().any(|a| a == "--head"));
         assert!(!head.iter().any(|a| a == "Range: bytes=0-0"));
+    }
+
+    /// cgp L4：--globoff 禁 URL globbing；`--` 终结选项解析（`-` 开头的不可信 URL
+    /// 不得被 curl 当选项）。
+    #[test]
+    fn curl_args_ends_with_double_dash_before_url() {
+        for url in ["-K/etc/passwd", "https://x/[1-10]", "https://example.com/"] {
+            let args = curl_args(url, None, 5, false);
+            assert!(args.iter().any(|a| a == "--globoff"), "缺 --globoff: {args:?}");
+            let last = args.last().expect("URL 是最后参数");
+            assert_eq!(last, url, "URL 必须是最后一个 argv");
+            let sep = &args[args.len() - 2];
+            assert_eq!(sep, "--", "URL 前必须有 -- 分隔: {args:?}");
+        }
     }
 
     #[test]

@@ -152,7 +152,7 @@ pub async fn run_search_on_page(
             }
             // 首页撞码：切有头轮询等人解（plsearch main.py:339-343 reveal_for_captcha + _search wait_for_captcha=True）
             eprintln!("Google 对无头浏览器有独立风控（豁免 cookie 约 3 小时且对无头无效），弹出窗口验证后本会话将切回无头继续；高频场景建议用 gsearch shell");
-            if let Err(e) = swap_to_headed(browser, h_slot).await {
+            if let Err(e) = browser::swap_to_headed(browser, h_slot).await {
                 let _ = page.close().await;
                 return Err(anyhow!("swap_to_headed 失败: {e}"));
             }
@@ -602,12 +602,6 @@ fn tokenize(seg: &str) -> Vec<String> {
 fn title_overlap(title: &str, keywords: &[String]) -> Vec<String> {
     let words = tokenize(title);
     keywords.iter().filter(|k| words.contains(k)).cloned().collect()
-}
-
-/// close 当前 browser 并同 profile 起重起有头实例。
-/// 等价 plsearch AppContext.reveal_for_captcha（main.py:133-137）。
-async fn swap_to_headed(browser: &mut Browser, h_slot: &mut Option<tokio::task::JoinHandle<()>>) -> Result<()> {
-    browser::swap_to_headed(browser, h_slot).await
 }
 
 /// 轮询 page content 直到非 captcha 或超时。等价 plsearch wait_until_captcha_solved（config.py:117-139）。

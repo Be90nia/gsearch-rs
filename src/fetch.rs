@@ -69,9 +69,6 @@ pub struct FetchOpts {
     /// FixG10 J-2：JSONPath 投影（例：`.crate.max_version,.crate.max_stable_version`）；
     /// 非空时 `--json` 输出只保留指定字段并打 `meta.truncated_by_json_keys: true`。
     pub json_keys: Vec<String>,
-    /// FixG10 L-2：URL `#N-M` 锚点范围裁剪——命中时仅输出文本 [line_start, line_end]，
-    /// 上下各扩 N 行作为上下文；meta.anchor_crop_range: [start, end]。
-    pub anchor_pad_lines: usize,
 }
 
 impl Default for FetchOpts {
@@ -87,7 +84,6 @@ impl Default for FetchOpts {
             timeout_secs: 30,
             retry: 1,
             json_keys: Vec::new(),
-            anchor_pad_lines: 0,
         }
     }
 }
@@ -104,8 +100,14 @@ fn resolve_host(host: &str) -> Result<IpAddr> {
     if host.is_empty() {
         return Err(anyhow!("URL host 为空"));
     }
-    // 字面 IP：直接解析，避免 DNS 走系统解析器
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    // 字面 IP：直接解析，避免 DNS 走系统解析器。cgp L3：IPv6 字面量在 URL host 形态带
+    // []（reqwest Url::host_str() 返回 "[::1]"）——不剥则重定向 policy 对公网 IPv6 字面量
+    // 解析失败误判私网（fail-closed 误拒）；剥后私网字面量仍被 is_private_ip 正确拒绝。
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = literal.parse::<IpAddr>() {
         return Ok(ip);
     }
     // 域名：用 ToSocketAddrs（带 80 端口仅占位，host 解析后即返回；端口不影响 IP 判定）
@@ -123,10 +125,12 @@ fn resolve_host(host: &str) -> Result<IpAddr> {
 fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_unspecified()                  // 0.0.0.0
                 || v4.is_loopback()               // 127.0.0.0/8
                 || v4.is_private()                // 10/172.16/192.168
                 || v4.is_link_local()             // 169.254/16
+                || (o[0] == 100 && (64..=127).contains(&o[1]))  // 100.64.0.0/10 CGNAT/Tailscale（cgp L2）
                 || v4.is_multicast()
         }
         IpAddr::V6(v6) => {
@@ -137,7 +141,7 @@ fn is_private_ip(ip: IpAddr) -> bool {
             v6.is_unspecified()
                 || v6.is_loopback()               // ::1
                 || is_ula_v6(v6)                  // fc00::/7
-                || v6.segments()[0] == 0xfe80      // fe80::/10
+                || (v6.segments()[0] & 0xffc0) == 0xfe80  // fe80::/10 全段（cgp L5：原只匹配 fe80::/64，漏 fe81-febf）
                 || v6.is_multicast()
         }
     }
@@ -208,6 +212,11 @@ fn accumulate_chunk(mut buf: Vec<u8>, chunk: &[u8], limit: usize) -> (Vec<u8>, b
 
 /// fetch/dl 共用客户端：UA + 总超时 + 重定向每跳 SSRF 门 + 可选显式代理。
 /// 门逻辑与单条/批量/并发数无关——每个 client 自带 Policy::custom，批量下每 URL 每跳照走。
+///
+/// 4bq 已知限制（DNS rebinding TOCTOU，PM 拍板接受不修）：resolve_host 的门校验与
+/// reqwest 实际连接是两次独立 DNS 解析——攻击者控制权威 DNS（TTL≈0）可在两解之间
+/// 换 IP 绕门（门判公网、连接打内网）。完整修复需自定义 DNS resolver 把已校验 IP
+/// 钉进连接层（reqwest::ClientBuilder::resolve 仅钉首跳，重定向各跳无法全钉），成本高。
 pub(crate) fn build_client(proxy: Option<&str>, allow: bool, timeout: Duration) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent(format!("gsearch/{}", env!("CARGO_PKG_VERSION")))
@@ -532,8 +541,7 @@ async fn fetch_one_attempt(
     // FixG10 L-2：URL `#N-M` 锚点裁剪——命中时按行号裁 text + 扩 pad 行上下文，meta 记实际范围。
     // 必须在 cap_chars 之后（用最终 text 行号）且在 cap_chars_json 之前（裁后才做 cap；裁后短文无需 cap）。
     if let Some((start, end)) = parse_anchor_range(url) {
-        let pad = opts.anchor_pad_lines;
-        let (cropped, actual) = crop_text_lines(&fetched.text, start, end, pad);
+        let (cropped, actual) = crop_text_lines(&fetched.text, start, end, 0);
         fetched.text = cropped;
         fetched.anchor_crop_range = Some(actual);
         // anchor crop 不引入新截断（crop 本身就是用户精确请求的子集）
@@ -592,7 +600,7 @@ pub async fn cmd_fetch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> {
         return match fetch_one(url, opts, &client).await {
             Ok(FetchOne::Done(fetched)) => {
                 if opts.json {
-                    println!("{}", fetched_json(&fetched));
+                    println!("{}", fetched_json(fetched));
                 } else {
                     if fetched.truncated {
                         eprintln!("注意：正文超上限已截断（省略 {} 字符；--json 输出在 meta 字段标注）", fetched.omitted);
@@ -624,13 +632,16 @@ fn project_json_body(body: &str, keys: &[String]) -> Result<Option<String>> {
         Ok(p) => p,
         Err(_) => return Ok(None),
     };
-    let projected = match project_json_paths(&parsed, keys) {
+    // 0vk M-3：parsed move 进投影（内部 mem::take 摘取，零深拷贝），顶层形态提前记——
+    // Err 路径的parsed 已被摘取不可再读。
+    let is_top_array = parsed.is_array();
+    let projected = match project_json_paths(parsed, keys) {
         Ok(p) => p,
         Err(e) => {
             // 顶层数组误用裸字段路径是最常见错法（GitHub comments/releases API）——
             // 教可行动语法而非让 agent 拿全量回退自己猜（盲测十四 W）。已用 [*] 的失败
             // 是元素缺字段，再教 [*] 会误导，不加。
-            if parsed.is_array() && !keys.iter().any(|k| k.contains('*')) {
+            if is_top_array && !keys.iter().any(|k| k.contains('*')) {
                 anyhow::bail!("{e:#}\n响应为顶层数组：请用 `0.field` 索引语法（如 `0.user.login`）或 `[*]` 通配（如 `[*].tag_name`）");
             }
             return Err(e);
@@ -664,37 +675,41 @@ async fn cmd_fetch_batch(urls: &[String], opts: &FetchOpts, client: &reqwest::Cl
         .collect()
         .await;
 
-    let mut entries = Vec::with_capacity(fetched.len());
-    let mut ok_count = 0usize;
-    for (url, result) in &fetched {
-        match result {
-            Ok(FetchOne::Done(f)) => {
-                ok_count += 1;
-                // status:"ok" 由 fetched_json 统一注入（FixG20 NN，单/批同源）
-                entries.push(fetched_json(f));
-            }
-            Ok(FetchOne::JsShell) => entries.push(serde_json::json!({
-                "url": url,
-                "status": "error",
-                // 8lp②：元素 url 键已携带地址，message 不再重复整段 URL
-                "message": "该页无服务端正文（JS 壳），需渲染：用 gsearch browse",
-            })),
-            Err(e) => {
-                let status = if e.to_string().contains("私网") { "private_blocked" } else { "error" };
-                entries.push(serde_json::json!({ "url": url, "status": status, "message": format!("{e:#}") }));
-            }
-        }
-    }
-
     let total = fetched.len();
+    let mut ok_count = 0usize;
     if opts.json {
         // 对齐 search batch：裸数组、无外层信封，单条失败不阻塞数组整体。
         // 8lp：compact 单行——输出契约面向 agent 消费。
+        // 0vk M-2：消费式迭代——FetchOne owned 化，fetched_json 内 text 可 move 免克隆；
+        // 非 json 分支走下方借用循环（人读路径无 text move 收益）。
+        let mut entries = Vec::with_capacity(total);
+        for (url, result) in fetched {
+            match result {
+                Ok(FetchOne::Done(f)) => {
+                    ok_count += 1;
+                    // status:"ok" 由 fetched_json 统一注入（FixG20 NN，单/批同源）
+                    entries.push(fetched_json(f));
+                }
+                Ok(FetchOne::JsShell) => entries.push(serde_json::json!({
+                    "url": url,
+                    "status": "error",
+                    // 8lp②：元素 url 键已携带地址，message 不再重复整段 URL
+                    "message": "该页无服务端正文（JS 壳），需渲染：用 gsearch browse",
+                })),
+                Err(e) => {
+                    let status = if e.to_string().contains("私网") { "private_blocked" } else { "error" };
+                    entries.push(serde_json::json!({ "url": url, "status": status, "message": format!("{e:#}") }));
+                }
+            }
+        }
         println!("{}", serde_json::to_string(&entries)?);
     } else {
         for (i, (url, result)) in fetched.iter().enumerate() {
             match result {
-                Ok(FetchOne::Done(f)) => println!("=== [{i}/{total}] {} | {} ===\n{}", url, f.title, f.text),
+                Ok(FetchOne::Done(f)) => {
+                    ok_count += 1;
+                    println!("=== [{i}/{total}] {} | {} ===\n{}", url, f.title, f.text)
+                }
                 Ok(FetchOne::JsShell) => println!(
                     "=== [{i}/{total}] {url} ===\n出错: 该页无服务端正文（JS 壳），需渲染：用 gsearch browse {url}"
                 ),
@@ -733,7 +748,7 @@ fn github_thread_comment_gap(url: &str) -> Option<String> {
 /// FixG10 J-2：非空 --json-keys 时顶层只保留指定字段并打 `meta.truncated_by_json_keys: true`；
 /// J-3：--include 多选器命中数写入 meta.include_hits；
 /// L-2：URL `#N-M` 锚点裁剪范围写入 meta.anchor_crop_range。
-fn fetched_json(f: &Fetched) -> serde_json::Value {
+fn fetched_json(mut f: Fetched) -> serde_json::Value {
     let mut meta = serde_json::json!({
         "truncated": f.truncated,
         "omitted": f.omitted,
@@ -777,17 +792,20 @@ fn fetched_json(f: &Fetched) -> serde_json::Value {
     }
     // FixG16：投影命中时 text 为原生 JSON Value（对象/数组原样，agent 免二次解析）；
     // 投影产物被字符预算截成非法 JSON 时回退 string。非投影路径恒为 string（老输出不变）。
+    // 0vk M-2：f 收 owned，text/title 走 mem::take move 免克隆（f 后续字段均为 Copy/已取）。
+    let raw_text = std::mem::take(&mut f.text);
     let text = if f.truncated_by_json_keys {
-        serde_json::from_str::<serde_json::Value>(&f.text).unwrap_or_else(|_| f.text.clone().into())
+        serde_json::from_str::<serde_json::Value>(&raw_text)
+            .unwrap_or_else(|_| raw_text.into())
     } else {
-        f.text.clone().into()
+        raw_text.into()
     };
     // FixG17：投影命中且投影含 title 时顶层 title 回填投影值——顶层 title 原是页面级
     // <title>（JSON API 响应取不到，恒空串），与 text.title 并存造成首读困惑。
     // 无 title 路径 / 投影值非字符串 / 顶层数组 → 维持页面级 title（现状）。
     let title = match text.get("title") {
         Some(serde_json::Value::String(s)) => s.clone(),
-        _ => f.title.clone(),
+        _ => std::mem::take(&mut f.title),
     };
     // FixG20 NN：顶层补 status:"ok"——单 URL 扁平形态与 batch 数组元素同键，消费方按
     // URL 数无需分支解析（NN 曾按 batch 形态解析单 URL 撞 KeyError）；只增不删。
@@ -884,12 +902,14 @@ fn crop_text_lines(text: &str, start: usize, end: usize, pad: usize) -> (String,
 /// 空 paths → 原样返回（不做投影）。
 /// FixG14：多路径末段名冲突（`items.0.title` / `items.1.title` 都要写 key "title"）时，
 /// 冲突 key 改用全路径形态输出，不再静默 last-write-wins；单路径/无冲突保持末段短名。
-fn project_json_paths(v: &serde_json::Value, paths: &[String]) -> Result<serde_json::Value> {
+fn project_json_paths(mut v: serde_json::Value, paths: &[String]) -> Result<serde_json::Value> {
     // 先求值全部路径，再统一定 key 形态（边插边定无法回头改名）。
+    // 0vk M-3：v 收 owned，路径末端节点 mem::take 摘出（零 Value 深拷贝）；副作用是原树
+    // 被掏成 Null，调用方不得再用原树（project_json_body 的 Err 路径只用原始 body 串）。
     let mut resolved: Vec<(String, serde_json::Value)> = Vec::with_capacity(paths.len());
     for path in paths {
         let segments = parse_json_path(path)?;
-        resolved.push(eval_json_path(v, &segments, path)?);
+        resolved.push(eval_json_path(&mut v, &segments, path)?);
     }
     // 冲突检测：路径数是个位数，O(n²) 两两比对足够
     let mut conflicted = vec![false; resolved.len()];
@@ -914,45 +934,47 @@ fn project_json_paths(v: &serde_json::Value, paths: &[String]) -> Result<serde_j
     Ok(serde_json::Value::Object(out))
 }
 
-/// 单条路径求值，返回 (输出 key, 投影值)。无通配：现行为——key 取末段名（数组下标用
+/// 单条路径求值，返回 (输出 key, 投影值)。无通配：key 取末段名（数组下标用
 /// `[N]` 形态）。含 `[*]`（FixG15）：通配前段定位到数组，其余段对每个元素求值，值为数组
 /// 形态、key 取通配后末段名（纯 `[*]` → `"[*]"`）；一条路径最多一个 `[*]`，作用于非数组
 /// → Err（不静默跳过回退全量，盲测十四 V）。
+/// 0vk M-3：v 收 &mut，末端节点 mem::take 摘出（投影值零深拷贝）；被摘位置变 Null
+///（v 是调用方刚解析的临时树，摘后无人再读）。
 fn eval_json_path(
-    v: &serde_json::Value,
+    v: &mut serde_json::Value,
     segs: &[Segment],
     path: &str,
 ) -> Result<(String, serde_json::Value)> {
     let Some(wi) = segs.iter().position(|s| *s == Segment::Wildcard) else {
-        let mut node: &serde_json::Value = v;
+        let mut node: &mut serde_json::Value = v;
         for seg in segs {
-            node = step_json_path(node, seg, path)?;
+            node = step_json_path_mut(node, seg, path)?;
         }
         let key = match segs.last().expect("至少一段") {
             Segment::Field(n) => n.clone(),
             Segment::Index(i) => format!("[{i}]"),
             Segment::Wildcard => unreachable!("position 为 None 即无通配"),
         };
-        return Ok((key, node.clone()));
+        return Ok((key, std::mem::take(node)));
     };
     if segs[wi + 1..].contains(&Segment::Wildcard) {
         anyhow::bail!("json-keys 一条路径最多一个 [*] 通配: {path:?}");
     }
-    // 通配前段定位到数组节点（如 `data.items[*].tag_name` 的 `data.items`）
-    let mut node: &serde_json::Value = v;
+    // 通配前段定位到数组节点（如 `data.items[*].tag_name` 的 `data.items`），整个数组摘出
+    let mut node: &mut serde_json::Value = v;
     for seg in &segs[..wi] {
-        node = step_json_path(node, seg, path)?;
+        node = step_json_path_mut(node, seg, path)?;
     }
-    let arr = node
-        .as_array()
-        .ok_or_else(|| anyhow!("json-keys 通配符 [*] 要求当前节点为数组: {path:?}"))?;
+    let serde_json::Value::Array(arr) = std::mem::take(node) else {
+        anyhow::bail!("json-keys 通配符 [*] 要求当前节点为数组: {path:?}");
+    };
     let mut vals = Vec::with_capacity(arr.len());
-    for el in arr {
-        let mut n = el;
+    for mut el in arr {
+        let mut cur = &mut el;
         for seg in &segs[wi + 1..] {
-            n = step_json_path(n, seg, path)?;
+            cur = step_json_path_mut(cur, seg, path)?;
         }
-        vals.push(n.clone());
+        vals.push(std::mem::take(cur));
     }
     let key = match segs.last().expect("至少一段") {
         Segment::Field(n) => n.clone(),
@@ -962,18 +984,18 @@ fn eval_json_path(
     Ok((key, serde_json::Value::Array(vals)))
 }
 
-/// 单步求值：Field/Index 走既有语义；Wildcard 只在 eval_json_path 的扇出层消费，
-/// 走到这里说明一条路径里有第二个 `[*]`。
-fn step_json_path<'a>(
-    node: &'a serde_json::Value,
+/// 单步求值（&mut 版，错误文案与原 & 版逐字一致）：Field/Index 走既有语义；Wildcard
+/// 只在 eval_json_path 的扇出层消费，走到这里说明一条路径里有第二个 `[*]`。
+fn step_json_path_mut<'a>(
+    node: &'a mut serde_json::Value,
     seg: &Segment,
     path: &str,
-) -> Result<&'a serde_json::Value> {
+) -> Result<&'a mut serde_json::Value> {
     match seg {
-        Segment::Field(name) => node.get(name).ok_or_else(|| {
+        Segment::Field(name) => node.get_mut(name).ok_or_else(|| {
             anyhow!("json-keys 路径无此字段: {path:?}（在 {name:?} 处失败）")
         }),
-        Segment::Index(i) => node.get(*i).ok_or_else(|| {
+        Segment::Index(i) => node.get_mut(*i).ok_or_else(|| {
             anyhow!("json-keys 数组下标越界: {path:?}（[{i}] 失败）")
         }),
         Segment::Wildcard => anyhow::bail!("json-keys 一条路径最多一个 [*] 通配: {path:?}"),
@@ -1235,7 +1257,7 @@ fn process_html(url: &str, html: &str, is_html: bool, limit: usize) -> Fetched {
         let doc = Html::parse_document(&strip_summary_elements(html));
         (tree_title(&doc), collapse_preserving_code(tree_text(&doc)))
     } else {
-        (String::new(), collapse_blank(html.to_string()))
+        (String::new(), collapse_blank(html))
     };
     // P1 fetch JSON 截断修复：GitHub API 等 JSON 源按字节截断会出半截 JSON，
     // json.loads 直接 UnclosedBraceError（G 盲测八实锤）。检测文本以 `{`/`[`
@@ -1404,7 +1426,7 @@ fn collapse_preserving_code(s: String) -> String {
         if i % 2 == 1 {
             out.push_str(seg);
         } else {
-            out.push_str(&collapse_blank(seg.to_string()));
+            out.push_str(&collapse_blank(seg));
         }
     }
     out
@@ -1433,11 +1455,13 @@ fn is_block_boundary(name: &str) -> bool {
 }
 
 /// 空白规整：行内连续空白 → 单空格；换行 → 单换行；去首尾。
-fn collapse_blank(s: String) -> String {
+/// 0vk M-1：收 &str 且 trim 前置（借用零拷贝）——首尾空白只置 pending 永不 push，
+/// 输出与旧实现（先建 out 再 trim().to_string()）逐字节一致，省 1×T 拷贝。
+fn collapse_blank(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut pending_nl = false;
     let mut pending_sp = false;
-    for c in s.chars() {
+    for c in s.trim().chars() {
         if c.is_whitespace() {
             if c == '\n' {
                 pending_nl = true;
@@ -1458,7 +1482,7 @@ fn collapse_blank(s: String) -> String {
             out.push(c);
         }
     }
-    out.trim().to_string()
+    out
 }
 
 /// --include：逗号分隔 selector 依序试（scraper 解析），FixG10 J-3 累加所有命中容器（多选器全要），
@@ -1626,9 +1650,9 @@ mod tests {
             {"tag_name": "v0.9.0", "body": "b"},
             {"tag_name": "v0.8.0", "body": "c"},
         ]);
-        let out = project_json_paths(&payload, &["[*].tag_name".to_string()]).unwrap();
+        let out = project_json_paths(payload.clone(), &["[*].tag_name".to_string()]).unwrap();
         assert_eq!(out, serde_json::json!({"tag_name": ["v1.0.0", "v0.9.0", "v0.8.0"]}));
-        let out = project_json_paths(&payload, &["[*]".to_string()]).unwrap();
+        let out = project_json_paths(payload.clone(), &["[*]".to_string()]).unwrap();
         assert_eq!(out, serde_json::json!({"[*]": payload.clone()}));
     }
 
@@ -1640,7 +1664,7 @@ mod tests {
             {"user": {"login": "bob"}, "body": "second"},
         ]);
         let out = project_json_paths(
-            &payload,
+            payload.clone(),
             &["0.user.login".to_string(), "[*].body".to_string()],
         )
         .unwrap();
@@ -1651,7 +1675,7 @@ mod tests {
     #[test]
     fn project_json_paths_wildcard_on_non_array_errors() {
         let payload = serde_json::json!({"tag_name": "v1.0.0"});
-        let err = project_json_paths(&payload, &["[*].tag_name".to_string()]).unwrap_err();
+        let err = project_json_paths(payload.clone(), &["[*].tag_name".to_string()]).unwrap_err();
         assert!(err.to_string().contains("数组"), "err: {err:#}");
     }
 
@@ -1907,6 +1931,27 @@ mod tests {
         assert!(is_private_ip("fd12:3456::1".parse().unwrap()));  // fd00::/8 = ULA
         assert!(is_private_ip("fe80::1".parse().unwrap()));
         assert!(!is_private_ip("2001:4860:4860::8888".parse().unwrap()));  // Google DNS IPv6
+        // cgp L2：100.64.0.0/10 CGNAT/Tailscale 段（原漏判按公网放行）
+        assert!(is_private_ip("100.64.0.1".parse::<Ipv4Addr>().unwrap().into()));
+        assert!(is_private_ip("100.127.255.254".parse::<Ipv4Addr>().unwrap().into()));
+        assert!(!is_private_ip("100.63.255.255".parse::<Ipv4Addr>().unwrap().into()));
+        assert!(!is_private_ip("100.128.0.1".parse::<Ipv4Addr>().unwrap().into()));
+        // cgp L5：fe80::/10 全段（fe81-febf 原漏判；fec0 起不属于 link-local）
+        assert!(is_private_ip("fe80::1".parse().unwrap()));
+        assert!(is_private_ip("fe9f::1".parse().unwrap()));
+        assert!(is_private_ip("febf::1".parse().unwrap()));
+        assert!(!is_private_ip("fec0::1".parse().unwrap()));
+        assert!(!is_private_ip("fe7f::1".parse().unwrap()));
+    }
+
+    /// cgp L3：resolve_host 对带 [] 的 IPv6 字面量直读（URL host 形态）——
+    /// 公网字面量可解析（重定向 policy 不再 fail-closed 误拒），私网字面量照常判私网。
+    #[test]
+    fn resolve_host_parses_bracketed_ipv6_literals() {
+        let ip = resolve_host("[2001:4860:4860::8888]").expect("公网 IPv6 字面量应可解析");
+        assert!(!is_private_ip(ip), "公网 IPv6 字面量不应判私网");
+        let ip = resolve_host("[::1]").expect("私网 IPv6 字面量应可解析");
+        assert!(is_private_ip(ip), "::1 应判私网");
     }
 
     /// Important-1：非 http(s) scheme 同样拒绝（fetch 子命令定位 = 互联网只读）。
@@ -1981,7 +2026,7 @@ mod tests {
         assert_eq!(f.text.chars().count(), 3);
         assert_eq!(f.omitted, full.text.chars().count() - 3);
         // JSON 载荷 meta.truncated 标注同步
-        let v = fetched_json(&f);
+        let v = fetched_json(f);
         assert_eq!(v["meta"]["truncated"], serde_json::json!(true));
         assert!(v["meta"]["omitted"].as_u64().unwrap() > 0);
     }
@@ -1991,7 +2036,7 @@ mod tests {
     #[test]
     fn fetched_json_includes_status_ok() {
         let f = Fetched { url: "u".into(), title: "t".into(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
-        let v = fetched_json(&f);
+        let v = fetched_json(f);
         assert_eq!(v["status"], serde_json::json!("ok"), "单/批两形态都应有顶层 status: {v}");
     }
 
@@ -2034,12 +2079,12 @@ mod tests {
             auto_include_applied: None,
             include_overridden_by_user: false,
         };
-        let v = fetched_json(&f);
+        let v = fetched_json(f);
         assert_eq!(v["meta"]["github_comments_missing"], serde_json::json!(true));
         assert!(v["meta"]["github_comments_hint"].as_str().unwrap().contains("api.github.com"));
 
         let f2 = Fetched { url: "https://e.test/".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
-        let v2 = fetched_json(&f2);
+        let v2 = fetched_json(f2);
         assert!(v2["meta"].get("github_comments_missing").is_none(), "非 thread 页不得出键");
         assert!(v2["meta"].get("github_comments_hint").is_none());
     }
@@ -2049,11 +2094,11 @@ mod tests {
     fn fetched_json_truncated_by_json_keys_flag() {
         // true：键出
         let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: true, auto_include_applied: None, include_overridden_by_user: false };
-        let v = fetched_json(&f);
+        let v = fetched_json(f);
         assert_eq!(v["meta"]["truncated_by_json_keys"], serde_json::json!(true));
         // false：键缺席
         let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
-        let v2 = fetched_json(&f2);
+        let v2 = fetched_json(f2);
         assert!(v2["meta"].get("truncated_by_json_keys").is_none(), "默认不得出键");
     }
 
@@ -2078,13 +2123,13 @@ mod tests {
             auto_include_applied: None,
             include_overridden_by_user: false,
         };
-        let hit = fetched_json(&mk(true, r#"{"tag_name":"v1.53.2"}"#));
+        let hit = fetched_json(mk(true, r#"{"tag_name":"v1.53.2"}"#));
         assert_eq!(hit["text"], serde_json::json!({"tag_name": "v1.53.2"}), "投影命中应为原生对象: {hit}");
         // 投影产物被字符预算截断成非法 JSON → 回退 string
-        let cut = fetched_json(&mk(true, r#"{"tag_name":"v1"#));
+        let cut = fetched_json(mk(true, r#"{"tag_name":"v1"#));
         assert!(cut["text"].is_string(), "非法 JSON 投影产物应回退 string: {cut}");
         // 非投影路径恒为 string
-        let plain = fetched_json(&mk(false, r#"{"tag_name":"v1.53.2"}"#));
+        let plain = fetched_json(mk(false, r#"{"tag_name":"v1.53.2"}"#));
         assert!(plain["text"].is_string(), "非投影 text 恒为 string: {plain}");
     }
 
@@ -2110,13 +2155,13 @@ mod tests {
             include_overridden_by_user: false,
         };
         // 对象投影含 title → 顶层回填投影值
-        let hit = fetched_json(&mk(true, "", r#"{"title":"tokio issue","state":"open"}"#));
+        let hit = fetched_json(mk(true, "", r#"{"title":"tokio issue","state":"open"}"#));
         assert_eq!(hit["title"], serde_json::json!("tokio issue"), "投影 title 应回填顶层: {hit}");
         // 投影无 title 路径 → 维持页面级 title（空串现状）
-        let no_title = fetched_json(&mk(true, "", r#"{"state":"open"}"#));
+        let no_title = fetched_json(mk(true, "", r#"{"state":"open"}"#));
         assert_eq!(no_title["title"], serde_json::json!(""), "无 title 路径维持现状: {no_title}");
         // 顶层数组投影（[*]）取不出字符串 title → 维持页面级
-        let arr = fetched_json(&mk(true, "page title", r#"[{"title":"a"},{"title":"b"}]"#));
+        let arr = fetched_json(mk(true, "page title", r#"[{"title":"a"},{"title":"b"}]"#));
         assert_eq!(arr["title"], serde_json::json!("page title"), "数组投影不回填: {arr}");
     }
 
@@ -2126,15 +2171,15 @@ mod tests {
     fn fetched_json_truncated_at_offset_emits_when_truncated() {
         // truncated=true + Some(off) → meta 出键
         let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: true, omitted: 100, truncated_at_offset: Some(3000), include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
-        let v = fetched_json(&f);
+        let v = fetched_json(f);
         assert_eq!(v["meta"]["truncated_at_offset"], serde_json::json!(3000));
         // truncated=true + None → 键缺席（不与 truncated 键语义重叠）
         let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: true, omitted: 100, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
-        let v2 = fetched_json(&f2);
+        let v2 = fetched_json(f2);
         assert!(v2["meta"].get("truncated_at_offset").is_none());
         // truncated=false → 键缺席
         let f3 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
-        let v3 = fetched_json(&f3);
+        let v3 = fetched_json(f3);
         assert!(v3["meta"].get("truncated_at_offset").is_none());
     }
 
@@ -2226,23 +2271,23 @@ mod tests {
             ],
         });
         // 裸首段（无前导 .）：合法
-        let out = project_json_paths(&payload, &["crate.max_stable_version".into()]).unwrap();
+        let out = project_json_paths(payload.clone(), &["crate.max_stable_version".into()]).unwrap();
         assert_eq!(out["max_stable_version"], serde_json::json!("1.39.2"));
         assert_eq!(out.as_object().unwrap().len(), 1);
         // 多字段 + 数组下标
-        let out = project_json_paths(&payload, &["crate.max_version".into(), "versions[0].num".into()]).unwrap();
+        let out = project_json_paths(payload.clone(), &["crate.max_version".into(), "versions[0].num".into()]).unwrap();
         assert_eq!(out["max_version"], serde_json::json!("1.40.0"));
         // versions[0].num 的末段是 Field("num") → key 名为 "num"
         assert_eq!(out["num"], serde_json::json!("1.39.2"));
         // 仅数组下标（直接 `[0]`）→ key 用 `[0]` 形态
-        let out2 = project_json_paths(&payload, &["versions[0]".into()]).unwrap();
+        let out2 = project_json_paths(payload.clone(), &["versions[0]".into()]).unwrap();
         assert_eq!(out2["[0]"], serde_json::json!({"num": "1.39.2", "yanked": false}));
         // 字段不存在 → Err（不静默吞掉）
-        assert!(project_json_paths(&payload, &["crate.nonexistent".into()]).is_err());
+        assert!(project_json_paths(payload.clone(), &["crate.nonexistent".into()]).is_err());
         // 数组下标越界 → Err
-        assert!(project_json_paths(&payload, &["versions[99].num".into()]).is_err());
+        assert!(project_json_paths(payload.clone(), &["versions[99].num".into()]).is_err());
         // 前导 . 形式仍兼容
-        let out3 = project_json_paths(&payload, &[".crate.max_version".into()]).unwrap();
+        let out3 = project_json_paths(payload.clone(), &[".crate.max_version".into()]).unwrap();
         assert_eq!(out3["max_version"], serde_json::json!("1.40.0"));
     }
 
@@ -2327,11 +2372,11 @@ mod tests {
     #[test]
     fn fetched_json_include_overridden_by_user_emits_only_when_true() {
         let overridden = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: Some(true), include_hits: Some(1), markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: Some("docs.rs".into()), include_overridden_by_user: true };
-        let v = fetched_json(&overridden);
+        let v = fetched_json(overridden);
         assert_eq!(v["meta"]["auto_include_applied"], serde_json::json!("docs.rs"), "覆盖时 label 恒在");
         assert_eq!(v["meta"]["include_overridden_by_user"], serde_json::json!(true));
         let plain = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
-        let v2 = fetched_json(&plain);
+        let v2 = fetched_json(plain);
         assert!(v2["meta"].get("include_overridden_by_user").is_none(), "无覆盖不得出键");
         assert!(v2["meta"].get("auto_include_applied").is_none(), "host 未命中不得出键");
     }
@@ -2564,15 +2609,15 @@ mod tests {
     fn fetched_json_auto_include_applied_emits_when_set() {
         // Some("github")：meta 出键
         let f = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: Some("github".into()), include_overridden_by_user: false };
-        let v = fetched_json(&f);
+        let v = fetched_json(f);
         assert_eq!(v["meta"]["auto_include_applied"], serde_json::json!("github"));
         // Some("docs.rs")：meta 出键
         let f2 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: Some("docs.rs".into()), include_overridden_by_user: false };
-        let v2 = fetched_json(&f2);
+        let v2 = fetched_json(f2);
         assert_eq!(v2["meta"]["auto_include_applied"], serde_json::json!("docs.rs"));
         // None：键缺席（默认输出逐键不变）
         let f3 = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
-        let v3 = fetched_json(&f3);
+        let v3 = fetched_json(f3);
         assert!(v3["meta"].get("auto_include_applied").is_none(), "默认不得出键");
     }
 
@@ -2588,7 +2633,6 @@ mod tests {
         assert!(!opts.markdown);
         assert!(opts.include.is_none());
         assert!(opts.json_keys.is_empty());
-        assert_eq!(opts.anchor_pad_lines, 0);
         assert!(opts.proxy.is_none());
         assert!(!opts.allow_private);
     }
@@ -2660,7 +2704,7 @@ mod tests {
         ] {
             assert_eq!(
                 collapse_preserving_code(raw.to_string()),
-                collapse_blank(raw.to_string()),
+                collapse_blank(raw),
                 "无哨兵必须等价: {raw:?}"
             );
         }
@@ -2729,14 +2773,14 @@ mod tests {
             {"user": {"login": "bob"}, "body": "second"}
         ]);
         let out = project_json_paths(
-            &payload,
+            payload.clone(),
             &["0.user.login".to_string(), "0.body".to_string()],
         )
         .unwrap();
         assert_eq!(out["login"], serde_json::json!("alice"));
         assert_eq!(out["body"], serde_json::json!("first comment"));
         // 越界仍报错（不静默）
-        let err = project_json_paths(&payload, &["9.user.login".to_string()]).unwrap_err();
+        let err = project_json_paths(payload.clone(), &["9.user.login".to_string()]).unwrap_err();
         assert!(err.to_string().contains("越界"), "越界语义: {err}");
     }
 
@@ -2871,7 +2915,7 @@ mod tests {
     fn project_json_paths_conflicting_keys_use_full_path() {
         let payload = serde_json::json!({"items": [{"title": "a"}, {"title": "b"}]});
         let out = project_json_paths(
-            &payload,
+            payload.clone(),
             &["items.0.title".into(), "items.1.title".into()],
         )
         .unwrap();
@@ -2879,7 +2923,7 @@ mod tests {
         assert_eq!(out["items.1.title"], serde_json::json!("b"));
         assert_eq!(out.as_object().unwrap().len(), 2, "两条都保留");
         // 单路径/无冲突：末段短名形态与旧版一致
-        let single = project_json_paths(&payload, &["items.0.title".into()]).unwrap();
+        let single = project_json_paths(payload.clone(), &["items.0.title".into()]).unwrap();
         assert_eq!(single["title"], serde_json::json!("a"));
         assert_eq!(single.as_object().unwrap().len(), 1);
     }
@@ -2906,11 +2950,11 @@ mod tests {
     #[test]
     fn fetched_json_marks_raw_format() {
         let f = raw_fetched("https://e.test/x", "<html>hi</html>", 50_000, false);
-        let v = fetched_json(&f);
+        let v = fetched_json(f);
         assert_eq!(v["meta"]["format"], serde_json::json!("raw"));
         assert_eq!(v["meta"]["content_untrusted"], serde_json::json!(true), "content_untrusted 恒在");
         // 非 raw 路径不得出 format="raw" 键（默认输出结构不变）
         let plain = Fetched { url: "u".into(), title: String::new(), text: "x".into(), truncated: false, omitted: 0, truncated_at_offset: None, include_hit: None, include_hits: None, markdown: false, raw: false, github_comment_hint: None, anchor_crop_range: None, truncated_by_json_keys: false, auto_include_applied: None, include_overridden_by_user: false };
-        assert!(fetched_json(&plain)["meta"].get("format").is_none(), "非 raw 非 markdown 不得出 format 键");
+        assert!(fetched_json(plain)["meta"].get("format").is_none(), "非 raw 非 markdown 不得出 format 键");
     }
 }

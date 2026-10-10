@@ -15,7 +15,6 @@ use chromiumoxide::cdp::browser_protocol::browser::{
 
 use gsearch::browser::{BrowserKind, launch_with_kind_proxy, open_page, spawn_handler};
 use gsearch::search::is_captcha;
-use gsearch::skeleton::extract_adaptive;
 use gsearch::util::filename_from_url;
 
 const PAGE_TIMEOUT_SECS: u64 = 30;
@@ -179,7 +178,8 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
                     // browse 侧 query 恒空（schema 约定同 browse/dl）
                     query: String::new(),
                     profile: gsearch::browser::profile_name_only(),
-                    proxy: opts.proxy.clone(),
+                    // 4bq M2：meta.proxy 进 JSON 输出前脱敏凭据（与日志侧 bfa3efe 同源）
+                    proxy: opts.proxy.as_deref().map(gsearch::util::redact_proxy),
                     humanize: false,
                     limit: 0,
                     elapsed_ms: started.elapsed().as_millis(),
@@ -228,14 +228,13 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
             None => postproc::eval_string_retry(&page, "document.title").await,
         };
         let html_full = html_probe;
-        let (html, truncated, omitted, truncated_at_offset) =
-            postproc::cap_extract_source(&html_full, opts.max_chars, url);
-        let mut read = extract_adaptive(&html, None);
+        let (mut read, truncated, omitted, truncated_at_offset) =
+            postproc::extract_adaptive_capped(&html_full, opts.max_chars, url, None);
         read.url = url.to_string();
         read.title = title;
-        // 打回轮2：browse 空正文保底（PM 公式两形态：截断吃光 / content 拿空）——
-        // agent 一轮自救（--markdown 或 --full），不再静默空输出
-        if needs_empty_body_hint(read.summary_paragraphs.len(), opts.headings_only, omitted, html_full.trim().is_empty()) {
+        // 打回轮2（PM 公式形态二「content 拿空」专用）：截断吃光形态（omitted>0）的
+        // hint 已由 render_read 打，此处 omitted 传 0 避免同一页双行重复（2se）
+        if needs_empty_body_hint(read.summary_paragraphs.len(), opts.headings_only, 0, html_full.trim().is_empty()) {
             eprintln!("[hint] 正文提取为空，试 --markdown 或 --full");
         }
 

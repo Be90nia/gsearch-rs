@@ -10,5 +10,3 @@ pub mod searxng;
 pub mod types;
 pub mod util;
 pub mod verify;
-
-pub use types::SearchResult;
