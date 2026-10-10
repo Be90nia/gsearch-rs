@@ -117,7 +117,7 @@ fn resolve_host(host: &str) -> Result<IpAddr> {
 
 /// SSRF 私网门（Important-1）：命中以下任一即拒绝。
 /// - IPv4: 0.0.0.0/8、127.0.0.0/8、10.0.0.0/8、172.16.0.0/12、192.168.0.0/16、169.254.0.0/16
-/// - IPv6: ::1、fc00::/7（ULA）、fe80::/10（link-local，含 IPv4-mapped 形态）
+/// - IPv6: ::1、fc00::/7（ULA）、fe80::/10（link-local）；::ffff:x.y.z.w 先转 V4 再判（qmg）
 ///
 /// 169.254.169.254（云 metadata）落在 169.254.0.0/16 内自动覆盖。
 fn is_private_ip(ip: IpAddr) -> bool {
@@ -130,6 +130,10 @@ fn is_private_ip(ip: IpAddr) -> bool {
                 || v4.is_multicast()
         }
         IpAddr::V6(v6) => {
+            // qmg：IPv4-mapped（::ffff:a.b.c.d）先转 V4 判私网——v4 私网换 v6 伪装不得绕门
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(IpAddr::V4(v4));
+            }
             v6.is_unspecified()
                 || v6.is_loopback()               // ::1
                 || is_ula_v6(v6)                  // fc00::/7
@@ -157,21 +161,17 @@ pub(crate) fn allow_private_requested(flag: bool) -> bool {
 /// URL → host → IP → 私网判定（pkp 拆分：无调用方文案的纯判定层）。
 /// 返回 (host, ip, 是否私网)。私网性始终返回——调用方结合 allow_private 决定拒/放行，
 /// 错误文案由调用方（fetch / browse 门）各自包装，避免 browse 场景打出「fetch 拒绝」。
+/// qmg：host 提取走 url crate（reqwest::Url 再导出，与连接层同一 parser）——手工切片
+/// 不认 userinfo（`http://a.com:80@192.168.1.1/` 门判公网、实连私网），reqwest 实际
+/// 连接的 host 与本门判定的 host 由此保证零分歧；IPv6 字面量也从解析结果直取。
 pub(crate) fn classify_url(url: &str) -> Result<(String, IpAddr, bool)> {
-    let scheme_end = url.find("://").ok_or_else(|| anyhow!("URL 无 scheme: {url}"))?;
-    let after_scheme = &url[scheme_end + 3..];
-    // host 提取：IPv6 字面量（[...]）vs 主机名（首个 '/?#:' 截断）
-    let host = if let Some(rest) = after_scheme.strip_prefix('[') {
-        // IPv6：到 ']' 止；'/' '?' '#' 若先于 ']' 出现则视为裸主机名
-        let close = rest.find(']').ok_or_else(|| anyhow!("URL IPv6 host 未闭合: {url}"))?;
-        &rest[..close]
-    } else {
-        // 普通 host：到首个 '/?#:'（端口分隔）止
-        let host_end = after_scheme
-            .find(['/', '?', '#', ':'])
-            .unwrap_or(after_scheme.len());
-        &after_scheme[..host_end]
-    };
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("URL 解析失败: {url}"))?;
+    let host_str = parsed.host_str().ok_or_else(|| anyhow!("URL host 为空: {url}"))?;
+    // IPv6 字面量序列化带方括号（[::1]）：成对剥除后再走字面量/DNS 判定
+    let host = host_str
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host_str);
     let ip = resolve_host(host)?;
     let private = is_private_ip(ip);
     Ok((host.to_string(), ip, private))
@@ -238,6 +238,15 @@ pub(crate) fn build_client(proxy: Option<&str>, allow: bool, timeout: Duration) 
         builder = builder.proxy(reqwest::Proxy::all(p).context("代理 URL 无效")?);
     }
     builder.build().context("构建 HTTP 客户端失败")
+}
+
+/// uvi：单命令一次构建 client——(proxy, allow, timeout) 三参数在单条命令生命周期内恒定
+/// （FixG10 J-1 的 --timeout clamp 也收敛在这唯一一处）；重定向 SSRF 门是 builder 级
+/// Policy::custom，复用同一 client 不受影响。
+fn command_client(opts: &FetchOpts) -> Result<reqwest::Client> {
+    let allow = allow_private_requested(opts.allow_private);
+    let timeout_secs = opts.timeout_secs.clamp(1, FETCH_TIMEOUT_MAX_SECS);
+    build_client(opts.proxy.as_deref(), allow, Duration::from_secs(timeout_secs))
 }
 
 /// Content-Type 判 PDF（含参数形态 `application/pdf; charset=binary`，大小写不敏感）。
@@ -314,7 +323,8 @@ fn should_retry(err_msg: &str, has_budget: bool) -> bool {
 /// 单 URL 拉取 + 提取（不含输出）。批量与单条共用；每 URL 独立过 SSRF 门（含重定向每跳）。
 /// FixG10 J-1：失败重试 loop——仅对网络/超时错误重试；HTTP 4xx 立即放弃（5xx 也重试，
 /// 因为 502/503/504 服务端瞬时错误常抖几下就好）。每次重试 stderr 一行 backoff + 提示。
-async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
+/// uvi：client 由命令入口构建一次传入（三参数命令内恒定），重试 loop 不再逐次重建。
+async fn fetch_one(url: &str, opts: &FetchOpts, client: &reqwest::Client) -> Result<FetchOne> {
     if !http_or_https_scheme(url) {
         return Err(anyhow!("fetch 仅支持 http/https URL（拒绝: {url}）"));
     }
@@ -329,8 +339,6 @@ async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
             "fetch 仅支持 https：公网明文 http 已禁用（防降级与重定向 SSRF 中转）。--allow-private 仅放行内网 http，对公网地址无效；如该站有 https 地址请改用 https: {url}"
         ));
     }
-    // FixG10 J-1：--timeout 注入；clamp 上限 300s（防止误传 86400 把 fetch 跑挂）。
-    let timeout_secs = opts.timeout_secs.clamp(1, FETCH_TIMEOUT_MAX_SECS);
     let retry = opts.retry.min(FETCH_RETRY_MAX);
     let total_attempts = retry + 1; // 含首次 = retry+1 次
 
@@ -345,7 +353,7 @@ async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
             );
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
-        match fetch_one_attempt(url, opts, timeout_secs, allow).await {
+        match fetch_one_attempt(url, opts, client).await {
             Ok(r) => return Ok(r),
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -362,13 +370,12 @@ async fn fetch_one(url: &str, opts: &FetchOpts) -> Result<FetchOne> {
 
 /// 单次 fetch 尝试（不含重试 loop）：抓响应 → 提取 → 组装 Fetched。
 /// 拆出便于 J-1 重试 loop 包裹；其余逻辑（SSRF / scheme / Content-Type / 累积）保持不动。
+/// uvi：client 复用命令入口的构建（timeout/proxy/allow 已烘焙进 client），不再每 attempt 重建。
 async fn fetch_one_attempt(
     url: &str,
     opts: &FetchOpts,
-    timeout_secs: u64,
-    allow: bool,
+    client: &reqwest::Client,
 ) -> Result<FetchOne> {
-    let client = build_client(opts.proxy.as_deref(), allow, Duration::from_secs(timeout_secs))?;
     let resp = client
         .get(url)
         .send()
@@ -579,8 +586,10 @@ fn raw_fetched(url: &str, body: &str, limit: usize, body_truncated: bool) -> Fet
 /// 退出码：0 成功；1 JS 壳（需渲染）/ 私网门拒（由 main 统一打印，HTTP 错误经 anyhow → exit 1）。
 pub async fn cmd_fetch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> {
     let started = Instant::now();
+    // uvi：单命令单 client——单条与 batch 共用（fetch_one_attempt 不再每 URL×attempt 重建）
+    let client = command_client(opts)?;
     if let [url] = urls {
-        return match fetch_one(url, opts).await {
+        return match fetch_one(url, opts, &client).await {
             Ok(FetchOne::Done(fetched)) => {
                 if opts.json {
                     println!("{}", fetched_json(&fetched));
@@ -602,7 +611,7 @@ pub async fn cmd_fetch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> {
             Err(e) => Err(e),
         };
     }
-    let code = cmd_fetch_batch(urls, opts).await?;
+    let code = cmd_fetch_batch(urls, opts, &client).await?;
     flush_stdout();
     Ok(code)
 }
@@ -643,11 +652,12 @@ fn flush_stdout() {
 }
 
 /// 批量：并发上限 5（防目标站/出口压力），buffered 保持输入序；每条独立过 SSRF 门（含重定向每跳）。
-async fn cmd_fetch_batch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> {
+/// uvi：client 由 cmd_fetch 构建一次传入，全 batch 共用。
+async fn cmd_fetch_batch(urls: &[String], opts: &FetchOpts, client: &reqwest::Client) -> Result<ExitCode> {
     use futures::stream::{StreamExt, iter};
     let fetched: Vec<(String, Result<FetchOne>)> = iter(urls.iter().cloned())
         .map(|u| async move {
-            let r = fetch_one(&u, opts).await;
+            let r = fetch_one(&u, opts, client).await;
             (u, r)
         })
         .buffered(FETCH_CONCURRENCY)
@@ -1843,6 +1853,39 @@ mod tests {
         ] {
             gate_check(url, true).expect(url);
         }
+    }
+
+    /// qmg：userinfo 混淆——`http://a.com:80@192.168.1.1/` 的真实连接目标是 @ 后的 host，
+    /// 门判定与 reqwest 同走 url crate parser，必须按 @ 后 host 判私网拒掉。
+    #[test]
+    fn ssrf_gate_rejects_userinfo_obfuscation() {
+        for bad in [
+            "http://a.com:80@192.168.1.1/",
+            "http://evil.example@10.0.0.5/x",
+            "http://user:pass@169.254.169.254/latest/meta-data/",
+            "http://x@[::1]/admin",                  // userinfo + IPv6 字面量
+            "http://192.168.1.1\\@public.example/",  // 反斜杠：url crate 按 '/' 归一 → 实连 192.168.1.1
+        ] {
+            let err = gate_check(bad, false).unwrap_err();
+            assert!(err.to_string().contains("拒绝"), "应拒绝 {bad}: {err}");
+        }
+    }
+
+    /// qmg：IPv4-mapped IPv6（::ffff:x.y.z.w）先转 V4 判私网——v4 私网换 v6 伪装不得绕门，
+    /// mapped 公网照常放行。
+    #[test]
+    fn ssrf_gate_rejects_ipv4_mapped_v6() {
+        for (url, private) in [
+            ("http://[::ffff:192.168.1.1]/", true),
+            ("http://[::ffff:10.0.0.5]/x", true),
+            ("http://[::ffff:169.254.169.254]/latest/meta-data/", true),
+            ("http://[::ffff:8.8.8.8]/", false),     // mapped 公网放行
+        ] {
+            let (_host, _ip, is_priv) = classify_url(url).expect(url);
+            assert_eq!(is_priv, private, "私网判定错误: {url}");
+        }
+        assert!(is_private_ip("::ffff:172.16.0.1".parse().unwrap()));
+        assert!(!is_private_ip("::ffff:1.1.1.1".parse().unwrap()));
     }
 
     /// Important-1：is_private_ip 覆盖各 IPv4 / IPv6 段（含 ::1 与 fc00::/7 边界）。

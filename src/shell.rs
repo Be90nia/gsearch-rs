@@ -25,7 +25,7 @@ use gsearch::skeleton::extract_adaptive;
 use gsearch::types::SearchResult;
 use gsearch::util::filename_from_url;
 
-use crate::postproc::{cap_chars, read_max_chars, render_read, wait_content_stable};
+use crate::postproc::{cap_chars, content_retry, read_max_chars, render_read, wait_content_stable};
 
 const TEXT_MAX_CHARS: usize = 5000;
 const PAGE_TIMEOUT_SECS: u64 = 30;
@@ -66,56 +66,74 @@ pub async fn run_shell() -> Result<ExitCode> {
     let (browser, handler) = browser::launch(true).await.context("启动 Chrome 失败")?;
     let handler_task = Some(browser::spawn_handler(handler));
 
-    let page = browser::open_page(&browser).await.context("创建初始 page 失败")?;
-
-    let mut ctx = ShellCtx {
-        browser,
-        page,
-        last_results: Vec::new(),
-        last_snap: Vec::new(),
-        current_url: String::new(),
-        handler_task,
-        human_solved: Arc::new(AtomicBool::new(false)),
-    };
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-    println!("进入 gsearch shell（输入 help 查命令，exit / quit / Ctrl+D 退出）");
-    let mut stdout = io::stdout();
-    let mut buf = String::new();
-    loop {
-        buf.clear();
-        print!("{PROMPT}");
-        stdout.flush()?;
-        let n = reader.read_line(&mut buf)?;
-        if n == 0 {
-            // EOF：Ctrl+D（Unix）或 Ctrl+Z 回车（Windows）
-            println!();
-            break;
-        }
-        // 命令行输入也算"用户活跃"——重置 human_solved 让下条 search 命令不会被旧信号立即 break
-        ctx.human_solved.store(false, std::sync::atomic::Ordering::Relaxed);
-        let line = buf.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        let Some(cmd) = parts.next() else {
-            continue;
+    // n9j（对齐 main.rs H2 收尾）：browser 停在外层 slot，内层 async 块任何 ? 早退（page
+    // 创建失败）由外层统一 graceful_close 再返回——Browser::drop 在 Windows 上不杀子进程，
+    // 裸 ? 早退会留 chrome.exe 残留 + profile 锁。
+    let mut slot: Option<Browser> = Some(browser);
+    let rc: Result<ExitCode> = async {
+        let page = browser::open_page(slot.as_ref().expect("browser 刚放入 slot"))
+            .await
+            .context("创建初始 page 失败")?;
+        let browser = slot.take().expect("browser 刚放入 slot");
+        let mut ctx = ShellCtx {
+            browser,
+            page,
+            last_results: Vec::new(),
+            last_snap: Vec::new(),
+            current_url: String::new(),
+            handler_task,
+            human_solved: Arc::new(AtomicBool::new(false)),
         };
-        // 8i3：quit/exit 真退出（graceful 关 Chrome 后 rc=0）；EOF（read_line=0）同样 break。
-        if cmd == "exit" || cmd == "quit" {
-            break;
-        }
-        let args: Vec<&str> = parts.collect();
-        if let Err(e) = dispatch(cmd, &args, &mut ctx).await {
-            eprintln!("error: {e}");
-            for cause in e.chain().skip(1) {
-                eprintln!(" 原因: {cause}");
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        println!("进入 gsearch shell（输入 help 查命令，exit / quit / Ctrl+D 退出）");
+        let mut stdout = io::stdout();
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            print!("{PROMPT}");
+            // n9j：prompt 刷写失败（stdout 断开）不再 `?` 早退——按 EOF 走 break，
+            // 保证 REPL 结束后 graceful_close 必达。
+            if stdout.flush().is_err() {
+                break;
+            }
+            let n = reader.read_line(&mut buf).unwrap_or(0);
+            if n == 0 {
+                // EOF：Ctrl+D（Unix）或 Ctrl+Z 回车（Windows）；read_line Err 同按 EOF 处理
+                println!();
+                break;
+            }
+            // 命令行输入也算"用户活跃"——重置 human_solved 让下条 search 命令不会被旧信号立即 break
+            ctx.human_solved.store(false, std::sync::atomic::Ordering::Relaxed);
+            let line = buf.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let Some(cmd) = parts.next() else {
+                continue;
+            };
+            // 8i3：quit/exit 真退出（graceful 关 Chrome 后 rc=0）；EOF（read_line=0）同样 break。
+            if cmd == "exit" || cmd == "quit" {
+                break;
+            }
+            let args: Vec<&str> = parts.collect();
+            if let Err(e) = dispatch(cmd, &args, &mut ctx).await {
+                eprintln!("error: {e}");
+                for cause in e.chain().skip(1) {
+                    eprintln!(" 原因: {cause}");
+                }
             }
         }
+        gsearch::browser::graceful_close(&mut ctx.browser).await;
+        Ok(ExitCode::SUCCESS)
     }
-    gsearch::browser::graceful_close(&mut ctx.browser).await;
-    Ok(ExitCode::SUCCESS)
+    .await;
+    // 内层 ? 早退且 browser 尚未移入 ctx（page 创建失败路径）→ slot 仍有 browser，兜底关。
+    if let Some(mut b) = slot.take() {
+        gsearch::browser::graceful_close(&mut b).await;
+    }
+    rc
 }
 
 /// M2 迁移：以前 shell 自带一个本地 graceful_close；现在统一走 gsearch::browser::graceful_close
@@ -307,11 +325,17 @@ async fn cmd_snap(ctx: &mut ShellCtx) -> Result<()> {
 
 async fn cmd_read(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     let opts = parse_shell_read_opts(args, "read")?;
-    let html_full = ctx.page.content().await.unwrap_or_default();
+    // 7l0：content_retry 替代裸 content().unwrap_or_default()——-32000 context 重建窗口期
+    // 不再静默吞成空串。
+    let html_full = content_retry(&ctx.page).await;
     if is_captcha(&html_full) {
         return Err(anyhow!(
             "当前页遇 CAPTCHA：用 `login <url>` 切有头窗人工验证后再回 shell"
         ));
+    }
+    // 7l0：空正文 stderr hint，与顶层 read 的 [hint] 同款（shell 无 --markdown，指到 --full）。
+    if html_full.trim().is_empty() && !opts.full {
+        eprintln!("[hint] 正文提取为空，试 --full");
     }
     // --full：纯 innerText 5000 字
     if opts.full {
@@ -396,6 +420,8 @@ async fn cmd_dl(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
             ctx.current_url.clone()
         }
     };
+    // 3t9：与顶层 dl 同门——仅 scheme 白名单（dl 私网不设门，内网下载走既有页内 fetch 路径）
+    let url = crate::general::browsable_scheme_ok(&url)?;
     dl_in_page(&ctx.page, &url, output).await
 }
 
@@ -426,7 +452,17 @@ async fn dl_in_page(page: &Page, url: &str, output: Option<&Path>) -> Result<()>
 
 async fn cmd_browse(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     let url = args.first().ok_or_else(|| anyhow!("browse 缺 url"))?;
-    goto(&ctx.page, url).await?;
+    // 3t9：与顶层 browse 同门（scheme 白名单 + 私网拒）。shell 无 --allow-private flag，
+    // 需内网页面请退出 shell 用顶层命令。
+    let url = crate::general::ensure_browsable_url(url, false).map_err(|e| {
+        anyhow!(
+            "{e:#}\n（shell 内无 --allow-private flag；确需内网页面请退出 shell 后用顶层 `gsearch browse <url> --allow-private`）"
+        )
+    })?;
+    goto(&ctx.page, &url).await?;
+    // 7l0：与顶层 browse 对齐——goto 后等语义定稿（50×200ms ≈ 10s），避免重定向竞态
+    // 拿到旧 context / 风控页假 complete。
+    wait_content_stable(&ctx.page, 50).await;
     ctx.current_url = url.to_string();
     let title = ctx
         .page
@@ -440,13 +476,15 @@ async fn cmd_browse(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
 
 async fn cmd_login(args: &[&str], ctx: &mut ShellCtx) -> Result<()> {
     let url = args.first().ok_or_else(|| anyhow!("login 缺 url"))?;
+    // 3t9：与顶层 login 同门——仅 scheme 白名单（login/dl 无私网门，内网登录页是合法场景）
+    let url = crate::general::browsable_scheme_ok(url)?;
     // 先切有头（close + 同 profile 重起），保持 cookie 不丢
     swap_to_headed(&mut ctx.browser, &mut ctx.handler_task).await?;
     // 有头模式下旧 page 已随旧 browser 关闭，新开一个
     ctx.page = browser::open_page(&ctx.browser)
         .await
         .context("有头模式创建 page 失败")?;
-    goto(&ctx.page, url).await?;
+    goto(&ctx.page, &url).await?;
     ctx.current_url = url.to_string();
     // 记录登录页 URL；用户登录成功跳到 dashboard = URL 变化 = 登录完成（bug fix）。
     // ponytail: 旧版只判 evaluate 失败 + page 死了；登录后跳到 dashboard，evaluate 仍成功 →

@@ -130,10 +130,11 @@ const SNAPSHOT_JS: &str = r#"async function () {
     return { readyState: document.readyState, title: document.title || '', visibleText: text, links };
 }"#;
 
-/// uhp：执行原子快照。evaluate Err（导航中 / -32000 context 重建）原样上抛，由调用方判稳逻辑消化。
+/// uhp：执行原子快照。evaluate Err（导航中 / -32000 context 重建 / vag 超时）原样上抛，
+/// 由调用方判稳逻辑消化（超时按「未就绪」重置 marker 继续轮询）。
 pub(crate) async fn page_snapshot(page: &chromiumoxide::Page) -> Result<PageSnapshot> {
     let js = SNAPSHOT_JS.replace("{max}", &SNAPSHOT_MAX_TEXT_CHARS.to_string());
-    page.evaluate(js)
+    cdp_timeout(page.evaluate(js), "快照 evaluate")
         .await?
         .into_value::<PageSnapshot>()
         .map_err(|e| anyhow!("快照反序列化失败: {e}"))
@@ -419,12 +420,12 @@ pub async fn read(
     opts: &ReadOpts,
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
-    let (page, snap) = open_page(browser, h_slot, url).await?;
+    // c5f：正文复用 open_page 的 captcha 检查取，不再二次 content_retry。
+    let (page, snap, html_full) = open_page(browser, h_slot, url).await?;
     let title = match &snap {
         Some(s) => s.title.clone(),
         None => eval_string_retry(&page, "document.title").await,
     };
-    let html_full = content_retry(&page).await;
     let (html, truncated, omitted, truncated_at_offset) =
         cap_extract_source(&html_full, read_max_chars(), url);
     let mut read = extract_adaptive(&html, opts.excerpt);
@@ -472,7 +473,7 @@ pub async fn read_full(
     opts: &ReadOpts,
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
-    let (page, _) = open_page(browser, h_slot, url).await?;
+    let (page, _, _) = open_page(browser, h_slot, url).await?;
     let (txt, _, _, _) = read_full_text(&page, read_max_chars()).await?;
     if !opts.json {
         println!("=== {url} ===\n{txt}");
@@ -503,19 +504,22 @@ pub(crate) async fn read_full_text(
 /// 等人工登录（复用 general::login_poll_decision 决策，180s 超时）→ 登录成功重抓正文。
 /// cookie 随 profile 落盘，下次无感。人关窗 = browser 已死 → 重起 headless 再试一次；
 /// 重抓仍撞墙/CAPTCHA 报错退出（限一次登录机会，防循环弹窗）。
-/// 返回 (page, 定稿快照)；快照 None（窗口内 evaluate 全败）时 title/正文特征退化为空，
-/// 登录墙判定只剩 URL 路径特征（与旧实现 evaluate 全败时的可观测行为一致）。
+/// 返回 (page, 定稿快照, 正文 HTML)——正文是 captcha 检查时取的那份（c5f：调用方 read
+/// 直接复用，不再二次 content_retry，省一次 content 往返）；快照 None（窗口内 evaluate 全败）
+/// 时 title/正文特征退化为空，登录墙判定只剩 URL 路径特征（与旧实现 evaluate 全败时的
+/// 可观测行为一致）。
 async fn open_page(
     browser: &mut Browser,
     h_slot: &mut Option<tokio::task::JoinHandle<()>>,
     url: &str,
-) -> Result<(chromiumoxide::Page, Option<PageSnapshot>)> {
+) -> Result<(chromiumoxide::Page, Option<PageSnapshot>, String)> {
     let (page, snap) = goto_page(browser, url).await?;
-    if is_captcha(&content_retry(&page).await) {
+    let html_full = content_retry(&page).await;
+    if is_captcha(&html_full) {
         return Err(anyhow!("{url} 遇 CAPTCHA，M4 后处理不支持人解，请重试或手动浏览器打开"));
     }
     if !login_wall_hit_page(&page, &snap).await {
-        return Ok((page, snap));
+        return Ok((page, snap, html_full));
     }
 
     eprintln!(
@@ -530,13 +534,14 @@ async fn open_page(
         *browser = b;
     }
     let (page, snap) = goto_page(browser, url).await?;
-    if is_captcha(&content_retry(&page).await) {
+    let html_full = content_retry(&page).await;
+    if is_captcha(&html_full) {
         return Err(anyhow!("{url} 遇 CAPTCHA，请重试或手动浏览器打开"));
     }
     if login_wall_hit_page(&page, &snap).await {
         return Err(anyhow!("登录后重抓 {url} 仍遇登录墙（登录未生效？）；可先 `gsearch login <url>` 手动完成登录"));
     }
-    Ok((page, snap))
+    Ok((page, snap, html_full))
 }
 
 /// new_page（browser::open_page，含 focus emulation）+ goto + 等语义定稿（登录墙重抓路径复用）。
@@ -636,11 +641,27 @@ async fn wait_dom_complete(page: &chromiumoxide::Page, rounds: usize) {
     }
 }
 
+/// vag：CDP 往返（content/evaluate）统一包 PAGE_TIMEOUT_SECS 预算——chromiumoxide 的
+/// evaluate/content future 在 context 销毁/渲染器挂死时可能永不 resolve，拖死整条链。
+/// 超时折叠进既有错误语义：retry 路径按「未就绪」重试，fetch_in_page 按「下载失败」上抛。
+/// 泛型 future 以便单测注入 pending() 打超时分支，无需真浏览器（同 goto_for_download 理由）。
+pub(crate) async fn cdp_timeout<F, T, E>(fut: F, what: &str) -> Result<T>
+where
+    F: Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(Duration::from_secs(PAGE_TIMEOUT_SECS), fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(anyhow!("{what} 失败: {e}")),
+        Err(_) => Err(anyhow!("{what} 超时（{PAGE_TIMEOUT_SECS}s 未返回）")),
+    }
+}
+
 /// page.content() 带 -32000 容错：context 重建中等 DOM 稳定后重取，至多 3 次。
 /// pub(crate)：general::cmd_browse 复用，避免直接 content() 撞 -32000 取空。
 pub(crate) async fn content_retry(page: &chromiumoxide::Page) -> String {
     for _ in 0..3 {
-        match page.content().await {
+        match cdp_timeout(page.content(), "page.content").await {
             Ok(c) => return c,
             Err(_) => wait_dom_complete(page, 25).await, // ≈5s 内等 context 重建
         }
@@ -652,7 +673,7 @@ pub(crate) async fn content_retry(page: &chromiumoxide::Page) -> String {
 /// pub(crate)：postproc title 兜底 / read_full_inner / general::cmd_browse title 兜底共用。
 pub(crate) async fn eval_string_retry(page: &chromiumoxide::Page, js: &str) -> String {
     for _ in 0..3 {
-        match page.evaluate(js).await {
+        match cdp_timeout(page.evaluate(js), "evaluate").await {
             Ok(v) => match v.into_value::<String>() {
                 Ok(s) => return s,
                 Err(_) => wait_dom_complete(page, 25).await,
@@ -738,10 +759,10 @@ pub(crate) async fn fetch_in_page(page: &chromiumoxide::Page, url: &str) -> Resu
         }}",
         serde_json::to_string(url)?
     );
-    let b64 = page
-        .evaluate(js)
+    let raw = cdp_timeout(page.evaluate(js), "页内 fetch")
         .await
-        .map_err(|e| anyhow!("页内 fetch 失败（{url}）: {e}（同源 fetch 受 CORS 限制，未放行的站会在此报错）"))?
+        .map_err(|e| anyhow!("页内 fetch 失败（{url}）: {e}（同源 fetch 受 CORS 限制，未放行的站会在此报错）"))?;
+    let b64 = raw
         .into_value::<String>()
         .map_err(|e| anyhow!("fetch 返回值非字符串（{url}）: {e}"))?;
     gsearch::util::b64_decode(&b64).map_err(|e| anyhow!("页内 fetch base64 解码失败（{url}）: {e}"))
@@ -1043,6 +1064,26 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("https://example.com/slow"), "Err 缺 URL: {msg}");
         assert!(msg.contains("超时"), "Err 未标超时: {msg}");
+    }
+
+    /// vag 回归：cdp_timeout 超时分支——pending future 在 start_paused 下时间自动推进必超时，
+    /// Err 标超时；正常完成值透传。无需真浏览器。
+    #[tokio::test(start_paused = true)]
+    async fn cdp_timeout_pending_future_times_out() {
+        let err = cdp_timeout(
+            std::future::pending::<std::result::Result<(), std::convert::Infallible>>(),
+            "evaluate",
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("超时"), "Err 未标超时: {msg}");
+        assert!(msg.contains("evaluate"), "Err 缺操作名: {msg}");
+
+        let v = cdp_timeout(async { Ok::<_, std::convert::Infallible>(7usize) }, "evaluate")
+            .await
+            .unwrap();
+        assert_eq!(v, 7, "成功值应透传");
     }
 
 }

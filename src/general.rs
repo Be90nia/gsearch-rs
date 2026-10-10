@@ -485,21 +485,20 @@ fn resolve_dl_target(output: Option<&Path>, output_file: Option<&Path>) -> Resul
 async fn dl_direct(url: &str, proxy: Option<&str>, path: &Path) -> Result<Option<u64>> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
+    // uvi：单命令单 client——DNS 复核与主路径共用同一构建（原先两互斥分支各自 build_client）
+    let client = crate::fetch::build_client(proxy, false, Duration::from_secs(DL_DIRECT_TIMEOUT_SECS))?;
     if let Err(e) = crate::fetch::gate_check(url, false) {
         // yvz：门层 DNS 失败（域名不存在）→ fail-fast rc=1，免起 Chrome（全链 6.1s vs 此处亚秒）。
         // 误伤防护：本机解析器坏/纯代理代解析环境在这里同样报 DNS 失败——先用（可能带代理的）
         // client 复核一次 HEAD，复核仍是 DNS 类失败才判死；复核成功/超时/SSL 一律回退 browser。
-        if is_gate_dns_error(&e) {
-            let client = crate::fetch::build_client(proxy, false, Duration::from_secs(DL_DIRECT_TIMEOUT_SECS))?;
-            if let Err(head_err) = client.head(url).send().await
-                && is_dns_error(&head_err)
-            {
-                anyhow::bail!("域名不存在（DNS 解析失败），跳过浏览器下载: {url}");
-            }
+        if is_gate_dns_error(&e)
+            && let Err(head_err) = client.head(url).send().await
+            && is_dns_error(&head_err)
+        {
+            anyhow::bail!("域名不存在（DNS 解析失败），跳过浏览器下载: {url}");
         }
         return Ok(None);
     }
-    let client = crate::fetch::build_client(proxy, false, Duration::from_secs(DL_DIRECT_TIMEOUT_SECS))?;
     let head = match client.head(url).send().await {
         Ok(r) if r.status().is_success() => r,
         _ => return Ok(None), // HEAD 被拒/不支持/网络错 → 无法判定 → browser

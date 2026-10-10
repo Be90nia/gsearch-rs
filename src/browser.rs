@@ -345,9 +345,19 @@ fn fork_path_for(default_path: &Path) -> Option<PathBuf> {
     Some(parent.join(name))
 }
 
+/// bnh：fork 拷贝跳过的缓存类目录名——**只影响 fork 拷贝**（default profile 本体不动）。
+/// 这些目录体积大且跨会话无价值（缓存/着色器/崩溃转储），fork 后 Chrome 自行重建。
+const FORK_SKIP_DIRS: &[&str] = &[
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "Service Worker",
+    "Crashpad",
+    "GrShaderCache",
+];
+
 /// 一次性 copy default profile 内容到 fork 目录（cookie/历史/Local Storage/GAEX）。
-/// 不递归（profile 顶层文件 + Default/ 子目录已含 chrome 主要持久化数据；递归
-/// 引入边界复杂度且缺测试，扁平拷贝足以保留跨次命令的登录态）。
+/// 递归 Default/ 子树（bnh：缓存类目录经 FORK_SKIP_DIRS 整棵跳过）。
 fn copy_profile_contents(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to).with_context(|| format!("创建 fork profile 目录失败: {}", to.display()))?;
     for entry in std::fs::read_dir(from).with_context(|| format!("读取 default profile 失败: {}", from.display()))? {
@@ -361,7 +371,12 @@ fn copy_profile_contents(from: &Path, to: &Path) -> Result<()> {
         {
             continue;
         }
-        let copy_result: std::result::Result<(), std::io::Error> = if src.is_dir() {
+        // bnh：顶层缓存目录（Crashpad/GrShaderCache 等）不进 fork（见 FORK_SKIP_DIRS）。
+        let is_dir = src.is_dir();
+        if is_dir && entry.file_name().to_str().is_some_and(|n| FORK_SKIP_DIRS.contains(&n)) {
+            continue;
+        }
+        let copy_result: std::result::Result<(), std::io::Error> = if is_dir {
             copy_dir_recursive(&src, &dst)
         } else {
             std::fs::copy(&src, &dst).map(|_| ())
@@ -389,6 +404,10 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::result::Result<(), std::io
         if let Some(name) = entry.file_name().to_str()
             && matches!(name, "SingletonLock" | "SingletonCookie" | "SingletonSocket" | "lockfile")
         {
+            continue;
+        }
+        // bnh：子树内缓存目录（Cache/Code Cache/GPUCache/Service Worker 等）整棵跳过。
+        if file_type.is_dir() && entry.file_name().to_str().is_some_and(|n| FORK_SKIP_DIRS.contains(&n)) {
             continue;
         }
         if file_type.is_dir() {
@@ -522,14 +541,16 @@ pub async fn swap_to_headed(
     browser: &mut Browser,
     handler_slot: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
-    graceful_close(browser).await;
-    let (new_browser, handler) = launch(false).await?;
-    // 关键：abort 旧 handler task 避免与新 Browser 的 sender 错配，否则 chromiumoxide 0.9.1
-    // handler 内部状态机在 sender drop 时报"Browser was not closed manually" warn，
-    // 后续新 Browser 的 CreatePage 发去已死 handler task → "send failed receiver is gone"。
+    // n9j：先 abort 旧 handler task 再 close——graceful_close 的 close() 无超时保护，
+    // handler 卡死时 close().await 永不返回；abort 后 close 立即失败走 warn，wait 有 5s
+    // 超时 + kill 兜底，swap 全程有界，launch 失败路径旧 handler 也不再悬挂。
+    // （旧 handler 若跨到新 Browser 仍活着，chromiumoxide 0.9.1 sender 错配会报
+    // "send failed receiver is gone"。）
     if let Some(h) = handler_slot.take() {
         h.abort();
     }
+    graceful_close(browser).await;
+    let (new_browser, handler) = launch(false).await?;
     *handler_slot = Some(spawn_handler(handler));
     *browser = new_browser;
     Ok(())
@@ -542,11 +563,12 @@ pub async fn swap_to_headless(
     browser: &mut Browser,
     handler_slot: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
-    graceful_close(browser).await;
-    let (new_browser, handler) = launch(true).await?;
+    // n9j：与 swap_to_headed 对称——先 abort 旧 handler 保证 close/wait 有界 + 失败路径不悬挂。
     if let Some(h) = handler_slot.take() {
         h.abort();
     }
+    graceful_close(browser).await;
+    let (new_browser, handler) = launch(true).await?;
     *handler_slot = Some(spawn_handler(handler));
     *browser = new_browser;
     Ok(())
@@ -1116,6 +1138,37 @@ mod tests {
         // 内容保真（cookie 是 cookie，不是 lock-data）
         let cookie = std::fs::read(fork_path.join("Cookies")).unwrap();
         assert_eq!(cookie, b"my-cookie", "cookie 内容保真");
+    }
+
+    /// bnh 回归：fork 拷贝跳过缓存类目录——顶层 Crashpad/GrShaderCache 与 Default/ 下
+    /// Cache/Code Cache 整棵不拷，default profile 本体不动；登录/历史数据照拷。
+    #[test]
+    fn copy_profile_contents_skips_cache_dirs() {
+        let tmp = tempdir();
+        let default_path = tmp.join("default");
+        let fork_path = tmp.join("fork");
+        // 顶层缓存目录 + 登录数据
+        std::fs::create_dir_all(default_path.join("Crashpad")).unwrap();
+        std::fs::write(default_path.join("Crashpad").join("reports"), b"dump").unwrap();
+        std::fs::create_dir_all(default_path.join("GrShaderCache")).unwrap();
+        std::fs::write(default_path.join("Cookies"), b"my-cookie").unwrap();
+        // Default/ 下缓存目录（Cache 内再嵌一层验证整棵跳过）
+        let cache_sub = default_path.join("Default").join("Cache");
+        std::fs::create_dir_all(&cache_sub).unwrap();
+        std::fs::write(cache_sub.join("entry"), b"cache-entry").unwrap();
+        std::fs::create_dir_all(default_path.join("Default").join("Code Cache")).unwrap();
+        std::fs::write(default_path.join("Default").join("History"), b"history-data").unwrap();
+
+        super::copy_profile_contents(&default_path, &fork_path).unwrap();
+
+        assert!(!fork_path.join("Crashpad").exists(), "顶层 Crashpad 应跳过");
+        assert!(!fork_path.join("GrShaderCache").exists(), "顶层 GrShaderCache 应跳过");
+        assert!(!fork_path.join("Default").join("Cache").exists(), "Default/Cache 应整棵跳过");
+        assert!(!fork_path.join("Default").join("Code Cache").exists(), "Default/Code Cache 应跳过");
+        // 跳过表只影响 fork 拷贝：default 本体 Cache 不动
+        assert!(cache_sub.join("entry").exists(), "default 本体 Cache 不应被删改");
+        assert!(fork_path.join("Cookies").exists(), "顶层 Cookies 应拷");
+        assert!(fork_path.join("Default").join("History").exists(), "Default/History 应拷");
     }
 
     /// P0 fork profile：is_default_profile_path 仅末段 = default 时为真，
