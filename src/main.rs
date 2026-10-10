@@ -193,6 +193,9 @@ enum Command {
         url: Vec<String>,
         /// 逗号分隔 CSS selector（如 "main,article"）：所有命中容器的正文都保留——
         /// inner_html 用 `\n\n---\n\n` 拼接；未命中回退全文提取，--json 在 meta.include_hit=false 标注。
+        /// 语义：命中元素只取其**内部**文本（不含兄弟节点）。注意 rustdoc/docs.rs 页面的段落是
+        /// 标题的兄弟节点（如 `<h2 id="errors">Errors</h2><p>正文…</p>`），此时 `#errors` 只返回
+        /// 标题；取段落正文用后续兄弟 selector `#errors ~ p` 或父容器 `div.docblock`。
         #[arg(long)]
         include: Option<String>,
         /// 输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
