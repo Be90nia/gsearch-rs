@@ -2,6 +2,12 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本遵循语义化版本。
 
+## [Unreleased]
+
+### Fixed
+
+- **`doctor` 的 SearXNG 探针超时贴边致间歇性误报**：探针超时 3s，而本机实例查询墙钟下界约 3.03s（引擎被上游熔断时 SearXNG 等满 `outgoing.request_timeout=3.0` 才回）→ 健康实例被报成「探测失败」（实测 4 跑 3 误报）。探针超时放宽到 8s，5 连跑全 OK
+
 ## [0.3.0] - 2026-10-10
 
 安全审计硬化里程碑：全库三轮深度审计（安全 / 静默失败 / 测试缺口 / 内存 / 性能 / lean）后的集中修复批次。

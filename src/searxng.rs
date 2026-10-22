@@ -232,7 +232,9 @@ pub async fn probe(base_url: &str) -> Result<SearxngProbe, String> {
     let resp = SHARED_CLIENT
         .get(&url)
         .header(reqwest::header::USER_AGENT, concat!("gsearch/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(3))
+        // 8s：本机实例查询墙钟下界 ~3.03s（引擎被上游熔断时 SearXNG 等满 outgoing.request_timeout=3.0
+        // 才回），旧 3s 贴边 → doctor 间歇性误报「探测失败」，害我以为实例老死（2026-10-22 实测 4 跑 3 误报）。
+        .timeout(Duration::from_secs(8))
         .send()
         .await
         .map_err(|e| format!("{e}"))?;

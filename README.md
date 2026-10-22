@@ -293,7 +293,7 @@ gsearch search "rust"                              # 默认 auto：优先 Chrome
 - **出口 IP**：明文 HTTP GET `http://ipv4.icanhazip.com/` 取公网 IP。**撞码时可以这里查 IP 被封状况**。当前 IP 记录到 `<profile>/last_exit_ip`；下次检查发现变化时附加 `exit_ip_drift` 一行 `[WARN]`（VPN/代理切换或 IP 信誉重置信号）——首次无记录或 IP 未变则静默
 - **网络连通**：TCP connect `www.google.com:443`，2 秒超时
 - **GSEARCH_PROFILE**：环境变量检查，缺/空用默认；路径不存在仅 WARN（首次启动会建）
-- **SearXNG probe**（配置 searxng_url 时）：GET `{url}/search?q=probe&format=json` 报 results 数与 unresponsive_engines；可达但零结果标 `[WARN]`（引擎降级/IP 信誉嫌疑）
+- **SearXNG probe**（配置 searxng_url 时）：GET `{url}/search?q=probe&format=json` 报 results 数与 unresponsive_engines；可达但零结果标 `[WARN]`（引擎降级/IP 信誉嫌疑）。**探针超时 8s**——实例查询墙钟下界约 3s（引擎被上游熔断时 SearXNG 等满 `outgoing.request_timeout` 才回），短超时会把健康实例误报成「探测失败」
 
 任意 FAIL 退出码 1；WARN 整体可用；都 OK 退出 0。CI 或首次安装后跑一次可快速定位是浏览器路径、profile 权限、网络出口哪一类故障。
 
