@@ -127,6 +127,8 @@ search(browser, query, limit):
 
 ### 3.4 output.rs
 
+> **v0.4.0 对齐**：本节的原设计（默认人读文本 + `--json` 全量）即当前形态——v0.2.9~v0.3.0 曾把默认反转成 JSON（AI-first 契约），v0.4.0 已**回归本节设计**：默认 md 排版，`--json` 是显式开关（JSON 内容与 v0.3.0 逐字节一致）。
+
 - 默认：`1. 标题\n   url\n   snippet前160字`
 - `--json`：serde_json 全量
 - `--open N`：`std::process::Command::new("cmd").args(["/c","start","",url])`
