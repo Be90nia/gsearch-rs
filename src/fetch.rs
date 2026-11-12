@@ -596,16 +596,34 @@ pub async fn cmd_fetch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> {
     let started = Instant::now();
     // uvi：单命令单 client——单条与 batch 共用（fetch_one_attempt 不再每 URL×attempt 重建）
     let client = command_client(opts)?;
+    // v0.4.0 md 路径：正文源 = markdown（复用 --markdown 路径的 html_to_markdown 转换器）。
+    // --raw 走 raw_fetched 早返回（原始字节），不受影响。
+    let md_opts = FetchOpts {
+        markdown: true,
+        ..opts.clone()
+    };
+    let eff = if opts.json { opts } else { &md_opts };
     if let [url] = urls {
-        return match fetch_one(url, opts, &client).await {
+        return match fetch_one(url, eff, &client).await {
             Ok(FetchOne::Done(fetched)) => {
                 if opts.json {
                     println!("{}", fetched_json(fetched));
                 } else {
-                    if fetched.truncated {
-                        eprintln!("注意：正文超上限已截断（省略 {} 字符；--json 输出在 meta 字段标注）", fetched.omitted);
-                    }
-                    println!("=== {} | {} ===\n{}", fetched.url, fetched.title, fetched.text);
+                    // v0.4.0 md 形态：meta 头 + `# <页面标题>` + md 正文（契约第 3/5.2 节）
+                    let format = if fetched.raw { "raw" } else { "markdown" };
+                    let fields = gsearch::output::content_meta_fields(
+                        format,
+                        fetched.truncated,
+                        fetched.omitted,
+                        started.elapsed().as_millis(),
+                    );
+                    gsearch::output::print_meta_header(&fields);
+                    let heading = if fetched.title.trim().is_empty() {
+                        fetched.url.clone()
+                    } else {
+                        fetched.title.clone()
+                    };
+                    println!("# {heading}\n\n{}", fetched.text);
                 }
                 flush_stdout();
                 tracing::debug!("fetch 完成: {url} ({}ms)", started.elapsed().as_millis());
@@ -619,7 +637,7 @@ pub async fn cmd_fetch(urls: &[String], opts: &FetchOpts) -> Result<ExitCode> {
             Err(e) => Err(e),
         };
     }
-    let code = cmd_fetch_batch(urls, opts, &client).await?;
+    let code = cmd_fetch_batch(urls, eff, opts.json, started, &client).await?;
     flush_stdout();
     Ok(code)
 }
@@ -663,8 +681,14 @@ fn flush_stdout() {
 }
 
 /// 批量：并发上限 5（防目标站/出口压力），buffered 保持输入序；每条独立过 SSRF 门（含重定向每跳）。
-/// uvi：client 由 cmd_fetch 构建一次传入，全 batch 共用。
-async fn cmd_fetch_batch(urls: &[String], opts: &FetchOpts, client: &reqwest::Client) -> Result<ExitCode> {
+/// v0.4.0：json 参数区分 JSON 数组（v0.3.0 逐字节不变）与 md 形态（meta 头 + 每 URL 一节）。
+async fn cmd_fetch_batch(
+    urls: &[String],
+    opts: &FetchOpts,
+    json: bool,
+    started: Instant,
+    client: &reqwest::Client,
+) -> Result<ExitCode> {
     use futures::stream::{StreamExt, iter};
     let fetched: Vec<(String, Result<FetchOne>)> = iter(urls.iter().cloned())
         .map(|u| async move {
@@ -677,7 +701,7 @@ async fn cmd_fetch_batch(urls: &[String], opts: &FetchOpts, client: &reqwest::Cl
 
     let total = fetched.len();
     let mut ok_count = 0usize;
-    if opts.json {
+    if json {
         // 对齐 search batch：裸数组、无外层信封，单条失败不阻塞数组整体。
         // 8lp：compact 单行——输出契约面向 agent 消费。
         // 0vk M-2：消费式迭代——FetchOne owned 化，fetched_json 内 text 可 move 免克隆；
@@ -704,16 +728,40 @@ async fn cmd_fetch_batch(urls: &[String], opts: &FetchOpts, client: &reqwest::Cl
         }
         println!("{}", serde_json::to_string(&entries)?);
     } else {
-        for (i, (url, result)) in fetched.iter().enumerate() {
+        // v0.4.0 md 形态：单一 meta 头 + 每 URL 一节（`## <url>` + `# <标题>` + 正文）。
+        // 截断统计聚合进 meta 头（truncated 任一 URL 截断即出现；omitted 为各 URL 之和）。
+        let mut any_truncated = false;
+        let mut total_omitted = 0usize;
+        for (_, result) in &fetched {
+            if let Ok(FetchOne::Done(f)) = result {
+                any_truncated |= f.truncated;
+                total_omitted += f.omitted;
+            }
+        }
+        let format = if opts.raw { "raw" } else { "markdown" };
+        let fields = gsearch::output::content_meta_fields(
+            format,
+            any_truncated,
+            total_omitted,
+            started.elapsed().as_millis(),
+        );
+        gsearch::output::print_meta_header(&fields);
+        for (url, result) in fetched.iter() {
             match result {
                 Ok(FetchOne::Done(f)) => {
                     ok_count += 1;
-                    println!("=== [{i}/{total}] {} | {} ===\n{}", url, f.title, f.text)
+                    println!("## {url}\n");
+                    let heading = if f.title.trim().is_empty() {
+                        f.url.clone()
+                    } else {
+                        f.title.clone()
+                    };
+                    println!("# {heading}\n\n{}", f.text);
                 }
                 Ok(FetchOne::JsShell) => println!(
-                    "=== [{i}/{total}] {url} ===\n出错: 该页无服务端正文（JS 壳），需渲染：用 gsearch browse {url}"
+                    "## {url}\n\n出错: 该页无服务端正文（JS 壳），需渲染：用 gsearch browse {url}"
                 ),
-                Err(e) => println!("=== [{i}/{total}] {url} ===\n出错: {e:#}"),
+                Err(e) => println!("## {url}\n\n出错: {e:#}"),
             }
         }
     }

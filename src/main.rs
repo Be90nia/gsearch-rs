@@ -39,7 +39,7 @@ fn enable_utf8_console() {}
 #[command(
     name = "gsearch",
     version = gsearch::build::version_line(),
-    about = "Google 搜索 + 通用浏览器代理 CLI（真 Chrome + 持久 profile）。输出契约：所有子命令默认输出 JSON（--json 显式同效），加 --human 切人读文本。"
+    about = "Google 搜索 + 通用浏览器代理 CLI（真 Chrome + 持久 profile）。输出契约：所有子命令默认输出 md 排版；--json 输出 JSON 信封。"
 )]
 struct Cli {
     #[arg(long, global = true, default_value = "info")]
@@ -108,11 +108,11 @@ enum Command {
         /// 纯 innerText 全文（50000 cap）；与 --headings-only 互斥
         #[arg(long, default_value_t = false, group = "browse_mode")]
         full: bool,
-        /// 输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
+        /// 显式 md 排版输出（v0.4.0 起默认即 md，此 flag 显式要 md；等价默认）。
         #[arg(long, default_value_t = false)]
         human: bool,
-        /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
-        #[arg(long, hide = true, default_value_t = false)]
+        /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
+        #[arg(long, default_value_t = false)]
         json: bool,
         #[arg(long)]
         from: Option<usize>,
@@ -160,11 +160,11 @@ enum Command {
     Shell,
     /// 检测浏览器 / profile / 网络连通性 / 出口 IP / SearXNG 健康度
     Doctor {
-        /// 输出默认 JSON（AI-first 契约）；此 flag 切回人读检查表。
+        /// 显式 md 排版输出（v0.4.0 起默认即 md，此 flag 显式要 md；等价默认）。
         #[arg(long, default_value_t = false)]
         human: bool,
-        /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
-        #[arg(long, hide = true, default_value_t = false)]
+        /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
+        #[arg(long, default_value_t = false)]
         json: bool,
     },
     /// HEADless URL 健康检查：HEAD/GET + redirect 链 + SSL + 延迟（无需 Chrome）
@@ -173,11 +173,11 @@ enum Command {
         /// 不设 required=true 以放行 --urls-file；零值由 required_unless_present 拒绝。
         #[arg(required_unless_present = "urls_file", num_args = 1..)]
         url: Vec<String>,
-        /// 输出默认 JSON（AI-first 契约）；此 flag 切回人读表格。
+        /// 显式 md 排版输出（v0.4.0 起默认即 md，此 flag 显式要 md；等价默认）。
         #[arg(long, default_value_t = false)]
         human: bool,
-        /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
-        #[arg(long, hide = true, default_value_t = false)]
+        /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
+        #[arg(long, default_value_t = false)]
         json: bool,
         /// 单条探测总预算秒数（含 redirect；CDN 抖动端点可调高）
         #[arg(long, default_value_t = gsearch::verify::VERIFY_TIMEOUT_SECS)]
@@ -200,11 +200,11 @@ enum Command {
         /// 标题；取段落正文用后续兄弟 selector `#errors ~ p` 或父容器 `div.docblock`。
         #[arg(long)]
         include: Option<String>,
-        /// 输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
+        /// 显式 md 排版输出（v0.4.0 起默认即 md，此 flag 显式要 md；等价默认）。
         #[arg(long, default_value_t = false)]
         human: bool,
-        /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
-        #[arg(long, hide = true, default_value_t = false)]
+        /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
+        #[arg(long, default_value_t = false)]
         json: bool,
         /// 放行私网地址（loopback / RFC1918 / link-local / 云 metadata），同时允许内网明文 http。
         /// 默认拒（SSRF 门）；也可通过 `GSEARCH_FETCH_ALLOW_PRIVATE=1` 环境变量放行。
@@ -252,11 +252,11 @@ enum Command {
         url: String,
         #[arg(long, default_value_t = 3, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=100))]
         limit: usize,
-        /// 输出默认 JSON（AI-first 契约）；此 flag 切人读文本。
+        /// 显式 md 排版输出（v0.4.0 起默认即 md，此 flag 显式要 md；等价默认）。
         #[arg(long, default_value_t = false)]
         human: bool,
-        /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
-        #[arg(long, hide = true, default_value_t = false)]
+        /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
+        #[arg(long, default_value_t = false)]
         json: bool,
     },
     /// 查 GitHub latest release 与本地版本比对；只给指引，不做自替换
@@ -303,13 +303,13 @@ struct SearchArgs {
     no_humanize: bool,
     #[arg(long, default_value_t = false)]
     full: bool,
-    /// 输出默认 JSON（AI-first 契约）；此 flag 切回人读文本。
+    /// 显式 md 排版输出（v0.4.0 起默认即 md，此 flag 显式要 md；等价默认）。
     #[arg(long, default_value_t = false)]
     human: bool,
-    /// 兼容占位：JSON 已是默认输出，此 flag 解析但无效果（存量脚本零破坏）。
-    #[arg(long, hide = true, default_value_t = false)]
+    /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
+    #[arg(long, default_value_t = false)]
     json: bool,
-    /// JSON 结果 snippet 截断长度（按字符）；默认 160。
+    /// 结果摘要截断长度（按字符，md 与 JSON 同源）；默认 160。
     #[arg(long, default_value_t = 160, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=100000))]
     snippet_len: usize,
     /// `--browse N --from K`：摘要段从第 K 段开始（1-based；默认 0 = 从首段）
@@ -383,11 +383,11 @@ async fn main() -> ExitCode {
     gsearch::types::set_compact_meta(compact_requested && !debug_logging);
     let result: Result<ExitCode> = match cli.cmd {
         Command::Search(args) => cmd_search(args, proxy.clone()).await,
-        Command::Browse { url, full, human, from, headings_only, compact_meta: _, markdown, browser, allow_private, max_chars, .. } => {
+        Command::Browse { url, full, human, json, from, headings_only, compact_meta: _, markdown, browser, allow_private, max_chars, .. } => {
             let opts = general::BrowseOpts {
                 full,
-                // 3gw：--json 已是默认，--human 才切人读
-                json: !human,
+                // v0.4.0：默认 md 排版；--json 强制 JSON；--human 显式要 md（与默认同）
+                json: json && !human,
                 from: from.unwrap_or(0),
                 headings_only,
                 markdown,
@@ -403,13 +403,13 @@ async fn main() -> ExitCode {
             general::cmd_dl(&url, output.as_deref(), output_file.as_deref(), browser.into(), proxy.clone()).await
         }
         Command::Shell => shell::run_shell().await,
-        Command::Doctor { human, .. } => cmd_doctor(!human).await,
-        Command::Verify { url, human, timeout, urls_file, .. } => {
-            gsearch::verify::cmd_verify(&url, !human, proxy.as_deref(), timeout, urls_file.as_deref())
+        Command::Doctor { human, json, .. } => cmd_doctor(json && !human).await,
+        Command::Verify { url, human, json, timeout, urls_file, .. } => {
+            gsearch::verify::cmd_verify(&url, json && !human, proxy.as_deref(), timeout, urls_file.as_deref())
         }
-        Command::Fetch { url, human, allow_private, include, markdown, raw, max_chars, timeout, retry, json_keys, .. } => {
+        Command::Fetch { url, human, json, allow_private, include, markdown, raw, max_chars, timeout, retry, json_keys, .. } => {
             fetch::cmd_fetch(&url, &fetch::FetchOpts {
-                json: !human,
+                json: json && !human,
                 proxy: proxy.clone(),
                 allow_private,
                 include,
@@ -421,7 +421,7 @@ async fn main() -> ExitCode {
                 json_keys,
             }).await
         }
-        Command::Similar { url, limit, human, .. } => cmd_similar(url, limit, human).await,
+        Command::Similar { url, limit, human, json, .. } => cmd_similar(url, limit, json && !human).await,
         Command::Update => update::cmd_update(proxy.clone()).await,
     };
 
@@ -554,8 +554,8 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
     let mut h_slot: Option<tokio::task::JoinHandle<()>> = None;
     let cfg = gsearch::search::SearchConfig { query: query.clone(), limit: args.limit, recency };
-    // 3gw：JSON 默认，--human 切人读
-    let json_mode = !args.human;
+    // v0.4.0：默认 md 排版；--json 强制 JSON；--human 显式要 md（与默认同）
+    let json_mode = args.json && !args.human;
     // zc6：SearXNG 单次尝试四态——Results 直接用；CircuitBroken 熔断早退；
     // NotConfigured/FallbackGoogle 走原 Google 链（IP 正常时行为与旧版一致）。
     let searxng = gsearch::search::try_searxng(&cfg).await;
@@ -736,7 +736,19 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         if json_mode {
             gsearch::output::print_envelope_json(&envelope)?;
         } else if !headings_solo {
-            gsearch::output::print_text(&results);
+            // v0.4.0 md 形态：meta 头 1 行 + md 结果列表（契约第 3/4 节）。
+            let fields = vec![
+                ("provider", provider.to_string()),
+                ("results", results.len().to_string()),
+                ("limit", envelope.meta.limit.to_string()),
+            ];
+            let mut fields = fields;
+            // truncated 只在 true 时出现（缺席语义与 JSON meta 一致）
+            if envelope.meta.truncated {
+                fields.push(("truncated", "true".to_string()));
+            }
+            fields.push(("elapsed", gsearch::output::elapsed_s(envelope.meta.elapsed_ms)));
+            gsearch::output::print_md(&results, &fields);
         }
     }
     // M4 后处理（PLAN §3.4）：clap ArgGroup "post" 保证 --open/--read/--browse/--dl 互斥；仅剩运行时分发。
@@ -819,7 +831,8 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
 
 /// `similar <url>`——启发式派生查询（title 关键词，SearXNG 单查 + 词重合/同域重排）。
 /// JSON 信封 = 常规 envelope + 顶层 similar_of/note 注解（0mf to_value 手法，不动公共结构）。
-async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode> {
+/// v0.4.0：默认 md 排版（json_mode=false），--json 出 JSON 信封。
+async fn cmd_similar(url: String, limit: usize, json_mode: bool) -> Result<ExitCode> {
     // qbw：非 URL 入参会退化成 site:<garbage> 派生查询白烧 token，发起前拒掉
     if !gsearch::search::looks_like_url(&url) {
         eprintln!("error: 输入应为 URL（如 https://example.com/page）：{url}");
@@ -832,11 +845,22 @@ async fn cmd_similar(url: String, limit: usize, human: bool) -> Result<ExitCode>
     for h in &mut hits {
         h.hit.snippet = gsearch::output::truncate_snippet(&h.hit.snippet, 160);
     }
-    if human {
+    if !json_mode {
+        // v0.4.0 md 形态：meta 头 + md 列表（similarity 标注保留在每条后）
+        let fields = vec![
+            ("provider", "searxng".to_string()),
+            ("results", hits.len().to_string()),
+            ("limit", limit.to_string()),
+        ];
+        let mut fields = fields;
+        if hits.len() >= limit {
+            fields.push(("truncated", "true".to_string()));
+        }
+        fields.push(("elapsed", gsearch::output::elapsed_s(started.elapsed().as_millis())));
+        gsearch::output::print_meta_header(&fields);
         for (i, h) in hits.iter().enumerate() {
-            println!("{}. {}", i + 1, h.hit.title);
+            println!("{}. {} [similarity] {}", i + 1, h.hit.title, h.similarity);
             println!("   {}", h.hit.url);
-            println!("   [similarity] {}", h.similarity);
             println!("   {}", h.hit.snippet);
         }
         return Ok(ExitCode::SUCCESS);
@@ -889,8 +913,8 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
             "batch 多查询暂不支持 --read/--browse/--dl/--open（batch 无浏览器参与）；请对单查询使用"
         ));
     }
-    // 3gw：JSON 默认，--human 切人读
-    let json_mode = !args.human;
+    // v0.4.0：默认 md 排版；--json 强制 JSON；--human 显式要 md（与默认同）
+    let json_mode = args.json && !args.human;
     let started = std::time::Instant::now();
     let recency = args.recency.map(gsearch::search::Recency::from);
     let outcomes = gsearch::search::run_batch(&args.query, args.limit, recency).await;
@@ -983,16 +1007,27 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
             gsearch::output::print_batch_json(&entries)?;
         }
     } else {
-        // 人读：逐条分隔标题，条目内部沿用单查询格式
-        for (i, e) in entries.iter().enumerate() {
-            println!("=== [{}/{}] {} ===", i + 1, entries.len(), e.query);
+        // v0.4.0 md 形态：meta 头 1 行 + 每 query 一节（`## <query>` + 该 query 的 md 列表）
+        let total_results: usize = entries.iter().map(|e| e.results.len()).sum();
+        let mut fields = vec![
+            ("provider", "searxng".to_string()),
+            ("results", total_results.to_string()),
+            ("limit", args.limit.to_string()),
+        ];
+        if entries.iter().any(|e| e.meta.truncated) {
+            fields.push(("truncated", "true".to_string()));
+        }
+        fields.push(("elapsed", gsearch::output::elapsed_s(elapsed_ms)));
+        gsearch::output::print_meta_header(&fields);
+        for e in entries.iter() {
+            println!("## {}", e.query);
             if e.status == gsearch::types::RunStatus::Error {
-                println!("  出错: {}", e.message);
+                println!("出错: {}", e.message);
             } else if e.status == gsearch::types::RunStatus::Ok {
                 gsearch::output::print_text(&e.results);
             } else {
                 // o1p：三态非 Ok 状态（filtered_empty/no_results/degraded）透出诊断行
-                println!("  {}", e.message);
+                println!("{}", e.message);
             }
         }
     }
@@ -1167,22 +1202,6 @@ fn record_check(
         _ => {}
     }
     checks.push(DoctorCheck { name, status, message, value });
-}
-
-/// 8lp③：人读分支从 value 拼回旧散文（格式与旧版逐字节一致）；散文检查原样透出。
-fn human_line(c: &DoctorCheck) -> String {
-    if !c.message.is_empty() {
-        return c.message.clone();
-    }
-    let v = c.value.as_deref().unwrap_or_default();
-    match c.name {
-        "chrome" => format!("Chrome: {v}"),
-        "edge" => format!("Edge:   {v}"),
-        "exit_ip" => format!("出口 IP: {v}"),
-        "network" => format!("网络连通 ({v})"),
-        "profile_source" => format!("profile 来自配置文件: {v}"),
-        _ => v.to_owned(),
-    }
 }
 
 async fn cmd_doctor(json: bool) -> Result<ExitCode> {
@@ -1380,22 +1399,33 @@ async fn cmd_doctor(json: bool) -> Result<ExitCode> {
         // 8lp：JSON 面向 agent 消费，compact 单行省 token
         println!("{}", serde_json::to_string(&out)?);
     } else {
-        println!("gsearch doctor");
+        // v0.4.0 md 形态：meta 头（checks/ok/failed/elapsed）+ 每检查一行
+        // `- [OK]/[WARN]/[FAIL]/[SKIP] <检查名>: <message>`（四态齐全，warn/skip 不进 meta 头）。
+        let ok_count = checks
+            .iter()
+            .filter(|c| matches!(c.status, DoctorStatus::Ok))
+            .count();
+        let fields = vec![
+            ("checks", checks.len().to_string()),
+            ("ok", ok_count.to_string()),
+            ("failed", fail.to_string()),
+            ("elapsed", gsearch::output::elapsed_s(elapsed_ms)),
+        ];
+        gsearch::output::print_meta_header(&fields);
         for c in &checks {
             let tag = match c.status {
-                DoctorStatus::Ok => "[ OK ]",
+                DoctorStatus::Ok => "[OK]",
                 DoctorStatus::Warn => "[WARN]",
                 DoctorStatus::Fail => "[FAIL]",
                 DoctorStatus::Skip => "[SKIP]",
             };
-            println!("{tag} {}", human_line(c));
-        }
-        if fail > 0 {
-            println!("\n[{fail} 项 FAIL] 检查上面建议。（耗时 {elapsed_ms}ms）");
-        } else if warn > 0 {
-            println!("\n[{warn} 项 WARN] 整体可用。（耗时 {elapsed_ms}ms）");
-        } else {
-            println!("\n所有检查通过 ✓（耗时 {elapsed_ms}ms）");
+            // 值类检查（message 缺席）取 value 作正文，散文检查取 message。
+            let detail = if !c.message.is_empty() {
+                c.message.clone()
+            } else {
+                c.value.clone().unwrap_or_default()
+            };
+            println!("- {tag} {}: {detail}", c.name);
         }
     }
     if fail > 0 {
@@ -1629,32 +1659,32 @@ mod tests {
         assert!(compact_meta);
     }
 
-    /// doctor 默认 JSON 输出；--human 切人读；--json 存量兼容（noop）。
+    /// doctor 默认 md 排版输出（v0.4.0 反转）；--human 显式要 md；--json 显式要 JSON。
     #[test]
     fn doctor_json_flag_parses() {
         let cli = Cli::try_parse_from(["gsearch", "doctor"]).unwrap();
         let Command::Doctor { json, human } = cli.cmd else { panic!("expected doctor") };
-        assert!(!human, "默认 JSON（human=false）");
-        assert!(!json);
+        assert!(!human, "默认 md（human=false）");
+        assert!(!json, "默认 md（json=false，--json 才是显式 JSON 开关）");
         let cli = Cli::try_parse_from(["gsearch", "doctor", "--human"]).unwrap();
         let Command::Doctor { human, .. } = cli.cmd else { panic!("expected doctor") };
         assert!(human);
-        // 存量脚本 --json 仍可解析，且不改变默认 JSON 行为
+        // --json 显式要 JSON（v0.4.0 起语义反转，不再是 noop）
         let cli = Cli::try_parse_from(["gsearch", "doctor", "--json"]).unwrap();
         let Command::Doctor { json, human } = cli.cmd else { panic!("expected doctor") };
         assert!(json);
         assert!(!human);
     }
 
-    /// verify 子命令解析；默认 JSON、--human 切人读、--json 存量 noop。
+    /// verify 子命令解析；默认 md 排版（v0.4.0 反转）、--human 显式要 md、--json 显式要 JSON。
     #[test]
     fn verify_subcommand_parses_with_json_flag() {
         let cli = Cli::try_parse_from(["gsearch", "verify", "https://example.com", "--json"]).unwrap();
         let Command::Verify { url, json, human, .. } = cli.cmd else { panic!("expected verify") };
         assert_eq!(url, vec!["https://example.com"]);
         assert!(json);
-        assert!(!human, "--json 存量兼容：仍是 JSON 输出");
-        // 默认（不带 flag）也是 JSON
+        assert!(!human, "--json 显式要 JSON 输出");
+        // 默认（不带 flag）是 md
         let cli = Cli::try_parse_from(["gsearch", "verify", "https://example.com"]).unwrap();
         let Command::Verify { human, .. } = cli.cmd else { panic!("expected verify") };
         assert!(!human);
@@ -1664,18 +1694,18 @@ mod tests {
         assert!(human);
     }
 
-    /// search 默认 JSON（human=false）、--human 翻转、--json 存量 noop、snippet 默认 160；
+    /// search 默认 md 排版（human=false、json=false）、--human 显式要 md、--json 显式要 JSON、snippet 默认 160；
     /// --limit 1..=100、--read 1.. 越界值 clap 阶段拒绝。
     #[test]
     fn ai_first_flip_defaults_and_value_ranges() {
         let cli = Cli::try_parse_from(["gsearch", "search", "x"]).unwrap();
         let Command::Search(args) = cli.cmd else { panic!("expected search") };
-        assert!(!args.human, "默认 JSON 输出");
-        assert!(!args.json);
+        assert!(!args.human, "默认 md 输出（--human 才是显式 md）");
+        assert!(!args.json, "默认 md 输出（--json 才是显式 JSON 开关）");
         let cli = Cli::try_parse_from(["gsearch", "search", "x", "--human"]).unwrap();
         let Command::Search(args) = cli.cmd else { panic!("expected search") };
         assert!(args.human);
-        // 存量 --json 解析接受、行为 noop（默认已是 JSON）
+        // --json 显式要 JSON（v0.4.0 起语义反转，不再是 noop）
         let cli = Cli::try_parse_from(["gsearch", "search", "x", "--json"]).unwrap();
         let Command::Search(args) = cli.cmd else { panic!("expected search") };
         assert!(args.json && !args.human);
@@ -1885,5 +1915,182 @@ mod tests {
         use clap::CommandFactory;
         let help = Cli::command().render_help().to_string();
         assert!(help.contains("read"), "顶层 help 应含 read 别名: {}", &help[..help.len().min(2000)]);
+    }
+
+    /// v0.4.0 回归锁 ①：默认输出**不是**合法 JSON（契约第 3 节反转 + 第 7 节）。
+    /// 纯函数级断言（不跑网络）：md 渲染串首行是 meta 头、整段无法被 JSON 解析器吃下；
+    /// 同一批结果走 --json 路径则必须是合法 JSON。两条断言锁住「默认 md / --json 显式 JSON」。
+    #[test]
+    fn default_md_output_is_not_json_and_json_path_is() {
+        let results = vec![gsearch::types::SearchResult {
+            title: "标题".into(),
+            url: "https://example.com/".into(),
+            snippet: "摘要".into(),
+            score: Some(1.5),
+            domain_class: "docs",
+        }];
+        let fields = vec![
+            ("provider", "searxng".to_string()),
+            ("results", "1".to_string()),
+            ("limit", "10".to_string()),
+            ("elapsed", "2.7s".to_string()),
+        ];
+        // 默认（md）路径：首行是 meta 头，整段不是合法 JSON
+        let md = gsearch::output::render_md(&results, &fields);
+        let first = md.lines().next().unwrap_or_default();
+        assert!(
+            first.starts_with("provider: searxng | results: 1 |"),
+            "默认输出首行必须是 meta 头: {first}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&md).is_err(),
+            "默认 md 输出不得是合法 JSON（v0.4.0 已反转）: {md}"
+        );
+        // --json 路径：同一批结果是合法 JSON
+        let env = gsearch::types::OutputEnvelope {
+            meta: gsearch::types::MetaOutput {
+                tool: "gsearch",
+                version: "0.4.0",
+                query: "q".into(),
+                profile: "default".into(),
+                proxy: None,
+                humanize: false,
+                limit: 10,
+                elapsed_ms: 27,
+                truncated: false,
+                truncated_at_offset: 0,
+                provider: "searxng".into(),
+                recency: None,
+                site_warn: None,
+                truncated_detail: None,
+            },
+            run: gsearch::types::RunStatusInfo {
+                status: gsearch::types::RunStatus::Ok,
+                captcha_solved: false,
+                message: String::new(),
+            },
+            results: &results,
+        };
+        let json = serde_json::to_string(&env).expect("信封序列化");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("--json 输出须是合法 JSON");
+        assert_eq!(v["results"][0]["title"], "标题", "--json 结果元素须完整");
+    }
+
+    /// v0.4.0 回归锁 ②：--json 的 meta / run / results 元素**键集**与 v0.3.0 基线一致
+    /// （契约第 5.3 节「JSON 输出内容必须与 v0.3.0 逐字节一致」的可测代理面）。
+    /// 基线键集取自 v0.3.0 二进制实测（target/gsearch-v0.3.0-baseline.exe，同一假 SearXNG
+    /// 数据源下 `--json` 输出的键序）；只比键集不比内容——SERP 内容随时间漂移，逐字节比必假失败。
+    ///
+    /// 键序从**原始 JSON 文本**扫：serde_json::Value 的 Map 是 BTreeMap（键被排序），
+    /// 而实际输出是结构体声明序（= v0.3.0 基线序）——两者不同，故不能用 Value 取序。
+    #[test]
+    fn json_key_sets_match_v030_baseline() {
+        let meta = gsearch::types::MetaOutput {
+            tool: "gsearch",
+            version: "0.4.0",
+            query: "q".into(),
+            profile: "default".into(),
+            proxy: Some("http://127.0.0.1:10808".into()),
+            humanize: false,
+            limit: 10,
+            elapsed_ms: 27,
+            truncated: true,
+            truncated_at_offset: 0,
+            provider: "searxng".into(),
+            recency: Some("week".into()),
+            site_warn: Some("site: 限定符".into()),
+            truncated_detail: Some("results_capped_by_limit".into()),
+        };
+        let run = gsearch::types::RunStatusInfo {
+            status: gsearch::types::RunStatus::Ok,
+            captcha_solved: false,
+            message: String::new(),
+        };
+        let results = vec![gsearch::types::SearchResult {
+            title: "t".into(),
+            url: "https://example.com/".into(),
+            snippet: "s".into(),
+            score: Some(1.0),
+            domain_class: "other",
+        }];
+        let env = gsearch::types::OutputEnvelope {
+            meta,
+            run,
+            results: &results,
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        // v0.3.0 基线实测键序（meta 含全部可选字段在场的情形）
+        assert_eq!(
+            json_object_keys(&json, "\"meta\":"),
+            vec![
+                "tool",
+                "version",
+                "query",
+                "profile",
+                "proxy",
+                "humanize",
+                "limit",
+                "elapsed_ms",
+                "truncated",
+                "provider",
+                "recency",
+                "site_warn",
+                "truncated_detail",
+            ],
+            "meta 键集/键序必须与 v0.3.0 基线一致"
+        );
+        assert_eq!(
+            json_object_keys(&json, "\"run\":"),
+            vec!["status"],
+            "run 键集/键序必须与 v0.3.0 基线一致（空 message 缺席）"
+        );
+        assert_eq!(
+            json_object_keys(&json, "\"results\":["),
+            vec!["title", "url", "snippet", "score", "domain_class"],
+            "results 元素键集/键序必须与 v0.3.0 基线一致"
+        );
+    }
+
+    /// 从 JSON 文本里取指定成员的直属键（按出现顺序）——`needle` 形如 `"meta":` 或 `"results":[`。
+    /// serde_json::Value 的 Map 是 BTreeMap（键序被排序），要断言「与 v0.3.0 基线同序」
+    /// 必须扫原始文本。键名只取 ASCII 标识符（serde 结构体字段名），非 ASCII 不在断言面。
+    fn json_object_keys(json: &str, needle: &str) -> Vec<String> {
+        let at = json.find(needle).unwrap_or_else(|| panic!("JSON 文本缺 {needle}"));
+        let bytes = json.as_bytes();
+        let mut i = at + needle.len();
+        // 跳过 needle 后的空白，定位对象起始 '{'
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        assert_eq!(bytes[i], b'{', "{needle} 后应是对象起始");
+        let mut depth = 0i32;
+        let mut keys = Vec::new();
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                b'"' if depth == 1 => {
+                    let key_end = json[i + 1..].find('"').map(|p| i + 1 + p).unwrap_or(bytes.len());
+                    let key = json[i + 1..key_end].to_string();
+                    // 键后（跳过空白）紧跟 ':' 才是成员名；否则是字符串值
+                    let mut j = key_end + 1;
+                    while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+                        j += 1;
+                    }
+                    if j < bytes.len() && bytes[j] == b':' {
+                        keys.push(key);
+                    }
+                    i = key_end;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        keys
     }
 }

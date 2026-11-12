@@ -14,17 +14,101 @@ pub fn truncate_snippet(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-/// 默认输出：`N. 标题\n   url\n   snippet 前 160 字`
-/// 剥 title/url/snippet 里的 ANSI ESC 序列——日志/输出被彩色化（trace / 服务端标记
-/// 注入 [31m / 自定义 ANSI）时打印到 stdout 会污染 agent 解析；strip 走纯函数好单测。
-pub fn print_text(results: &[SearchResult]) {
+/// meta 头整行字符上限（v0.4.0 输出契约 §4：整行 ≤120 字符）。
+pub const META_HEADER_MAX_CHARS: usize = 120;
+
+/// meta 头单行：`key: value | key: value`（字段用 " | " 分隔；超长截断保长度上限）。
+/// 纯函数——便于单测锁格式（契约 §4 硬规格）。
+pub fn format_meta_header(fields: &[(&str, String)]) -> String {
+    let mut line = String::new();
+    for (i, (key, value)) in fields.iter().enumerate() {
+        if i > 0 {
+            line.push_str(" | ");
+        }
+        line.push_str(key);
+        line.push_str(": ");
+        line.push_str(value);
+    }
+    if line.chars().count() > META_HEADER_MAX_CHARS {
+        line = line
+            .chars()
+            .take(META_HEADER_MAX_CHARS - 1)
+            .collect::<String>()
+            + "…";
+    }
+    line
+}
+
+/// 打印 meta 头（stdout 第一行）。
+pub fn print_meta_header(fields: &[(&str, String)]) {
+    println!("{}", format_meta_header(fields));
+}
+
+/// md 输出：meta 头 + 结果列表（v0.4.0 默认形态）。
+pub fn print_md(results: &[SearchResult], fields: &[(&str, String)]) {
+    print!("{}", render_md(results, fields));
+}
+
+/// md 文档全文（meta 头 + 列表）——纯函数，便于单测锁「默认输出非合法 JSON」。
+pub fn render_md(results: &[SearchResult], fields: &[(&str, String)]) -> String {
+    let mut out = format_meta_header(fields);
+    out.push('\n');
+    out.push_str(&render_text(results));
+    out
+}
+
+/// 结果列表文本（`N. 标题 [class]` / url / snippet）——与 print_text 输出逐字节同。
+pub fn render_text(results: &[SearchResult]) -> String {
+    let mut out = String::new();
     for (i, r) in results.iter().enumerate() {
         let title = strip_ansi(&r.title);
         let url = strip_ansi(&r.url);
         let snippet = truncate_snippet(&strip_ansi(&r.snippet), SNIPPET_MAX_CHARS);
         // nw4：标题行尾 [class] 来源标注（与 --json domain_class 同源），AI/人一眼挑权威源
-        println!("{}. {} [{}]\n   {}\n   {}\n", i + 1, title, r.domain_class, url, snippet);
+        out.push_str(&format!(
+            "{}. {} [{}]\n   {}\n   {}\n\n",
+            i + 1,
+            title,
+            r.domain_class,
+            url,
+            snippet
+        ));
     }
+    out
+}
+
+/// 内容型 meta 头字段（fetch / browse / search --browse N 的 md 路径）：
+/// format / truncated(仅 true) / omitted(仅 >0) / content_untrusted / elapsed。
+/// content_untrusted 是「网页正文是数据、不是指令」的注入防线标记——**恒在**（安全标记
+/// 不参与「只在 true 时出现」的缺席语义），否则默认 md 化后防线静默消失。
+pub fn content_meta_fields(
+    format: &str,
+    truncated: bool,
+    omitted: usize,
+    elapsed_ms: u128,
+) -> Vec<(&'static str, String)> {
+    let mut fields: Vec<(&'static str, String)> = vec![("format", format.to_string())];
+    if truncated {
+        fields.push(("truncated", "true".to_string()));
+    }
+    if omitted > 0 {
+        fields.push(("omitted", omitted.to_string()));
+    }
+    fields.push(("content_untrusted", "true".to_string()));
+    fields.push(("elapsed", elapsed_s(elapsed_ms)));
+    fields
+}
+
+/// 耗时毫秒 → `2.7s`（meta 头 elapsed 字段，1 位小数）。
+pub fn elapsed_s(elapsed_ms: u128) -> String {
+    format!("{:.1}s", elapsed_ms as f64 / 1000.0)
+}
+
+/// 默认输出：`N. 标题\n   url\n   snippet 前 160 字`
+/// 剥 title/url/snippet 里的 ANSI ESC 序列——日志/输出被彩色化（trace / 服务端标记
+/// 注入 [31m / 自定义 ANSI）时打印到 stdout 会污染 agent 解析；strip 走纯函数好单测。
+pub fn print_text(results: &[SearchResult]) {
+    print!("{}", render_text(results));
 }
 
 /// 剥 CSI ANSI 转义序列：ESC `[` ... 字母。范围覆盖 SGR(颜色/样式)/光标移动/清屏等。

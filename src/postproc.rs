@@ -452,6 +452,7 @@ pub async fn read(
     opts: &ReadOpts,
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
+    let started = std::time::Instant::now();
     // c5f：正文复用 open_page 的 captcha 检查取，不再二次 content_retry。
     let (page, snap, html_full) = open_page(browser, h_slot, url, opts.allow_private).await?;
     let title = match &snap {
@@ -476,26 +477,84 @@ pub async fn read(
         }
     }
 
-    let out = render_read(
+    // 0mf：--json 时不再直接打印（envelope 先打 + read JSON 追加 = 两段拼接破坏 json.loads），
+    // 串由 cmd_search 装配进单一 JSON 文档后输出。
+    // v0.4.0 md 形态（契约第 3/5.2 节）：内容段 meta 头 + `# <页面标题>` + 空行 + md 正文。
+    // 正文源 = markdown（默认，渲染后 HTML→markdown）/ 标题目录（--headings-only）。
+    // meta 头字段与 fetch/browse 一致（format / truncated / omitted / content_untrusted / elapsed）
+    // ——content_untrusted 恒在：网页正文进 agent 上下文 = 注入面，这条标记是唯一载体。
+    // md 路径不走 render_read：那是 v0.3.0 人读形态（format_adaptive 散文），此处要的是
+    // md 正文；顺带免掉一次「算了再扔」的无用渲染 + 一条提到 --json 的过时 stderr 告警。
+    if !opts.json {
+        let (body, format, truncated, omitted) = if opts.headings_only {
+            (headings_md(&read), "headings", truncated, omitted)
+        } else {
+            // 截断数字取 md 正文自身（cap_chars 结果）——meta 头描述的是「打印出来的正文」，
+            // 不是 html 源的截断。
+            let (md, t, o, _) = cap_chars(&crate::convert::html_to_markdown(&html_full)?, read_max_chars());
+            (md, "markdown", t, o)
+        };
+        let fields = gsearch::output::content_meta_fields(
+            format,
+            truncated,
+            omitted,
+            started.elapsed().as_millis(),
+        );
+        gsearch::output::print_meta_header(&fields);
+        let section = md_page_section(&read.title, &body, opts.from);
+        print!("{section}");
+        return Ok(section);
+    }
+    Ok(render_read(
         &read,
-        opts.json,
+        true,
         opts.headings_only,
         opts.from,
         truncated,
         omitted,
         truncated_at_offset,
         headings_truncated,
-    );
-    // 0mf：--json 时不再直接打印（envelope 先打 + read JSON 追加 = 两段拼接破坏 json.loads），
-    // 串由 cmd_search 装配进单一 JSON 文档后输出；文本模式照旧。
-    if !opts.json {
-        println!("{out}");
+    ))
+}
+
+/// md 页节：`# <页面标题>` + 空行 + 正文（契约第 3/5.2 节）。
+/// `from` = 跳过正文前 N 个空行分隔的块——v0.3.0 的 `--from K` 语义是「摘要段从第 K 段开始」
+/// （AdaptiveRead 无摘要段），md 全文模式下取等价的「前 K 块」语义，flag 不静默失效。
+pub(crate) fn md_page_section(title: &str, body: &str, from: usize) -> String {
+    let mut out = String::new();
+    let heading = if title.trim().is_empty() {
+        "(untitled)"
+    } else {
+        title
+    };
+    out.push_str(&format!("# {heading}\n\n"));
+    if from > 0 {
+        let rest: Vec<&str> = body.split("\n\n").skip(from).collect();
+        out.push_str(&rest.join("\n\n"));
+    } else {
+        out.push_str(body);
     }
-    Ok(out)
+    out.push('\n');
+    out
+}
+
+/// 标题目录的 md 形态（`--headings-only`）：层级用 `#`/`##`/`###` 前缀。
+pub(crate) fn headings_md(read: &gsearch::skeleton::AdaptiveRead) -> String {
+    let mut out = String::new();
+    for h in &read.headings {
+        let prefix = match h.level {
+            1 => "#",
+            2 => "##",
+            3 => "###",
+            _ => "-",
+        };
+        out.push_str(&format!("{prefix} {}\n", h.text));
+    }
+    out
 }
 
 /// `--read N --full` 兜底：纯 innerText。--json（0mf）时静默返回正文串，由 cmd_search
-/// 装配进单一 JSON 文档；文本模式照旧打印 `=== url ===` 头。
+/// 装配进单一 JSON 文档；md 形态打印 `# <页面标题>` + 正文。
 pub async fn read_full(
     browser: &mut Browser,
     h_slot: &mut Option<tokio::task::JoinHandle<()>>,
@@ -504,10 +563,23 @@ pub async fn read_full(
     opts: &ReadOpts,
 ) -> Result<String> {
     let url = pick(results, n, "read")?;
-    let (page, _, _) = open_page(browser, h_slot, url, opts.allow_private).await?;
-    let (txt, _, _, _) = read_full_text(&page, read_max_chars()).await?;
+    let started = std::time::Instant::now();
+    let (page, snap, _) = open_page(browser, h_slot, url, opts.allow_private).await?;
+    let title = match &snap {
+        Some(s) => s.title.clone(),
+        None => eval_string_retry(&page, "document.title").await,
+    };
+    let (txt, truncated, omitted, _) = read_full_text(&page, read_max_chars()).await?;
     if !opts.json {
-        println!("=== {url} ===\n{txt}");
+        // v0.4.0 md 形态：内容段 meta 头 + `# <页面标题>` + 正文（format=full——innerText 源）。
+        let fields = gsearch::output::content_meta_fields(
+            "full",
+            truncated,
+            omitted,
+            started.elapsed().as_millis(),
+        );
+        gsearch::output::print_meta_header(&fields);
+        print!("{}", md_page_section(&title, &txt, 0));
     }
     Ok(txt)
 }

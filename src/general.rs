@@ -163,15 +163,16 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
         // xih：--markdown 隐含全文模式，源换渲染后 HTML→markdown（转换在截断前的完整 HTML 上做，
         // md 产物再过同一字符上限——先截 HTML 会把表格腰斩）。
         // --json 对齐 0mf search 契约：信封（meta.truncated 标内容截断）+ content_text 单文档
-        if opts.full || opts.markdown {
-            let (txt, truncated, omitted, truncated_at_offset) = if opts.markdown {
-                let (md, t, o, off) =
-                    postproc::cap_chars(&crate::convert::html_to_markdown(&html_probe)?, opts.max_chars);
-                (md, t, o, off)
-            } else {
-                postproc::read_full_text(&page, opts.max_chars).await?
-            };
-            if opts.json {
+        // v0.4.0：--json 路径 = v0.3.0 原路径（逐字节一致）；默认走 md 形态（meta 头 + 标题 + 正文）。
+        if opts.json {
+            if opts.full || opts.markdown {
+                let (txt, truncated, omitted, truncated_at_offset) = if opts.markdown {
+                    let (md, t, o, off) =
+                        postproc::cap_chars(&crate::convert::html_to_markdown(&html_probe)?, opts.max_chars);
+                    (md, t, o, off)
+                } else {
+                    postproc::read_full_text(&page, opts.max_chars).await?
+                };
                 let meta = gsearch::types::MetaOutput {
                     tool: "gsearch",
                     version: env!("CARGO_PKG_VERSION"),
@@ -214,41 +215,67 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
                 }
                 println!("{doc}");
             } else {
-                println!("=== {url} ===\n{txt}");
-                if truncated {
-                    eprintln!("注意：正文超上限已截断（省略 {omitted} 字符；--json 输出在 meta 字段标注）");
+                // AdaptiveRead JSON（v0.3.0 默认 JSON 形态，逐字节不变）
+                let title = match &snap {
+                    Some(s) => s.title.clone(),
+                    None => postproc::eval_string_retry(&page, "document.title").await,
+                };
+                let html_full = html_probe;
+                let (mut read, truncated, omitted, truncated_at_offset) =
+                    postproc::extract_adaptive_capped(&html_full, opts.max_chars, url, None);
+                read.url = url.to_string();
+                read.title = title;
+                if needs_empty_body_hint(
+                    read.summary_paragraphs.len(),
+                    opts.headings_only,
+                    0,
+                    html_full.trim().is_empty(),
+                ) {
+                    eprintln!("[hint] 正文提取为空，试 --markdown 或 --full");
                 }
+                let out = postproc::render_read(
+                    &read,
+                    true,
+                    opts.headings_only,
+                    opts.from,
+                    truncated,
+                    omitted,
+                    truncated_at_offset,
+                    false,
+                );
+                println!("{out}");
             }
             browser_opt = Some(browser);
             return Ok(());
         }
 
+        // v0.4.0 md 形态：meta 头 + `# <页面标题>` + 空行 + 正文（契约第 3/4/5.2 节）。
+        // 正文源：markdown（默认，渲染后 HTML→markdown）/ innerText（--full）/ 标题目录（--headings-only）。
         let title = match &snap {
             Some(s) => s.title.clone(),
             None => postproc::eval_string_retry(&page, "document.title").await,
         };
-        let html_full = html_probe;
-        let (mut read, truncated, omitted, truncated_at_offset) =
-            postproc::extract_adaptive_capped(&html_full, opts.max_chars, url, None);
-        read.url = url.to_string();
-        read.title = title;
-        // 打回轮2（PM 公式形态二「content 拿空」专用）：截断吃光形态（omitted>0）的
-        // hint 已由 render_read 打，此处 omitted 传 0 避免同一页双行重复（2se）
-        if needs_empty_body_hint(read.summary_paragraphs.len(), opts.headings_only, 0, html_full.trim().is_empty()) {
-            eprintln!("[hint] 正文提取为空，试 --markdown 或 --full");
-        }
-
-        let out = postproc::render_read(
-            &read,
-            opts.json,
-            opts.headings_only,
-            opts.from,
+        let heading = if title.trim().is_empty() { url.to_string() } else { title };
+        let (body, format, truncated, omitted) = if opts.full {
+            let (txt, t, o, _) = postproc::read_full_text(&page, opts.max_chars).await?;
+            (txt, "full", t, o)
+        } else if opts.headings_only {
+            let (read, t, o, _) =
+                postproc::extract_adaptive_capped(&html_probe, opts.max_chars, url, None);
+            (postproc::headings_md(&read), "headings", t, o)
+        } else {
+            let (md, t, o, _) =
+                postproc::cap_chars(&crate::convert::html_to_markdown(&html_probe)?, opts.max_chars);
+            (md, "markdown", t, o)
+        };
+        let fields = gsearch::output::content_meta_fields(
+            format,
             truncated,
             omitted,
-            truncated_at_offset,
-            false,
+            started.elapsed().as_millis(),
         );
-        println!("{out}");
+        gsearch::output::print_meta_header(&fields);
+        println!("# {heading}\n\n{body}");
         browser_opt = Some(browser);
         Ok(())
     }

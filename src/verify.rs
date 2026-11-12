@@ -33,6 +33,7 @@ pub fn cmd_verify(
     timeout: u64,
     urls_file: Option<&Path>,
 ) -> Result<ExitCode> {
+    let started = Instant::now();
     let mut targets: Vec<String> = urls.to_vec();
     if let Some(f) = urls_file {
         let content =
@@ -49,13 +50,22 @@ pub fn cmd_verify(
         // 单 URL：退出码与人读输出与旧版一致；JSON 增加 verdict 分类（6a6/ih1，与批量元素同构）
         [one] => {
             let probe = probe_url(one, proxy, timeout)?;
-            match probe.transport {
-                // 传输层失败沿用旧行为：仅 SSL 出报告，其余只出 stderr 分类行
-                Some((kind, curl_code)) => Ok(transport_exit(&probe, kind, curl_code, json)),
-                None => {
-                    print_probe(&probe, json);
-                    Ok(ExitCode::from(probe.verdict))
+            if json {
+                match probe.transport {
+                    // 传输层失败沿用旧行为：JSON 出分类行，其余只出 stderr 分类行
+                    Some((kind, curl_code)) => Ok(transport_exit(&probe, kind, curl_code)),
+                    None => {
+                        print_probe(&probe);
+                        Ok(ExitCode::from(probe.verdict))
+                    }
                 }
+            } else {
+                // v0.4.0 md 形态：meta 头 + 每 URL 一行结果（契约第 3/4 节）
+                print_verify_md(&[one], std::slice::from_ref(&probe), started.elapsed().as_millis());
+                if let Some((kind, curl_code)) = probe.transport {
+                    eprintln!("verify {kind} (curl exit {curl_code})");
+                }
+                Ok(ExitCode::from(probe.verdict))
             }
         }
         [] => anyhow::bail!("verify: 未提供任何 URL（参数为空或 urls 文件无有效行）"),
@@ -70,7 +80,11 @@ pub fn cmd_verify(
                     Ok(p)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            print_batch(many, &probes, json);
+            if json {
+                print_batch(&probes);
+            } else {
+                print_verify_md(many, &probes, started.elapsed().as_millis());
+            }
             // 批量退出码对齐 batch search（main.rs cmd_search_batch）：全 OK 0 / 部分失败 1 / 全失败 2
             let all_ok = probes.iter().all(|p| p.verdict == 0);
             let any_ok = probes.iter().any(|p| p.verdict == 0);
@@ -83,6 +97,37 @@ pub fn cmd_verify(
             }))
         }
     }
+}
+
+/// v0.4.0 md 形态：meta 头（checked/ok/failed/elapsed）+ 每 URL 一行检查结果（契约第 3/4 节）。
+/// 泛型 `S: AsRef<str>`：单 URL 传 `&[&String]`、批量传 `&[String]`——同一函数两种入参，零 URL 拷贝。
+fn print_verify_md<S: AsRef<str>>(urls: &[S], probes: &[Probe], elapsed_ms: u128) {
+    let ok = probes.iter().filter(|p| p.verdict == 0).count();
+    let fields = vec![
+        ("checked", probes.len().to_string()),
+        ("ok", ok.to_string()),
+        ("failed", (probes.len() - ok).to_string()),
+        ("elapsed", crate::output::elapsed_s(elapsed_ms)),
+    ];
+    crate::output::print_meta_header(&fields);
+    for (u, p) in urls.iter().zip(probes) {
+        println!("{}", verify_line_md(u.as_ref(), p));
+    }
+}
+
+/// 每 URL 一行：`- [OK]/[FAIL] <url> | <verdict> | <细节>`。
+fn verify_line_md(url: &str, p: &Probe) -> String {
+    let tag = if p.verdict == 0 { "[OK]" } else { "[FAIL]" };
+    let detail = match p.error_detail() {
+        Some(d) => d,
+        None => format!(
+            "status {} | ssl {} | {}ms",
+            p.report.status,
+            ssl_cell(p.ssl_output()),
+            p.report.latency_ms
+        ),
+    };
+    format!("- {tag} {url} | {} | {detail}", verdict_name(p.verdict))
 }
 
 /// 单条探测结果：报告 + 分类判定 + 输出元数据（标注/表格用）。
@@ -245,52 +290,24 @@ fn transport_kind(verdict: u8) -> &'static str {
 }
 
 /// 单 URL 传输层失败：JSON 一律出结构化分类行（6a6，单条/批量同构）；
-/// 人读仅 SSL 失败出报告（旧行为），其余只出 stderr 分类行。
-fn transport_exit(probe: &Probe, kind: &'static str, curl_code: i32, json: bool) -> ExitCode {
-    if json {
-        print_json(&probe_json(probe));
-    } else if probe.verdict == 3 {
-        print_report(&probe.report, probe.ssl_output());
-    }
+/// stderr 另出一行分类诊断（契约第 4 节：stderr 只放诊断行）。
+fn transport_exit(probe: &Probe, kind: &'static str, curl_code: i32) -> ExitCode {
+    print_json(&probe_json(probe));
     eprintln!("verify {kind} (curl exit {curl_code})");
     ExitCode::from(probe.verdict)
 }
 
-fn print_probe(p: &Probe, json: bool) {
-    if json {
-        print_json(&probe_json(p));
-        return;
-    }
-    print_report(&p.report, p.ssl_output());
-    if let Some(tag) = p.probe_tag() {
-        println!("probe:       {tag}");
-    }
+/// 单 URL 探测输出（JSON 路径；md 路径见 print_verify_md）。
+fn print_probe(p: &Probe) {
+    print_json(&probe_json(p));
 }
 
-/// 批量输出：--json 为报告数组（元素含 verdict 分类）；人读为对比表（含分类列，6a6）。
-fn print_batch(urls: &[String], probes: &[Probe], json: bool) {
-    if json {
-        let rows: Vec<ProbeJson> = probes.iter().map(probe_json).collect();
-        print_json(&rows);
-        return;
-    }
-    let w = urls.iter().map(String::len).max().unwrap_or(3).max(3);
-    println!(
-        "{:<w$}  {:>6}  {:>5}  {:>11}  {:>10}",
-        "url", "status", "ssl", "verdict", "latency_ms",
-        w = w
-    );
-    for (u, p) in urls.iter().zip(probes) {
-        println!(
-            "{:<w$}  {:>6}  {:>5}  {:>11}  {:>10}",
-            u,
-            p.report.status,
-            ssl_cell(p.ssl_output()),
-            verdict_name(p.verdict),
-            p.report.latency_ms,
-            w = w
-        );
-    }
+/// 批量输出（--json 为报告数组，元素含 verdict 分类）。
+/// v0.3.0 逐字节一致：JSON 路径元素集 = ProbeJson（status/final_url/redirect_chain/ssl_valid/
+/// latency_ms/verdict/error_detail/probe），原 `urls` 参数本就只服务于人读对比表，随之退休。
+fn print_batch(probes: &[Probe]) {
+    let rows: Vec<ProbeJson> = probes.iter().map(probe_json).collect();
+    print_json(&rows);
 }
 
 /// ssl 列单元格——None = http 无 TLS 参与，显示 n/a。
@@ -308,19 +325,6 @@ fn print_json<T: Serialize>(v: &T) {
         Ok(s) => println!("{s}"),
         Err(e) => eprintln!("JSON 序列化失败: {e}"),
     }
-}
-
-fn print_report(r: &VerifyReport, ssl: Option<bool>) {
-    println!("status:      {}", r.status);
-    println!("final_url:   {}", r.final_url);
-    if r.redirect_chain.is_empty() {
-        println!("redirects:   0");
-    } else {
-        println!("redirects:   {}", r.redirect_chain.join(" -> "));
-    }
-    // ih1：http 目标无 TLS 参与 → n/a，不继承结构体缺省值谎报
-    println!("ssl_valid:   {}", ssl.map(|b| b.to_string()).unwrap_or_else(|| "n/a".into()));
-    println!("latency_ms:  {}", r.latency_ms);
 }
 
 fn curl_args(url: &str, proxy: Option<&str>, timeout: u64, head: bool) -> Vec<String> {
