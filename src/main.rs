@@ -326,8 +326,8 @@ struct SearchArgs {
     /// 默认裸数组（存量 agent 零破坏）。单查询模式忽略此 flag。
     #[arg(long, value_enum)]
     envelope: Option<EnvelopeArg>,
-    /// meta 压缩到少量字段（query/truncated/provider/elapsed_ms/recency）。
-    /// 默认关（13 字段全量）；--verbose debug 或 GSEARCH_LOG=debug 时强制全量（排障现场保留）。
+    /// meta 压缩到少量字段（query/elapsed_ms/truncated/provider/truncated_detail）。
+    /// 默认关（全量 meta）；--verbose debug 或 GSEARCH_LOG=debug 时强制全量（排障现场保留）。
     #[arg(long, default_value_t = false)]
     compact_meta: bool,
     /// `--dl N -o DIR`：把下载文件落到 DIR 下（按 URL 末段命名）；DIR 缺省落 CWD。
@@ -1623,7 +1623,7 @@ mod tests {
         assert!(args.compact_meta);
         let cli = Cli::try_parse_from(["gsearch", "search", "x"]).unwrap();
         let Command::Search(args) = cli.cmd else { panic!("expected search") };
-        assert!(!args.compact_meta, "默认应关（14 字段全量）");
+        assert!(!args.compact_meta, "默认应关（全量 meta）");
         let cli = Cli::try_parse_from(["gsearch", "browse", "https://example.com", "--compact-meta"]).unwrap();
         let Command::Browse { compact_meta, .. } = cli.cmd else { panic!("expected browse") };
         assert!(compact_meta);

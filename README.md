@@ -40,7 +40,7 @@ gsearch search "..." --open 1
 - `meta` 键缺席语义：`truncated:false`、空 `message`、`captcha_solved:false` 均不占键；`results_count` 已移除（`len(results)` 可推导）；`browser_path` / `browser_kind` 已移除（环境噪声，浏览器信息走 `gsearch doctor`）
 - `meta.truncated` **按子命令两义，消费前先看子命令**（FixG20 PP 消歧）：`search` = **结果集封顶**——结果数触及 `--limit` 上限（可能还有更多被裁），与正文/snippet 截断无关，`truncated:true` 时**必附** `meta.truncated_detail: "results_capped_by_limit"` 自解释键；`fetch` / `read` / `browse` = **正文/响应体截断**（此时无 truncated_detail，伴随键是 `omitted` / `truncated_at_offset`）
 - `meta.limit` 如实反映返回集：`--read N` 截断后 `meta.limit = N`（而非 `--limit` 原值），下游按它判断返回集大小/预算（FixG18 HH）
-- `--compact-meta`（opt-in）：meta 裁到 query/limit/elapsed_ms/provider/recency 等少量键（`--verbose debug` 时强制全量排障）
+- `--compact-meta`（opt-in）：meta 裁到 query/elapsed_ms/truncated/provider/truncated_detail 少量键（`--verbose debug` 时强制全量排障）
 
 #### read 失败显式化
 
@@ -159,8 +159,23 @@ gsearch search "rust async" | python -m json.tool | less
 gsearch fetch https://big.site --max-chars 8000          # 默认 50000
 gsearch browse https://spa.site --max-chars 8000
 
+# 4. search 场景控 SERP 体积（同查询 limit5 实测 1811B/452tok → 965B/241tok）
+gsearch search "rust async" --limit 3 --snippet-len 100 --compact-meta
+
 # 禁 2>&1：stderr 承载 Chrome 启动 INFO/截断告警，混流会破坏 json.loads
 ```
+
+**search 场景的省 token 杠杆排序**（2026-11-12 实测，同一查询 limit 5；字节随 SERP 内容与查询措辞漂移，量级稳定）：
+
+| 姿势 | 字节 | tokens | 省 |
+|---|---|---|---|
+| 默认 | 1811B | ~452 | — |
+| `--snippet-len 100` | 1540B | ~385 | 14% |
+| `--compact-meta` | 1728B | ~432 | 4% |
+| `--compact-meta --snippet-len 100` | 1459B | ~364 | 19% |
+| `--compact-meta --snippet-len 100 --limit 3` | 965B | ~241 | **46%** |
+
+杠杆排序：**条数（`--limit`）> 截断长度（`--snippet-len`）> meta 精简（`--compact-meta`）**——meta 只值 4-8%（83-135B），而 snippet 占结果体积 60% 是内容本体、不可再省。`--human` 人读更省（1278B/319tok）但丢字段名、正则解析脆，一次误解析等于重跑一遍完整 JSON，比省下的更贵。
 
 注意：`browse` 等非搜索输出**没有 `meta.provider` 键**（无搜索来源，键缺席=正常）；`search` 输出恒有该键（`searxng` / `duckduckgo` / `google`）。
 
