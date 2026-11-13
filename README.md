@@ -2,7 +2,7 @@
 
 **AI-first** 搜索 + 通用浏览器代理 CLI：单 exe、零扩展、零运行时依赖（有 Chrome 即可）。输出契约默认为 **md 排版**（v0.4.0 起）——软件的唯一消费者是 AI/agent（LLM 下游），token 是一等成本：md 比 JSON 信封省 **~29%**（同批 5 条结果实测 436 → 308 tok），且盲测证明**不损 AI 提取准确率**；要程序解析（`json.loads` / 按字段名取值）加 `--json`。移植自 plsearch（Python/Playwright）的核心能力。
 
-> 输出契约（v0.4.0 反转，**breaking**）：默认输出 **md 排版**（stdout 第一行 = meta 头，其后 = md 正文）；`--json` 是**显式 JSON 开关**，输出与 v0.3.0 **逐字节一致**的 `{meta,run,results}` 信封（存量脚本加 `--json` 即完全兼容）；`--human` 保留，等价于默认（显式要 md）。缺席语义：`message:""`、`truncated:false`、`captcha_solved:false` 等**正常态字段直接缺席**（缺席 = 正常，出现 = 有新闻）——该语义在 `--json` 路径不变；md 路径对应地「`truncated` 只在 true 时出现在 meta 头」。**人读豁免（ago 实测修正）**：`dl` 与 `update` 与 `login` 输出人读文本而非 JSON/md 信封——`dl` 报 `mode: …` 与落盘路径、`update` 报版本比对结论、`login` 报登录过程提示；agent 消费这三个命令的 stdout 请按文本处理（`json.loads` 不适用）。`search` / `similar` / `fetch` / `verify` / `browse` / `doctor` 默认走 md 通道，加 `--json` 走 JSON 契约通道。
+> 输出契约（v0.4.0 反转，**breaking**）：默认输出 **md 排版**（stdout 第一行 = meta 头，其后 = md 正文）；`--json` 是**显式 JSON 开关**，输出与 v0.3.0 **逐字节一致**的 `{meta,run,results}` 信封（存量脚本加 `--json` 即完全兼容；唯一例外：结果集被判「整集与 query 无关」时会多 `relevance` 键并把 `run.status` 置 `off_topic_results`——正常查询不触发，见「结果相关性自检与诚实标注」）；`--human` 保留，等价于默认（显式要 md）。缺席语义：`message:""`、`truncated:false`、`captcha_solved:false` 等**正常态字段直接缺席**（缺席 = 正常，出现 = 有新闻）——该语义在 `--json` 路径不变；md 路径对应地「`truncated` 只在 true 时出现在 meta 头」。**人读豁免（ago 实测修正）**：`dl` 与 `update` 与 `login` 输出人读文本而非 JSON/md 信封——`dl` 报 `mode: …` 与落盘路径、`update` 报版本比对结论、`login` 报登录过程提示；agent 消费这三个命令的 stdout 请按文本处理（`json.loads` 不适用）。`search` / `similar` / `fetch` / `verify` / `browse` / `doctor` 默认走 md 通道，加 `--json` 走 JSON 契约通道。
 
 ## 用法
 
@@ -13,6 +13,7 @@ gsearch search "python asyncio" --limit 10        # 默认输出 md 排版（met
 gsearch search "fastapi tutorial" --json          # 显式 JSON 信封（= v0.3.0 行为，程序解析用）
 gsearch search "fastapi tutorial" --human         # 显式要 md（等价于默认，保留 flag）
 gsearch search "rust release" --recency week      # 时间过滤 day|week|month|year
+gsearch search "..." --relevance-threshold 0.8   # 相关性自检阈值（整集 off_topic 占比，默认 0.5）
 gsearch search "..." --no-humanize                # 强制跳过 warmup（TTY 下想快档时用；管道默认已关）
 gsearch search "..." --read 5                     # L-1：snippet-only，只取前 5 条 snippet（不启浏览器）
 gsearch search "..." --browse 1                   # L-1：启浏览器读前 1 条结果的 URL 页面正文（AdaptiveRead）
@@ -48,6 +49,7 @@ provider: searxng | results: 5 | limit: 5 | truncated: true | elapsed: 2.7s
 - `results`：本次返回条数
 - `limit`：本次生效的 limit
 - `truncated`：**只在 true 时出现**（false 是默认态，缺席 = 未截断，与 `--json` 路径的缺席语义一致）
+- `off_topic`：相关性自检计数（**只在整集判可疑时出现**，形如 `off_topic: 10/10`——分子 = 与 query 零交集条数，分母 = 结果总数；见下方「结果相关性自检与诚实标注」）
 - `elapsed`：耗时，保留 1 位小数秒
 
 各命令的 md 形态：
@@ -73,6 +75,7 @@ search 结果列表（= 现有 `--human` 的 `print_text` 形态，已盲测验�
 
 - 摘要截断语义不变：`--snippet-len`，默认 160 字符
 - 类别即 `--json` 路径的 `domain_class`（URL host 启发式：docs/github/wikipedia/blog/forum/video/news/qa/other）
+- **整集判可疑时**标题行尾追加相关性档位（`1. 标题 [docs] [off_topic]`，档位 `off_topic` / `weak` / `ok`）；正常态不追加 → md 输出逐字节不变
 - **`score`（相关性分）只在 `--json` 路径有**——md 列表不渲染分值；需要按分筛序请用 `--json`
 - fetch / browse 的正文复用现有 `--markdown` 转换器（`crate::convert::html_to_markdown`），表格保管道表格、标题保层级、链接保 `[text](href)`
 - fetch / browse 的截断语义不变：`--max-chars`，截断信息走 meta 头的 `truncated`（true 时）与 `omitted`（>0 时）
@@ -87,20 +90,51 @@ search 结果列表（= 现有 `--human` 的 `print_text` 形态，已盲测验�
 
 JSON 的浪费是**结构性**的：每条结果固定多付 `"title":` `"url":` `"snippet":` `"domain_class":` 共 **47B ≈ 12 tok** 键名，条数越多亏得越多（limit 10 时 JSON 996 tok vs md 484 tok）。独立 agent 盲测（各只读一种形态，答案按 JSON 源逐字核对）：**JSON 组 5/5 全对，md 组 5/5 全对且答案逐字一致**（含带 `msockid` 的长 URL、40 字符截断边界）→ md 形态**不损 AI 提取准确率**。
 
-##### `--json` 路径（显式 JSON，内容 = v0.3.0 逐字节一致）
+##### `--json` 路径（显式 JSON，内容 = v0.3.0 逐字节一致；整集可疑时除外，见下）
 
 - **紧凑单行**（无缩进——缩进对 LLM 是纯 token 税）
 - 信封结构 `{meta, run, results}`（search / batch；`--json` 输出与 v0.3.0 默认输出**逐字节一致**，只是入口从「默认」变成「显式 flag」；fetch / browse / verify / doctor 的 JSON 形态各自独立，见各命令章节）
 - **`--human` 与 `--json` 同时传时 `--human` 优先**（保 v0.3.0 `--human --json` 仍给人读的兼容行为）
-- 每条结果：`title / url / snippet / score / domain_class`
+- 每条结果：`title / url / snippet / score / domain_class`（+ `relevance`，**缺席语义**：只在整集判可疑时出现）
   - `snippet` 默认 160 字符截断（`--snippet-len N` 可调，1..=100000）
   - `score` 为 SearXNG 内部相关性分透传（agent 可按分筛序）；DDG html 用 **SERP 页位置分**——DDG 首页返回序去重后打分，SERP 第 1 位 = 10.0，每降一位 -1.0（`--limit` 截断不改变分数，故 limit=3 实测得 `[10,9,8]`，ago 实测修正）；**跨 provider 量纲不同，不可直比**（SearXNG 内部分与 DDG 位置分无换算关系）；Google 等无分来源此键缺席
   - `domain_class`：URL host 启发式（docs/github/wikipedia/blog/forum/video/news/qa/other），可按类筛权威源
-- 顶层 `run.status`：`ok / captcha_required / captcha_timeout / searxng_degraded / filtered_empty / no_results / error`——零结果三态分立（o1p）：`searxng_degraded` = 源故障/熔断（跑 doctor），`filtered_empty` = recency 过滤后空、源健康（去掉 --recency 或换时间窗），`no_results` = 查询无果、源健康（换词重试）
+  - `relevance`：与 query 的相关性档位（`off_topic` / `weak` / `ok`）——**整集未判可疑时该键整体缺席**（不是 `null`），故正常查询的 `--json` 输出与引入本特性前**逐字节一致**
+- 顶层 `run.status`：`ok / captcha_required / captcha_timeout / searxng_degraded / filtered_empty / no_results / off_topic_results / error`——零结果三态分立（o1p）：`searxng_degraded` = 源故障/熔断（跑 doctor），`filtered_empty` = recency 过滤后空、源健康（去掉 --recency 或换时间窗），`no_results` = 查询无果、源健康（换词重试）；`off_topic_results` = **有结果但整集与 query 零词元交集**（上游引擎返回了无关结果集）——结果不丢弃，逐条带 `relevance` 标签
 - `meta` 键缺席语义：`truncated:false`、空 `message`、`captcha_solved:false` 均不占键；`results_count` 已移除（`len(results)` 可推导）；`browser_path` / `browser_kind` 已移除（环境噪声，浏览器信息走 `gsearch doctor`）
 - `meta.truncated` **按子命令两义，消费前先看子命令**（FixG20 PP 消歧）：`search` = **结果集封顶**——结果数触及 `--limit` 上限（可能还有更多被裁），与正文/snippet 截断无关，`truncated:true` 时**必附** `meta.truncated_detail: "results_capped_by_limit"` 自解释键；`fetch` / `read` / `browse` = **正文/响应体截断**（此时无 truncated_detail，伴随键是 `omitted` / `truncated_at_offset`）
 - `meta.limit` 如实反映返回集：`--read N` 截断后 `meta.limit = N`（而非 `--limit` 原值），下游按它判断返回集大小/预算（FixG18 HH）
-- `--compact-meta`（opt-in）：meta 裁到 query/elapsed_ms/truncated/provider/truncated_detail 少量键（`--verbose debug` 时强制全量排障）
+- `--compact-meta`（opt-in）：meta 裁到 query/elapsed_ms/truncated/provider/truncated_detail 少量键（可疑集另加 `off_topic` 计数；`--verbose debug` 时强制全量排障）
+
+#### 结果相关性自检与诚实标注（bd gsearch-rs-d8s）
+
+**问题**：上游引擎可能返回与 query 完全无关的结果集——实锤：SearXNG `bing` 引擎对中文查询返回 Bloomberg / 美元汇率 / 新加坡掏耳诊所 / Chess.com（upstream [searxng#6937](https://github.com/searxng/searxng/issues/6937)，2026-11-13）。每条标题与 URL 都长得像正常 SERP，客户端无从察觉 → **静默污染**。
+
+**做法**：拿 query 词元与每条结果的 `title + snippet` 求交集，判档位：
+
+| 档位 | 含义 |
+|---|---|
+| `off_topic` | 与 query **零词元交集**（结果与查询无关） |
+| `weak` | 有交集但未覆盖全部词元；或结果文本与 query **不同族**（**判不了 ≠ 判无关**，跨语言结果不冤枉） |
+| `ok` | query 词元全覆盖 |
+
+- 词元提取：拉丁词（≥3 字符、去英文停用词）+ 中文**不重叠 2-gram**（去中文停用二元组）——中文查询通常无空格，不按空格分词；query 词元 < 2 条**不判定**（短 query 不冤枉）
+- **逐族判定（不制造「假零交集」）**：query 词元按文字族分开算——**拉丁族**（拉丁词）与 **CJK 族**（中文不重叠 2-gram）。某一族在**该条结果文本里不可比**时（如英文页里没有中文可比）→ 该族**跳过**，不拿它的零命中去凑「零交集」（判不了 ≠ 判无关）；**所有可比族都零交集** → 该条 `off_topic`；**任一可比族有交集** → `weak` / `ok`（不指控）
+- **整集判定**：off_topic 条数 ≥ 2 **且**占结果集比例 ≥ `--relevance-threshold`（默认 `0.5`）→ 判整集可疑 → 逐条下发 `relevance` 标签 + `run.status=off_topic_results` + `run.message` 一行人读说明（`10/10 条结果与 query 零词元交集（疑似上游引擎返回了无关结果集，非查询无资料）；建议换引擎或换短 query 复核`）
+- **缺席语义**：未判可疑时 `relevance` 键**整体缺席**、`run.status` 仍是 `ok`、md 行不追加标记 → **正常查询的 `--json` 输出与引入本特性前逐字节一致**（回归锁 `tests/cli_golden_bytes.rs`：跑**真实 CLI 二进制** + 本地回环假 SearXNG，stdout 归一后与仓内 golden 逐字节比对；golden 取自**本特性引入前**的 commit `ae1d595` release 二进制实跑输出。`tests/json_golden_compat.rs` 另锁信封序列化层）
+- **只打标，不丢结果、不改排序**：首轮不做 rerank、不删 off_topic 条目（本地 rerank 已在 bd `8gp` 明确驳回）
+- 阈值可配：`--relevance-threshold <0.0..1.0>`（默认 0.5）——调高更保守（只对整集明显无关时才标注）、调低更敏感；越界取值在发起任何网络前拒绝（rc=2）
+- md 路径：meta 头追加 `off_topic: N/M` 计数（>0 才出现），结果行尾追加 `[off_topic]` / `[weak]` / `[ok]`；`--json` 路径对应计数在 `meta.off_topic`（**只在可疑时出现**，缺席语义；值 = 零交集条数，分母 = `len(results)`）
+- 退出码不变：可疑集仍返回 `0`（结果照给了，只是如实标注）；消费方请读 `run.status` / `relevance`
+- batch 多查询同规则：单条 query 判可疑时该条目标 `status=off_topic_results`（结果照给 + 一行诊断），退出码语义不变
+- **已知边界（实测）**：
+  - **已知误指控面（产品取舍）**：混合 query（中+拉丁）遇**外语结果集**时，判定**只依据拉丁族**（CJK 词元在外语文本里永不可能命中 → 跳过）→ 若英文页含天气却不含 `api` 这类拉丁词元，仍会被判 `off_topic`（例：「北京 天气 API」× 含天气但不含 api 的英文页）。**取舍理由**：漏指控会让上游引擎的污染静默通过（2026-11-13 bing 事故形态＝中文 query × 全英文无关结果集，必须抓得到）；**代价受控**——本特性**只打标、不丢结果、不改排序**，下游 agent 可自行复核
+  - **跨文字族行同档**：结果文本是西里尔/希腊等文字（query 为拉丁）时，只要**结果集里存在拉丁文本**，该行照样按拉丁词元判定 → 与同族无关行同档（不再因字形族不同而分档）；但若整集**没有任何拉丁字母**（例：拉丁 query × 全俄语结果集）→ 拉丁族跳过 → 不判定、不指控
+  - **部分污染永不标注**：off_topic 占比未达阈值（如 1/10、4/10）时整集不判可疑 → **一个标签都不下发**（不是逐条报，是整集口径）
+  - **`shell` 交互路径与 `similar` 命令不参与标注**（只有 `search` / `search` 多查询 batch 带 `relevance`）
+  - **短词 / 版本号 / 标识符类 query 静默永不判定**：query 词元 < 2 条即不判定（`rust`、`Go 语言`、`rust 1.75`、`C++` 智能指针）——无标签、无状态、无提示
+  - **子串匹配的已知假命中**：词元按子串匹配（不切词边界）→ `rust` 会命中 `Distrust`、`cat` 会命中 `education` → 方向是**漏判**（少指控），不修（改动会牵连召回）
+  - **可疑集与人工 CAPTCHA 同时成立时**：`run.message` 走 off_topic 分支，CAPTCHA 的人读提示被吞（`run.captcha_solved` 独立字段仍在，信息未丢）
 
 #### read 失败显式化
 

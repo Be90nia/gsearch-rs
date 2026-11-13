@@ -155,6 +155,7 @@ fn push_result(out: &mut Vec<SearchResult>, href: &str, title: String, snippet: 
         // score 占位 None，parse 尾部统一按返回序打分（去重后才知最终名次）
         score: None,
         domain_class: crate::util::domain_class(&url),
+        relevance: None,
     });
 }
 

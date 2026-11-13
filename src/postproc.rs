@@ -900,6 +900,7 @@ mod tests {
             snippet: "s".into(),
             score: None,
             domain_class: "other",
+            relevance: None,
         }];
         assert!(pick(&r, 0, "read").is_err());
         assert!(pick(&r, 2, "read").is_err());
@@ -1253,6 +1254,7 @@ mod live_tests {
             snippet: "s".into(),
             score: None,
             domain_class: "other",
+            relevance: None,
         }]
     }
 

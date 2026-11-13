@@ -116,6 +116,7 @@ fn parse(text: &str) -> Result<Vec<SearchResult>> {
                 snippet: r.content,
                 score: r.score,
                 domain_class,
+                relevance: None,
             }
         })
         .collect())
@@ -176,6 +177,7 @@ fn extract_articles(doc: &Html, article: &Selector, base_url: &str) -> Vec<Searc
             snippet,
             score: None,
             domain_class,
+            relevance: None,
         });
     }
     out
@@ -196,6 +198,7 @@ fn extract_walk(doc: &Html, base_url: &str) -> Vec<SearchResult> {
                 snippet: String::new(),
                 score: None,
                 domain_class,
+                relevance: None,
             });
             pending = true;
         } else if pending {

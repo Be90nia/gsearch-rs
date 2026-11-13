@@ -30,9 +30,10 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
-      - name: cargo test (lib + bin, no live_tests)
+      - name: cargo test (lib + bin + integration tests, no live_tests)
         # live_tests 需要真 Chrome + profile——只在 Windows 跑
-        run: cargo test --lib --bins -- --skip live_tests
+        # --tests：跑 tests/ 下的集成测试（假 SearXNG 回环回归 + CLI stdout 逐字节 golden）
+        run: cargo test --lib --bins --tests -- --skip live_tests
 
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings

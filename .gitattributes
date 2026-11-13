@@ -1,0 +1,8 @@
+# 逐字节 golden 期望文件是 CLI stdout 原始字节（LF）——必须跨 checkout 保持 LF。
+# 本机 git core.autocrlf=true 且本仓曾无 .gitattributes → LF 文件在 Windows 重新 checkout
+# 会被转成 CRLF，导致 golden 比对在本地红（CI 的 Linux checkout 是 LF 故绿）。
+# 修：显式声明 eol=lf，两端一致。
+tests/fixtures/golden_search_*.txt text eol=lf
+tests/fixtures/cli_golden_payloads.json text eol=lf
+tests/fixtures/off_topic_searxng_20261113.json text eol=lf
+tests/fixtures/on_topic_control_20261113.json text eol=lf

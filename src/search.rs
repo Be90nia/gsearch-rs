@@ -14,7 +14,7 @@ use chromiumoxide::browser::Browser;
 
 use crate::browser;
 use crate::parse::parse_serp;
-use crate::types::SearchResult;
+use crate::types::{Relevance, SearchResult};
 
 /// 常量对照 plsearch config.py / main.py：RESULTS_PER_PAGE=10 / MAX_PAGES=10 / CAPTCHA_WAIT_TIMEOUT_SECONDS=120
 const RESULTS_PER_PAGE: usize = 10;
@@ -317,6 +317,219 @@ pub fn circuit_diag(reason: &str) -> String {
     } else {
         format!("{SEARXNG_CIRCUIT_MSG}；真因: {reason}")
     }
+}
+
+// ===== bd gsearch-rs-d8s：结果相关性自检（诚实标注）=====
+
+/// 相关性判定的最小词元数——query 词元 < 2 不判定（短 query 词元少，误杀率高）。
+const MIN_RELEVANCE_TERMS: usize = 2;
+
+/// 整集可疑所需的最小 off_topic 条数——单条噪声不构成「整集可疑」。
+const MIN_OFF_TOPIC_RESULTS: usize = 2;
+
+/// 默认阈值：整集 off_topic 占比 ≥ 该值 → 判整集可疑（可疑才下发标签 + 新状态）。
+pub const DEFAULT_RELEVANCE_THRESHOLD: f64 = 0.5;
+
+/// 英文停用词（≥3 字符的功能词）——不剔则 "how/the" 命中一切 → 零交集判定永久失效。
+const EN_STOP_WORDS: &str = "\
+and are but can could did does for from had has have how its may might more most nor not once only other our out \
+over own same should some such than then there these they this those through too under until use used using very \
+was were what when where which while who why will with would you your via per way one two new see let list best top \
+like also just much sure keep give find call come take ask try say few end time work thing know make want need feel \
+site http https www com org net get";
+
+/// 中文停用二元组（疑问/连接/泛指词）——同理（"如何/怎么" 在中文标题里遍地都是）。
+const ZH_STOP_BIGRAMS: &str = "\
+如何 怎么 怎样 什么 为啥 哪些 哪里 何时 是否 能否 可以 应该 需要 这些 那些 这个 那个 以及 或者 而且 因为 所以 \
+如果 但是 通过 进行 关于 对于 由于 于是 然后 现在 已经 还是 不是 没有 就是 不会 不能 不同 相关 主要 一般 常见 \
+使用 用于 一个 哪种 我们 你们 他们";
+
+/// CJK 判定（基本汉字区 + 扩展 A + 兼容表意文字）。
+fn is_cjk(ch: char) -> bool {
+    let o = ch as u32;
+    (0x4E00..=0x9FFF).contains(&o) || (0x3400..=0x4DBF).contains(&o) || (0xF900..=0xFAFF).contains(&o)
+}
+
+fn is_stop_word(w: &str) -> bool {
+    EN_STOP_WORDS.split_whitespace().any(|s| s == w)
+}
+
+fn is_stop_bigram(g: &str) -> bool {
+    ZH_STOP_BIGRAMS.split_whitespace().any(|s| s == g)
+}
+
+/// query 词元：拉丁词（≥3 字符、去停用词）+ 中文不重叠 2-gram（去停用二元组）。
+/// CJK 不按空格分词（中文查询通常无空格）——按 2-gram 取子串，命中即算交集。
+struct QueryTerms {
+    latin: Vec<String>,
+    cjk: Vec<String>,
+}
+
+impl QueryTerms {
+    fn of(query: &str) -> Self {
+        let mut latin = Vec::new();
+        let mut cjk = Vec::new();
+        let mut buf = String::new();
+        let mut buf_cjk = false;
+        for ch in query.chars() {
+            let cjk_ch = is_cjk(ch);
+            // 非字母数字且非 CJK = 分隔符（空格/标点）→ 断段
+            if !(cjk_ch || ch.is_alphanumeric()) {
+                push_terms(&mut buf, buf_cjk, &mut latin, &mut cjk);
+                continue;
+            }
+            if !buf.is_empty() && cjk_ch != buf_cjk {
+                push_terms(&mut buf, buf_cjk, &mut latin, &mut cjk);
+            }
+            buf_cjk = cjk_ch;
+            for lower in ch.to_lowercase() {
+                buf.push(lower);
+            }
+        }
+        push_terms(&mut buf, buf_cjk, &mut latin, &mut cjk);
+        QueryTerms { latin, cjk }
+    }
+
+    fn total(&self) -> usize {
+        self.latin.len() + self.cjk.len()
+    }
+}
+
+/// 结果集里是否出现过拉丁字母——拉丁族可比性的**集合级**前提。
+///
+/// 整集一条拉丁字母都没有 → 拉丁词元在此集永不可能命中 → 零交集是必然（判不了 ≠ 判无关）
+/// → 拉丁族整体跳过。保住「拉丁 query × 全俄语结果集」不判 off_topic（探针 S5）。
+fn set_has_latin(results: &[SearchResult]) -> bool {
+    results.iter().any(|r| {
+        r.title
+            .chars()
+            .chain(r.snippet.chars())
+            .any(|c| c.is_ascii_alphabetic())
+    })
+}
+
+/// 把一段同族文本转成词元：CJK 段取不重叠 2-gram；拉丁段整体成一个词（段内已无非字母数字）。
+fn push_terms(buf: &mut String, cjk: bool, latin: &mut Vec<String>, cjk_terms: &mut Vec<String>) {
+    if buf.is_empty() {
+        return;
+    }
+    if cjk {
+        let chars: Vec<char> = buf.chars().collect();
+        let mut i = 0;
+        while i + 1 < chars.len() {
+            let g: String = chars[i..i + 2].iter().collect();
+            if !is_stop_bigram(&g) {
+                cjk_terms.push(g);
+            }
+            i += 2;
+        }
+    } else {
+        for w in buf.split(|c: char| !c.is_alphanumeric()) {
+            if w.chars().count() >= 3 && !is_stop_word(w) {
+                latin.push(w.to_string());
+            }
+        }
+    }
+    buf.clear();
+}
+
+/// 单条结果的相关性档位：None = 不判定（query 词元不足 2 —— 短 query 不冤枉）。
+///
+/// **逐族独立判定**（bd d8s B1）：
+///   * 拉丁族可比 ⟺ query 有拉丁词元 ∧ 结果集里出现过拉丁字母 ∧ 本条含**任意字母**
+///     （ASCII / 西里尔 / 希腊…——放宽自「ASCII 字母」，免得同族无关行因字形族被分档）；
+///   * CJK 族可比 ⟺ query 有 CJK 词元 ∧ 本条含 CJK 字符；
+///   * **不可比的族直接跳过**（不制造「假零交集」——判不了 ≠ 判无关）；
+///   * 所有可比族都零交集 → `off_topic`；任一可比族有交集 → `weak` / `ok`。
+///
+/// 混合 query（中+拉丁）× 外语结果集时，判定只依据可比的那一族（例：中文 query × 英文结果集
+/// → 只看拉丁词元）——这是**产品取舍**：漏指控会让上游引擎的污染静默通过（bing 事故形态），
+/// 误指控只产生一个可复核的标签（只打标、不丢结果、不改排序）。
+fn label_result(terms: &QueryTerms, r: &SearchResult, set_latin: bool) -> Option<Relevance> {
+    let total = terms.total();
+    if total < MIN_RELEVANCE_TERMS {
+        return None;
+    }
+    let hay = format!("{} {}", r.title, r.snippet).to_lowercase();
+    let latin_ok =
+        !terms.latin.is_empty() && set_latin && hay.chars().any(|c| c.is_alphabetic());
+    let cjk_ok = !terms.cjk.is_empty() && hay.chars().any(is_cjk);
+    if !latin_ok && !cjk_ok {
+        // 一个可比族都没有 → 判不了（不指控）
+        return Some(Relevance::Weak);
+    }
+    let mut matched = 0usize;
+    if latin_ok {
+        matched += terms.latin.iter().filter(|t| hay.contains(t.as_str())).count();
+    }
+    if cjk_ok {
+        matched += terms.cjk.iter().filter(|t| hay.contains(t.as_str())).count();
+    }
+    if matched == 0 {
+        return Some(Relevance::OffTopic);
+    }
+    if matched == total {
+        return Some(Relevance::Ok);
+    }
+    Some(Relevance::Weak)
+}
+
+/// 相关性判定报告（bd d8s）——整集视角，供 status / meta 计数共用。
+#[derive(Debug, Clone)]
+pub struct RelevanceOutcome {
+    /// 逐条档位（None = 不判定：query 词元不足 2）。**内部判定始终进行**，
+    /// 但只有整集可疑时才写回结果（正常态键整体缺席 → 输出逐字节不变）。
+    pub labels: Vec<Option<Relevance>>,
+    /// 整集是否可疑——只有可疑才下发标签 + 新状态（正常态输出逐字节不变）。
+    pub suspicious: bool,
+    /// off_topic 条数（与 query 零词元交集）。
+    pub off_topic: usize,
+    /// 结果总数。
+    pub total: usize,
+}
+
+/// 相关性自检（纯函数）：query 词元与 (title + snippet) 的交集。
+/// threshold = 整集 off_topic 占比下限（默认 0.5）；off_topic ≥ 2 条且占比达阈值 → 整集可疑。
+/// 只打标不改排序、不丢结果（bd d8s 非目标）。
+pub fn judge_relevance(query: &str, results: &[SearchResult], threshold: f64) -> RelevanceOutcome {
+    let terms = QueryTerms::of(query);
+    let total = results.len();
+    let set_latin = set_has_latin(results);
+    let labels: Vec<Option<Relevance>> = results
+        .iter()
+        .map(|r| label_result(&terms, r, set_latin))
+        .collect();
+    let off_topic = labels.iter().filter(|l| **l == Some(Relevance::OffTopic)).count();
+    let ratio = if total == 0 { 0.0 } else { off_topic as f64 / total as f64 };
+    RelevanceOutcome {
+        labels,
+        suspicious: off_topic >= MIN_OFF_TOPIC_RESULTS && ratio >= threshold,
+        off_topic,
+        total,
+    }
+}
+
+/// 相关性自检 + 就地打标（生产接线用）：整集可疑时逐条写入 `relevance` 标签
+/// （off_topic/weak/ok）；正常态不动任何结果（--json 输出与本特性引入前逐字节一致）。
+pub fn apply_relevance(
+    query: &str,
+    results: &mut [SearchResult],
+    threshold: f64,
+) -> RelevanceOutcome {
+    let out = judge_relevance(query, results, threshold);
+    if out.suspicious {
+        for (r, label) in results.iter_mut().zip(out.labels.iter()) {
+            r.relevance = *label;
+        }
+    }
+    out
+}
+
+/// 整集可疑诊断行——与三态零结果语义分立（有结果但结果无关，不是「没找到」也不是「源故障」）。
+pub fn off_topic_diag(off_topic: usize, total: usize) -> String {
+    format!(
+        "{off_topic}/{total} 条结果与 query 零词元交集（疑似上游引擎返回了无关结果集，非查询无资料）；建议换引擎或换短 query 复核"
+    )
 }
 
 pub async fn try_searxng(cfg: &SearchConfig) -> SearxngAttempt {
@@ -835,6 +1048,29 @@ mod tests {
         assert_eq!(title_overlap("unrelated page", &kws), Vec::<String>::new());
         assert_eq!(host_of("https://docs.rs/serde?q=1"), "docs.rs");
         assert_eq!(host_of("https://www.Example.com/x"), "example.com", "www 剥离与同域比较归一一致");
+    }
+
+    /// bd d8s：query 词元提取锁定——英文停用词 + 短词丢弃、中文不重叠 2-gram + 停用二元组。
+    /// 停用词表是多行字符串常量（`\` 续行），格式写错会让「how/to/on」变成词元 →
+    /// 零交集判定全盘失效，故把词元表本身钉死。
+    /// 注：`install` 刻意**不在**停用词表内（内容动词，保留后判定更保守——少指控）。
+    #[test]
+    fn query_terms_drop_stopwords_and_split_cjk_bigrams() {
+        use super::QueryTerms;
+        let latin = QueryTerms::of("how to install docker on debian");
+        assert_eq!(
+            latin.latin,
+            vec![
+                "install".to_string(),
+                "docker".to_string(),
+                "debian".to_string()
+            ]
+        );
+        assert!(latin.cjk.is_empty());
+        // 中文不按空格分词：按不重叠 2-gram 取子串，停用二元组丢弃
+        let cjk = QueryTerms::of("如何用Python读取CSV");
+        assert_eq!(cjk.latin, vec!["python".to_string(), "csv".to_string()]);
+        assert_eq!(cjk.cjk, vec!["读取".to_string()]);
     }
 
     /// qbw：验收点名用例——not-a-url 拒、带 scheme 过、无 scheme 的 host/path 形态

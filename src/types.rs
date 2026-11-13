@@ -14,6 +14,34 @@ pub struct SearchResult {
     /// nw4：来源类型标注（URL host 启发式：docs/github/wikipedia/blog/forum/video/news/qa/other）。
     /// 零网络零猜测——未命中一律 other。装配处统一走 util::domain_class。
     pub domain_class: &'static str,
+    /// bd gsearch-rs-d8s：与 query 的相关性标签（off_topic / weak / ok）。
+    /// 缺席语义（8lp）：整集判可疑时才逐条下发，正常态键整体缺席——
+    /// 故 --json 输出与 v0.4.0 逐字节一致（未触发可疑判定时）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relevance: Option<Relevance>,
+}
+
+/// bd gsearch-rs-d8s：单条结果与 query 的相关性档位。
+/// - `off_topic`：与 query 零词元交集（上游引擎返回了与查询无关的结果集）
+/// - `weak`：有交集但未覆盖全部词元，或文本不含 query 同族文字（判不了 ≠ 判无关）
+/// - `ok`：query 词元全覆盖
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Relevance {
+    OffTopic,
+    Weak,
+    Ok,
+}
+
+impl Relevance {
+    /// 档位文本——与 `--json` 的 snake_case 序列化名同源（md 行内标记用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OffTopic => "off_topic",
+            Self::Weak => "weak",
+            Self::Ok => "ok",
+        }
+    }
 }
 
 /// 给 agent 用的 self-describing JSON 头部。`--json` 输出现在长这样：
@@ -67,6 +95,11 @@ pub struct MetaOutput {
     /// 截断无关）。truncated=false 或非搜索路径缺席（8lp 缺席=正常，默认输出结构不变）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated_detail: Option<String>,
+    /// bd gsearch-rs-d8s：整集判可疑时与 query 零词元交集的结果条数（计数）。
+    /// 缺席语义：未判可疑（正常态）键整体缺席 → `--json` 输出与本特性引入前逐字节一致。
+    /// md 路径同源计数在 meta 头（`off_topic: N/M`）；JSON 侧只给分子 N，分母 = len(results)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub off_topic: Option<usize>,
 }
 
 /// FixG17：search `truncated=true` 时 `meta.truncated_detail` 的值——结果数触及
@@ -129,6 +162,11 @@ pub enum RunStatus {
     FilteredEmpty,
     /// o1p：查询无果且 SearXNG 源健康——既非熔断也非过滤空，换词重试即可。
     NoResults,
+    /// bd gsearch-rs-d8s：整集结果与 query 零词元交集（上游引擎返回了无关结果集，
+    /// 如 SearXNG bing 的中文查询错位，upstream searxng#6937）。
+    /// 与三态零结果语义分立——**有结果但结果无关**（不是「没找到」，也不是「源故障」）；
+    /// 结果不丢弃，只逐条标 `relevance` + 本状态如实告知消费方。
+    OffTopicResults,
     #[default]
     Error,
 }
@@ -229,6 +267,7 @@ mod tests {
             snippet: "S".into(),
             score: None,
             domain_class: "other",
+            relevance: None,
         }]
     }
 
@@ -248,6 +287,7 @@ mod tests {
             recency: None,
             site_warn: None,
             truncated_detail: None,
+            off_topic: None,
         }
     }
 
@@ -325,6 +365,8 @@ mod tests {
             // o1p：三态零结果语义（filtered_empty / no_results 与 searxng_degraded 分立）
             (RunStatus::FilteredEmpty, "\"status\":\"filtered_empty\""),
             (RunStatus::NoResults, "\"status\":\"no_results\""),
+            // bd d8s：整集可疑新态（有结果但结果无关）——与三态零结果分立
+            (RunStatus::OffTopicResults, "\"status\":\"off_topic_results\""),
         ] {
             let env = OutputEnvelope::<Vec<SearchResult>> {
                 meta: sample_meta(),
@@ -369,6 +411,16 @@ mod tests {
             s.ends_with(r#""domain_class":"other"}"#),
             "domain_class 应为末键: {s}"
         );
+    }
+
+    /// bd d8s：md 行内标记文本（`Relevance::as_str`）必须与 `--json` 的序列化名一致——
+    /// 两处映射各写一份，漂移即红（否则 md 说 weak、JSON 说 ok，消费方两处读出不同结论）。
+    #[test]
+    fn relevance_label_text_matches_serde_name() {
+        for rel in [Relevance::OffTopic, Relevance::Weak, Relevance::Ok] {
+            let json = serde_json::to_string(&rel).expect("序列化");
+            assert_eq!(json, format!("\"{}\"", rel.as_str()));
+        }
     }
 
     /// batch 契约（issue gsearch-rs-doh）：元素含 query/status/meta/results 键，

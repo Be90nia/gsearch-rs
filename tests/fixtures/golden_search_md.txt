@@ -1,0 +1,13 @@
+provider: searxng | results: 3 | limit: 10 | elapsed: 0.0s
+1. Async in Rust - The Rust Programming Language [docs]
+   https://doc.rust-lang.org/book/ch17-00-async-await.html
+   Rust async await basics, futures and the Future trait.
+
+2. Tokio Tutorial - Async Rust [other]
+   https://tokio.rs/tutorial
+   Building async services with tokio in Rust.
+
+3. Async Programming in Rust [blog]
+   https://rust-lang.github.io/async-book/
+   A guide to async Rust: futures, streams and async await.
+

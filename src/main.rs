@@ -312,6 +312,12 @@ struct SearchArgs {
     /// 结果摘要截断长度（按字符，md 与 JSON 同源）；默认 160。
     #[arg(long, default_value_t = 160, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=100000))]
     snippet_len: usize,
+    /// 相关性判定阈值（0.0–1.0）：整集中与 query 零词元交集（off_topic）的结果占比 ≥ 该值、
+    /// 且 off_topic ≥ 2 条 → 判整集可疑（逐条下发 `relevance` 标签 +
+    /// `run.status=off_topic_results`）。默认 0.5；调高更保守（只对整集明显无关时才标注），
+    /// 调低更敏感。正常查询不触发判定 → 输出与本特性引入前逐字节一致。
+    #[arg(long, default_value_t = gsearch::search::DEFAULT_RELEVANCE_THRESHOLD, value_parser = clap::value_parser!(f64))]
+    relevance_threshold: f64,
     /// `--browse N --from K`：摘要段从第 K 段开始（1-based；默认 0 = 从首段）
     #[arg(long)]
     from: Option<usize>,
@@ -525,6 +531,15 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         eprintln!("error: query 不能为空或纯空白（收到 {q:?}）；请给出搜索词");
         return Ok(ExitCode::from(2));
     }
+    // bd d8s：阈值护栏——0.0..=1.0 之外的取值无意义（占比阈值），客户端即可判定 → 零网络 rc=2。
+    // （clap 无 RangedF64ValueParser，故在此处校验；NaN 亦被该范围检查拒掉）
+    if !(0.0..=1.0).contains(&args.relevance_threshold) {
+        eprintln!(
+            "error: --relevance-threshold 必须在 0.0..=1.0 之间（收到 {}）",
+            args.relevance_threshold
+        );
+        return Ok(ExitCode::from(2));
+    }
     // batch 多查询：并发 searxng、单条失败不阻塞、禁浏览器回退（issue gsearch-rs-doh）
     if args.query.len() > 1 {
         return cmd_search_batch(args).await;
@@ -656,25 +671,10 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         }
         }
     };
-    // cw8/3gw：SERP snippet 默认 160 字符封顶（人读渲染本就 160，JSON 不再例外），--snippet-len 可调
-    for r in &mut results {
-        r.snippet = gsearch::output::truncate_snippet(&r.snippet, args.snippet_len);
-    }
     // yq6 + o1p：主源降级且回退也空 → searxng_degraded（真因透传）；主源健康空 →
     // filtered_empty（recency 过滤后）/ no_results（查询无果）——防把「没新鲜结果」当基础设施故障。
     let degraded = results.is_empty() && searxng_fallback_reason.is_some();
     let healthy_empty = results.is_empty() && searxng_source_healthy;
-    let (run_status, run_message) = if degraded {
-        let reason = searxng_fallback_reason.as_deref().unwrap_or_default();
-        (gsearch::types::RunStatus::SearxngDegraded, gsearch::search::circuit_diag(reason))
-    } else if healthy_empty {
-        let (s, m) = gsearch::search::SearxFail::empty_status(recency);
-        (s, m.to_string())
-    } else if captcha_solved {
-        (gsearch::types::RunStatus::Ok, "本次搜索经过了人工 CAPTCHA 验证".into())
-    } else {
-        (gsearch::types::RunStatus::Ok, String::new())
-    };
     // 0mf：--json + --browse 时 read 产物并入单一 JSON 文档——envelope 延后装配，stdout 只出
     // 一份可解析 JSON（旧行为 envelope 先打 + read raw 追加 = json.loads 崩）。
     // b95：--headings-only 连 SERP 集都不进输出（text 模式同样跳过 print_text）。
@@ -699,6 +699,31 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     if let Some(n) = read_n {
         results.truncate(n);
     }
+    // bd d8s：结果相关性自检——整集可疑才逐条下发 relevance 标签 + run.status=off_topic_results；
+    // 正常态键整体缺席（--json 输出与本特性引入前逐字节一致）。只打标，不改排序、不丢结果。
+    // B2：判定基于**未截断**的 title+snippet（query 词元落在 snippet 尾部时不误判 off_topic）——
+    // 输出侧截断挪到判定之后（下方），--snippet-len 语义不变。
+    let relevance = gsearch::search::apply_relevance(&query, &mut results, args.relevance_threshold);
+    // cw8/3gw：SERP snippet 默认 160 字符封顶（人读渲染本就 160，JSON 不再例外），--snippet-len 可调
+    for r in &mut results {
+        r.snippet = gsearch::output::truncate_snippet(&r.snippet, args.snippet_len);
+    }
+    let (run_status, run_message) = if degraded {
+        let reason = searxng_fallback_reason.as_deref().unwrap_or_default();
+        (gsearch::types::RunStatus::SearxngDegraded, gsearch::search::circuit_diag(reason))
+    } else if healthy_empty {
+        let (s, m) = gsearch::search::SearxFail::empty_status(recency);
+        (s, m.to_string())
+    } else if relevance.suspicious {
+        (
+            gsearch::types::RunStatus::OffTopicResults,
+            gsearch::search::off_topic_diag(relevance.off_topic, relevance.total),
+        )
+    } else if captcha_solved {
+        (gsearch::types::RunStatus::Ok, "本次搜索经过了人工 CAPTCHA 验证".into())
+    } else {
+        (gsearch::types::RunStatus::Ok, String::new())
+    };
     let browse_solo_json = json_mode && browse_n.is_some();
     let headings_solo = browse_n.is_some() && args.headings_only;
     let meta = gsearch::types::MetaOutput {
@@ -720,6 +745,8 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         site_warn: site_warn_for(&query),
         truncated_detail: (results.len() >= args.limit)
             .then(|| gsearch::types::TRUNCATED_RESULTS_CAPPED.to_string()),
+        // bd d8s：可疑集的零交集条数（计数）——正常态键缺席（缺席语义，输出逐字节不变）
+        off_topic: relevance.suspicious.then_some(relevance.off_topic),
     };
     // o1p：stderr 诊断行与 run.status 同源——run move 进信封后仍需在空结果分支打 stderr
     let stderr_diag = (results.is_empty() && !run_message.is_empty()).then(|| run_message.clone());
@@ -746,6 +773,13 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
             // truncated 只在 true 时出现（缺席语义与 JSON meta 一致）
             if envelope.meta.truncated {
                 fields.push(("truncated", "true".to_string()));
+            }
+            // bd d8s：off_topic 计数（>0 才出现；整集可疑时才有——正常态 meta 头逐字节不变）
+            if relevance.suspicious {
+                fields.extend(gsearch::output::relevance_meta_fields(
+                    relevance.off_topic,
+                    relevance.total,
+                ));
             }
             fields.push(("elapsed", gsearch::output::elapsed_s(envelope.meta.elapsed_ms)));
             gsearch::output::print_md(&results, &fields);
@@ -890,6 +924,7 @@ async fn cmd_similar(url: String, limit: usize, json_mode: bool) -> Result<ExitC
         site_warn: site_warn_for(&derived_query),
         truncated_detail: (hits.len() >= limit)
             .then(|| gsearch::types::TRUNCATED_RESULTS_CAPPED.to_string()),
+        off_topic: None,
     };
     let envelope = gsearch::types::OutputEnvelope { meta, run, results: &hits };
     let mut doc = serde_json::to_value(&envelope)?;
@@ -947,10 +982,22 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
                     ),
                 },
             };
+            // bd d8s：相关性自检——整集可疑才下发标签 + status=off_topic_results（与单查询同规则）
+            // B2：判定基于未截断的 title+snippet（与单查询同序），输出侧截断在判定之后。
+            let relevance =
+                gsearch::search::apply_relevance(&query, &mut results, args.relevance_threshold);
             // cw8/3gw：snippet 封顶与单查询同规则
             for r in &mut results {
                 r.snippet = gsearch::output::truncate_snippet(&r.snippet, args.snippet_len);
             }
+            let (status, message) = if relevance.suspicious {
+                (
+                    gsearch::types::RunStatus::OffTopicResults,
+                    gsearch::search::off_topic_diag(relevance.off_topic, relevance.total),
+                )
+            } else {
+                (status, message)
+            };
             let meta = gsearch::types::MetaOutput {
                 tool: "gsearch",
                 version: env!("CARGO_PKG_VERSION"),
@@ -968,6 +1015,8 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
                 site_warn: site_warn_for(&query),
                 truncated_detail: (results.len() >= args.limit)
                     .then(|| gsearch::types::TRUNCATED_RESULTS_CAPPED.to_string()),
+                // bd d8s：可疑集的零交集条数（计数）——正常态键缺席
+                off_topic: relevance.suspicious.then_some(relevance.off_topic),
             };
             gsearch::types::BatchEntry {
                 query,
@@ -981,9 +1030,15 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
     if json_mode {
         if args.envelope == Some(EnvelopeArg::V2) {
             // nx4：v2 信封——批统计一次，元素丢 14 字段 meta（opt-in，默认裸数组不变）
+            // bd d8s：off_topic_results 计入 n_ok（结果照给了，只是标注了无关）
             let n_ok = entries
                 .iter()
-                .filter(|e| e.status == gsearch::types::RunStatus::Ok)
+                .filter(|e| {
+                    matches!(
+                        e.status,
+                        gsearch::types::RunStatus::Ok | gsearch::types::RunStatus::OffTopicResults
+                    )
+                })
                 .count();
             let env = gsearch::types::BatchEnvelopeV2 {
                 meta: gsearch::types::BatchMetaV2 {
@@ -1025,15 +1080,25 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
                 println!("出错: {}", e.message);
             } else if e.status == gsearch::types::RunStatus::Ok {
                 gsearch::output::print_text(&e.results);
+            } else if e.status == gsearch::types::RunStatus::OffTopicResults {
+                // bd d8s：整集可疑——结果照给（不丢弃），附一行诊断
+                gsearch::output::print_text(&e.results);
+                println!("{}", e.message);
             } else {
                 // o1p：三态非 Ok 状态（filtered_empty/no_results/degraded）透出诊断行
                 println!("{}", e.message);
             }
         }
     }
+    // bd d8s：off_topic_results 也算「成功」——结果照给了，只是标注了无关（退出码语义不变）
     let ok_count = entries
         .iter()
-        .filter(|e| e.status == gsearch::types::RunStatus::Ok)
+        .filter(|e| {
+            matches!(
+                e.status,
+                gsearch::types::RunStatus::Ok | gsearch::types::RunStatus::OffTopicResults
+            )
+        })
         .count();
     let total = entries.len();
     eprintln!("batch 完成：{ok_count}/{total} 条成功");
@@ -1093,6 +1158,7 @@ fn emit_captcha_timeout_json(
         recency: recency.map(|r| r.as_str().into()),
         site_warn: site_warn_for(query),
         truncated_detail: None,
+        off_topic: None,
     };
     let run = gsearch::types::RunStatusInfo {
         status: gsearch::types::RunStatus::CaptchaTimeout,
@@ -1133,6 +1199,7 @@ fn emit_searxng_degraded_json(
         recency: recency.map(|r| r.as_str().into()),
         site_warn: site_warn_for(query),
         truncated_detail: None,
+        off_topic: None,
     };
     let run = gsearch::types::RunStatusInfo {
         status: gsearch::types::RunStatus::SearxngDegraded,
@@ -1971,6 +2038,7 @@ mod tests {
             snippet: "摘要".into(),
             score: Some(1.5),
             domain_class: "docs",
+            relevance: None,
         }];
         let fields = vec![
             ("provider", "searxng".to_string()),
@@ -2006,6 +2074,7 @@ mod tests {
                 recency: None,
                 site_warn: None,
                 truncated_detail: None,
+                off_topic: None,
             },
             run: gsearch::types::RunStatusInfo {
                 status: gsearch::types::RunStatus::Ok,
@@ -2043,6 +2112,7 @@ mod tests {
             recency: Some("week".into()),
             site_warn: Some("site: 限定符".into()),
             truncated_detail: Some("results_capped_by_limit".into()),
+            off_topic: None,
         };
         let run = gsearch::types::RunStatusInfo {
             status: gsearch::types::RunStatus::Ok,
@@ -2055,6 +2125,7 @@ mod tests {
             snippet: "s".into(),
             score: Some(1.0),
             domain_class: "other",
+            relevance: None,
         }];
         let env = gsearch::types::OutputEnvelope {
             meta,

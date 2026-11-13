@@ -64,17 +64,32 @@ pub fn render_text(results: &[SearchResult]) -> String {
         let title = strip_ansi(&r.title);
         let url = strip_ansi(&r.url);
         let snippet = truncate_snippet(&strip_ansi(&r.snippet), SNIPPET_MAX_CHARS);
+        // bd d8s：整集可疑时逐条标相关性（[off_topic]/[weak]/[ok]）——正常态无标签，md 行逐字节不变
+        let relevance = match r.relevance {
+            Some(rel) => format!(" [{}]", rel.as_str()),
+            None => String::new(),
+        };
         // nw4：标题行尾 [class] 来源标注（与 --json domain_class 同源），AI/人一眼挑权威源
         out.push_str(&format!(
-            "{}. {} [{}]\n   {}\n   {}\n\n",
+            "{}. {} [{}]{}\n   {}\n   {}\n\n",
             i + 1,
             title,
             r.domain_class,
+            relevance,
             url,
             snippet
         ));
     }
     out
+}
+
+/// 相关性标注的 meta 头字段：off_topic 计数（>0 才出现；整集可疑时才有）。
+/// 计数形如 `off_topic: 10/10`——分子 = 与 query 零交集条数，分母 = 结果总数。
+pub fn relevance_meta_fields(off_topic: usize, total: usize) -> Vec<(&'static str, String)> {
+    if off_topic == 0 {
+        return Vec::new();
+    }
+    vec![("off_topic", format!("{off_topic}/{total}"))]
 }
 
 /// 内容型 meta 头字段（fetch / browse / search --browse N 的 md 路径）：

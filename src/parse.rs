@@ -41,6 +41,7 @@ pub fn parse_serp(html: &str) -> Vec<SearchResult> {
                 snippet: String::new(),
                 score: None,
                 domain_class,
+                relevance: None,
             });
             pending.push(results.len() - 1);
         } else {

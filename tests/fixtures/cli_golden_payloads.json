@@ -1,0 +1,63 @@
+{
+  "_comment": "bd gsearch-rs-d8s B3：本地回环假 SearXNG 的固定载荷（tests/cli_golden_bytes.rs 用）。三个场景按 query 路由：normal=正常态（结果与 query 相关）、off_topic=整集无关（触发可疑标注）、tail_token=query 词元只落在 snippet 尾部（第 160 字之后，锁 B2 判定用未截断文本）。SearXNG 响应形态：{results:[{title,url,content,score}]}。",
+  "normal": {
+    "results": [
+      {
+        "title": "Async in Rust - The Rust Programming Language",
+        "url": "https://doc.rust-lang.org/book/ch17-00-async-await.html",
+        "content": "Rust async await basics, futures and the Future trait.",
+        "score": 3.0
+      },
+      {
+        "title": "Tokio Tutorial - Async Rust",
+        "url": "https://tokio.rs/tutorial",
+        "content": "Building async services with tokio in Rust.",
+        "score": 2.0
+      },
+      {
+        "title": "Async Programming in Rust",
+        "url": "https://rust-lang.github.io/async-book/",
+        "content": "A guide to async Rust: futures, streams and async await.",
+        "score": 1.5
+      }
+    ]
+  },
+  "off_topic": {
+    "results": [
+      {
+        "title": "Ear Wax Removal Singapore",
+        "url": "https://earcare.example.org/singapore",
+        "content": "Professional ear cleaning and earwax removal services in Singapore.",
+        "score": 9.0
+      },
+      {
+        "title": "Crypto Exchange Lsto.me",
+        "url": "https://lsto.example.com/home",
+        "content": "How crypto exchanges are turning digital assets into spending power.",
+        "score": 8.0
+      },
+      {
+        "title": "Currency Converter XE",
+        "url": "https://xe.example.net/currencyconverter",
+        "content": "Live exchange rates for major world currencies and precious metals.",
+        "score": 7.0
+      }
+    ]
+  },
+  "tail_token": {
+    "results": [
+      {
+        "title": "Release notes for build 42",
+        "url": "https://releases.example.org/build-42",
+        "content": "This release ships a long tail of housekeeping changes to the packaging pipeline, the retry backoff policy, the trace sampler defaults, the metric label cardinality limits, and the index compaction scheduler, so that operators can read the whole page without scrolling back; the only tokens that matter for the relevance check live at the very end of this snippet: zeta omega",
+        "score": 5.0
+      },
+      {
+        "title": "Release notes for build 43",
+        "url": "https://releases.example.org/build-43",
+        "content": "This release ships a long tail of housekeeping changes to the packaging pipeline, the retry backoff policy, the trace sampler defaults, the metric label cardinality limits, and the index compaction scheduler, so that operators can read the whole page without scrolling back; the only tokens that matter for the relevance check live at the very end of this snippet: zeta omega",
+        "score": 4.5
+      }
+    ]
+  }
+}

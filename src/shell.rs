@@ -689,6 +689,7 @@ mod tests {
             snippet: String::new(),
             score: None,
             domain_class: "other",
+            relevance: None,
         }
     }
 

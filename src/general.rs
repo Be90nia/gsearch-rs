@@ -192,6 +192,7 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
                     recency: None,
                     site_warn: None,
                     truncated_detail: None,
+                    off_topic: None,
                 };
                 let run = gsearch::types::RunStatusInfo {
                     status: gsearch::types::RunStatus::Ok,
