@@ -106,24 +106,24 @@ enum Command {
     Browse {
         url: String,
         /// 纯 innerText 全文（50000 cap）；与 --headings-only 互斥
-        #[arg(long, default_value_t = false, group = "browse_mode")]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set, group = "browse_mode")]
         full: bool,
         /// 显式 md 排版输出（v0.4.0 起默认即 md，此 flag 显式要 md；等价默认）。
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         human: bool,
         /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
         #[arg(long)]
         from: Option<usize>,
-        #[arg(long, default_value_t = false, group = "browse_mode")]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set, group = "browse_mode")]
         headings_only: bool,
         /// meta 压缩（仅 --json --full 信封生效；debug 日志强制全量）
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         compact_meta: bool,
         /// 正文以 markdown 输出（渲染后 HTML 转换，隐含全文模式，与 --headings-only 互斥）。
         /// --json 时 content_text 字段换源为 markdown，meta.format="markdown" 标注。
-        #[arg(long, default_value_t = false, conflicts_with = "headings_only")]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set, conflicts_with = "headings_only")]
         markdown: bool,
         /// 正文字符预算（HTML/innerText/markdown 上限；超限截断并在 meta.truncated 如实标注）。
         #[arg(long, default_value_t = 50_000, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=10_000_000))]
@@ -131,7 +131,7 @@ enum Command {
         /// 放行私网地址（loopback / RFC1918 / link-local / 云 metadata），语义与 fetch 对齐。
         /// 默认拒（SSRF 门）：browse 的 URL 可能来自 LLM 输出（搜索结果/页面内容间接注入），
         /// 私网地址默认不渲染；非 http/https scheme（file:///javascript:/data: 等）一律拒绝，无 flag 可绕。
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         allow_private: bool,
         #[arg(long, value_enum, default_value_t = BrowserArg::Auto)]
         /// 选择浏览器
@@ -161,10 +161,10 @@ enum Command {
     /// 检测浏览器 / profile / 网络连通性 / 出口 IP / SearXNG 健康度
     Doctor {
         /// 显式 md 排版输出（v0.4.0 起默认即 md，此 flag 显式要 md；等价默认）。
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         human: bool,
         /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
     },
     /// HEADless URL 健康检查：HEAD/GET + redirect 链 + SSL + 延迟（无需 Chrome）
@@ -174,10 +174,10 @@ enum Command {
         #[arg(required_unless_present = "urls_file", num_args = 1..)]
         url: Vec<String>,
         /// 显式 md 排版输出（v0.4.0 起默认即 md，此 flag 显式要 md；等价默认）。
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         human: bool,
         /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
         /// 单条探测总预算秒数（含 redirect；CDN 抖动端点可调高）
         #[arg(long, default_value_t = gsearch::verify::VERIFY_TIMEOUT_SECS)]
@@ -201,22 +201,22 @@ enum Command {
         #[arg(long)]
         include: Option<String>,
         /// 显式 md 排版输出（v0.4.0 起默认即 md，此 flag 显式要 md；等价默认）。
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         human: bool,
         /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
         /// 放行私网地址（loopback / RFC1918 / link-local / 云 metadata），同时允许内网明文 http。
         /// 默认拒（SSRF 门）；也可通过 `GSEARCH_FETCH_ALLOW_PRIVATE=1` 环境变量放行。
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         allow_private: bool,
         /// 正文以 markdown 输出（保表格/标题/链接结构）。--json 时 text 字段换源，
         /// meta.format="markdown" 标注；无 flag 输出逐字节不变。
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         markdown: bool,
         /// 正文 = HTTP 响应体原样（零提取/零清洗）——精确性自证的逃生门，提取器动了什么对比它即可自证。
         /// 与 --markdown/--include/--json-keys 互斥；--max-chars 仍约束 text（截断 meta 如实标注）。
-        #[arg(long, default_value_t = false, conflicts_with_all = ["markdown", "include", "json_keys"])]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set, conflicts_with_all = ["markdown", "include", "json_keys"])]
         raw: bool,
         /// 正文字符预算（text 字段上限；超限截断并在 meta.truncated/omitted 如实标注）。
         /// 作用顺序：--json-keys 投影先替换 text，本预算再对投影产物计（截断按投影后长度算）。
@@ -253,10 +253,10 @@ enum Command {
         #[arg(long, default_value_t = 3, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=100))]
         limit: usize,
         /// 显式 md 排版输出（v0.4.0 起默认即 md，此 flag 显式要 md；等价默认）。
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         human: bool,
         /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
     },
     /// 查 GitHub latest release 与本地版本比对；只给指引，不做自替换
@@ -296,18 +296,18 @@ struct SearchArgs {
     /// 跳过搜索前的 warmup（Wikipedia/GitHub/HN 随机访问 + 滚动）+ 指纹补丁。
     /// isatty 自动档：stdout 是 TTY（人）默认开；管道/agent 调用默认关（快档，实测省 80s+）。
     /// 显式 --humanize / --no-humanize 恒覆盖自动档。
-    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "no_humanize")]
+    #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set, overrides_with = "no_humanize")]
     humanize: bool,
     /// 显式关闭 humanize（覆盖 TTY 自动档；管道/agent 调用自动档已是关，通常无需传）。
-    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "humanize")]
+    #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set, overrides_with = "humanize")]
     no_humanize: bool,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
     full: bool,
     /// 显式 md 排版输出（v0.4.0 起默认即 md，此 flag 显式要 md；等价默认）。
-    #[arg(long, default_value_t = false)]
+    #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
     human: bool,
     /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
-    #[arg(long, default_value_t = false)]
+    #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
     json: bool,
     /// 结果摘要截断长度（按字符，md 与 JSON 同源）；默认 160。
     #[arg(long, default_value_t = 160, value_parser = clap::builder::RangedI64ValueParser::<usize>::from(1..=100000))]
@@ -316,7 +316,7 @@ struct SearchArgs {
     #[arg(long)]
     from: Option<usize>,
     /// `--browse N --headings-only`：只输出目录（最省 token fast path）
-    #[arg(long, default_value_t = false)]
+    #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
     headings_only: bool,
     /// `--browse N --excerpt N`——paragraph_index 每项附该段前 N 字符实际文本（--json 生效，
     /// 受 read_max_chars 总 cap 约束）。与 --full/--headings-only 互斥；默认不启用（输出逐键不变）。
@@ -328,7 +328,7 @@ struct SearchArgs {
     envelope: Option<EnvelopeArg>,
     /// meta 压缩到少量字段（query/elapsed_ms/truncated/provider/truncated_detail）。
     /// 默认关（全量 meta）；--verbose debug 或 GSEARCH_LOG=debug 时强制全量（排障现场保留）。
-    #[arg(long, default_value_t = false)]
+    #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
     compact_meta: bool,
     /// `--dl N -o DIR`：把下载文件落到 DIR 下（按 URL 末段命名）；DIR 缺省落 CWD。
     #[arg(short = 'o', long = "output")]
@@ -338,7 +338,7 @@ struct SearchArgs {
     browser: BrowserArg,
     /// 放行私网结果页（--browse N 读内网 URL 的显式出口；语义与 browse/fetch --allow-private
     /// 对齐）。4bq M3：--browse N 的结果 URL 过 browse 私网门后新增的透传 flag。
-    #[arg(long, default_value_t = false)]
+    #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
     allow_private: bool,
 }
 
@@ -1741,6 +1741,49 @@ mod tests {
         assert_eq!(args.recency, None);
         // 非法值 clap 直接拒绝
         assert!(Cli::try_parse_from(["gsearch", "search", "x", "--recency", "hour"]).is_err());
+    }
+
+    /// 布尔 flag 显式值回归锁（跨项目实证 bug：Xray-core-rust 项目里别的 agent 写
+    /// `--humanize false` 时，clap 把 `false` 当成第二个位置参数 → 静默变成 batch 搜索，
+    /// 拿到双倍结果却不报错）。四种写法全部要能用，且 `false` 绝不能落到 QUERY。
+    #[test]
+    fn bool_flags_accept_explicit_values() {
+        // ① 空格形式：false 必须被 flag 吃掉，不能变成第二个查询词
+        let cli = Cli::try_parse_from(["gsearch", "search", "x", "--humanize", "false"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert_eq!(args.query.len(), 1, "false 被当成了查询词（静默 batch）");
+        assert_eq!(args.query[0], "x");
+        assert!(!args.humanize, "--humanize false 应为 false");
+
+        // ② 等号形式与空格形式等价
+        let cli = Cli::try_parse_from(["gsearch", "search", "x", "--humanize=false"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert_eq!(args.query.len(), 1);
+        assert!(!args.humanize);
+
+        // ③ 裸 flag 仍是 true（不得回归）
+        let cli = Cli::try_parse_from(["gsearch", "search", "x", "--humanize"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert!(args.humanize, "裸 --humanize 应为 true");
+        assert_eq!(args.query.len(), 1);
+
+        // ④ 反向 flag：--no-humanize false = 不禁用；=true 才是禁用
+        let cli = Cli::try_parse_from(["gsearch", "search", "x", "--no-humanize", "false"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert!(!args.no_humanize, "--no-humanize false 不应触发禁用");
+        assert_eq!(args.query.len(), 1);
+        let cli = Cli::try_parse_from(["gsearch", "search", "x", "--no-humanize=true"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert!(args.no_humanize, "--no-humanize=true 应禁用");
+
+        // ⑤ 其余布尔 flag 同样支持显式值（--json / --allow-private / --raw / --full）
+        let cli = Cli::try_parse_from(["gsearch", "search", "x", "--json", "false"]).unwrap();
+        let Command::Search(args) = cli.cmd else { panic!("expected search") };
+        assert!(!args.json);
+        assert_eq!(args.query.len(), 1);
+        let cli = Cli::try_parse_from(["gsearch", "fetch", "https://example.com", "--allow-private", "false"]).unwrap();
+        let Command::Fetch { allow_private, .. } = cli.cmd else { panic!("expected fetch") };
+        assert!(!allow_private);
     }
 
     /// similar 子命令解析——默认 limit 3、--json 兼容占位、limit 越界拒绝。

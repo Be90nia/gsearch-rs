@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **布尔 flag 显式值（跨项目实证 bug）**：此前所有布尔 flag 是 clap `SetTrue`，**空格形式的 `false` 会被当成第二个位置参数**——`gsearch search "x" --humanize false` 曾**静默变成 batch 搜索**（多查一个词、结果翻倍、不报错）；等号形式 `--humanize=false` 则报 "unexpected value"。成因是别的 agent 按 Python/argparse 习惯写 `--flag false`（证据：D:/Project/Xray-core-rust 项目会话原文 + v0.4.0 实测复现）。现全部布尔 flag 支持 `--flag` / `--flag true` / `--flag=true` / `--flag false` 四种写法（`num_args(0..=1)` + `default_missing_value("true")` + `ArgAction::Set`），裸 flag 语义不变；`--no-humanize false` = 不禁用（反向 flag 语义正确）。新增回归锁 `bool_flags_accept_explicit_values`（纯解析层、零网络）。⚠ 副作用：flag 写在查询词**前面**时（`search --humanize "x"`），查询词会被当作 flag 的值 → 明确报错；flag 写在查询词之后即可
+
 ## [0.4.0]
 
 **breaking**：默认输出从 JSON 反转为 **md 排版**。`--json` 从「no-op 兼容占位」变为**显式 JSON 开关**。
