@@ -128,6 +128,8 @@ search(browser, query, limit):
 ### 3.4 output.rs
 
 > **v0.4.0 对齐**：本节的原设计（默认人读文本 + `--json` 全量）即当前形态——v0.2.9~v0.3.0 曾把默认反转成 JSON（AI-first 契约），v0.4.0 已**回归本节设计**：默认 md 排版，`--json` 是显式开关（JSON 内容与 v0.3.0 逐字节一致）。
+>
+> **v0.4.1 对齐**：search 增加**结果相关性自检**——上游引擎偶尔返回与 query 零相关的整片结果集（2026-11-13 SearXNG 的 bing 引擎即此形态），旧行为是静默污染。v0.4.1 起整集判可疑时逐条下发 `relevance` 档位键（`off_topic`/`weak`/`ok`）+ `run.status=off_topic_results` + `meta.off_topic` 计数，md 路径追加计数与档位标记；**只打标，不丢结果、不改排序**。**正常态输出逐字节不变**——由 `tests/cli_golden_bytes.rs` 跑真实 CLI 二进制与仓内 golden 逐字节比对锁定（golden 取自引入前 commit 的 release 二进制实跑输出）。
 
 - 默认：`1. 标题\n   url\n   snippet前160字`
 - `--json`：serde_json 全量
