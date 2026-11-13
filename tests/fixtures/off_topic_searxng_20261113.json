@@ -1,0 +1,234 @@
+{
+ "_comment": "2026-11-13 实锤 off_topic 正样本: 同一 query 的两次请求返回完全无关的两批结果(上游 searxng#6937)。用于回归: 相关性检测必须把本文件全部 results 判为 off_topic。",
+ "source": "SearXNG 2026.10.19 @ http://192.168.89.249:8888/search (engines=bing)",
+ "cases": [
+  {
+   "query": "如何用Python读取CSV",
+   "language": "zh-CN",
+   "note": "SearXNG bing engine returned a result set unrelated to the query (upstream issue searxng#6937); every result below shares no meaningful token with the query.",
+   "results": [
+    {
+     "title": "Bloomberg Anywhere",
+     "url": "https://bba.bloomberg.net/",
+     "snippet": "Access the Bloomberg Terminal wherever you are. Financial professionals need constant access to high-quality news, data and …"
+    },
+    {
+     "title": "Bloomberg Anywhere",
+     "url": "https://bba.bloomberg.net/help",
+     "snippet": "Bloomberg Excel Add-In with BLOOMBERG ANYWHERE allows you to use a remote version of Microsoft Excel running on …"
+    },
+    {
+     "title": "Log in to BAUTH",
+     "url": "https://bba-new.bloomberg.net/login",
+     "snippet": "This is a secure Bloomberg authentication service that allows you access to Bloomberg services from wherever you are. Your B-Unit …"
+    },
+    {
+     "title": "行動及遠端存取 | 彭博專業服務",
+     "url": "https://www.bloomberg.com/tc/product/remote-access/",
+     "snippet": "彭博自由型提供的服務能與微軟Office及彭博應用程式入口（APPS）整合，且還包括來自第三方供應商的客製化應用程式。 若您目前 …"
+    },
+    {
+     "title": "Access the Bloomberg Terminal | Bloomberg Professional Services",
+     "url": "https://professional.bloomberg.com/products/bloomberg-terminal/access/",
+     "snippet": "The power of the Bloomberg Terminal can be tapped in a number of ways, so that you are supported seamlessly — anytime, …"
+    },
+    {
+     "title": "IB Anywhere",
+     "url": "https://ib.bloomberg.com/",
+     "snippet": "Instant Bloomberg Welcome to IB Anywhere - Instant Bloomberg, anywhere with a browser Login"
+    },
+    {
+     "title": "Bloomberg - Business News, Stock Markets, Finance, Breaking",
+     "url": "https://www.bloomberg.com/",
+     "snippet": "Bloomberg delivers business and markets news, data, analysis, and video to the world, featuring stories from Businessweek and …"
+    },
+    {
+     "title": "Bloomberg Terminal | Bloomberg Professional Services",
+     "url": "https://professional.bloomberg.com/products/bloomberg-terminal/",
+     "snippet": "Access your Bloomberg Terminal account right on your mobile devices whether you’re in between meetings, in transit or simply on …"
+    },
+    {
+     "title": "Home - Bloomberg DATA <GO>",
+     "url": "http://data.bloomberg.com/",
+     "snippet": "The following are trademarks and service marks of BFLP, a Delaware limited partnership, or its subsidiaries: BLOOMBERG, …"
+    },
+    {
+     "title": "彭博终端Bloomberg Terminal | 金融数据终端 | 彭博中国",
+     "url": "https://www.bloombergchina.com/solution/bloomberg-terminal/",
+     "snippet": "彭博终端（Bloomberg Terminal）是全球专业的金融数据终端，提供实时财经资讯、交易解决方案、投资组合分析、市场监控及研究报 …"
+    }
+   ]
+  },
+  {
+   "query": "如何用Python读取CSV",
+   "language": "zh-CN",
+   "note": "SearXNG bing engine returned a result set unrelated to the query (upstream issue searxng#6937); every result below shares no meaningful token with the query.",
+   "results": [
+    {
+     "title": "货币转换器计算器 | XE 实时汇率",
+     "url": "https://www.xe.com/zh-cn/currencyconverter/",
+     "snippet": "利用此货币计算器在全球所有主要货币、贵金属和加密货币之间进行换算，并查看实时中期市场汇率。"
+    },
+    {
+     "title": "美元至人民币汇率。将 USD 兑换成 CNY - Wise",
+     "url": "https://wise.com/zh-cn/currency-converter/usd-to-cny-rate",
+     "snippet": "您可以在下表中查看从美元兑换至人民币，以及从人民币兑换至美元的常见换算结果。 如何兑换货币？ 您可以按照两种货币之间的汇 …"
+    },
+    {
+     "title": "“美元”为什么叫“美刀”？不只是因为与dollar谐音 - 知乎",
+     "url": "https://zhuanlan.zhihu.com/p/93918249",
+     "snippet": "常有人把“美元”叫做“ 美刀 ”，是因为 dollar 的发音与“刀”相近的戏称吗？ 或许还有更直接的原因。 表示“美元”的单词其实有两个，一个 …"
+    },
+    {
+     "title": "$（货币符号，常特指美元符号）_百度百科",
+     "url": "https://baike.baidu.com/item/$/189873",
+     "snippet": "美元是外汇交换中的基础货币，也是国际支付和外汇交易中的主要货币，在国际外汇市场中占有非常重要的地位。 $是美元最常用的货 …"
+    },
+    {
+     "title": "汇率换算器 | 外汇汇率 | Wise",
+     "url": "https://wise.com/zh-cn/currency-converter/",
+     "snippet": "我们的 USD 兑 CNY 互动图表采用实时中间市场汇率，并支持您查看长达 5 年的历史数据。 如果您正等待更优汇率，不妨设置汇率提 …"
+    },
+    {
+     "title": "美刀和美元的区别是什么？一文看懂美元、美金、美刀的不同含义与由来",
+     "url": "https://wenku.baidu.com/view/b63fec99200c844769eae009581b6bd97f19bcf4.html",
+     "snippet": "中国人对美元的称呼，经历了“美刀”→“美金”→“美元”的流变，这背后是历史、经济与国际关系的缩影。 “美刀”的由来，普遍认为是对英 …"
+    },
+    {
+     "title": "美刀.cc｜美刀.com|4455.LV",
+     "url": "https://美刀.com/",
+     "snippet": "美刀.cc｜美刀.com|4455.LV 截图保存·以防丢失 注册后登录即可 不要重复注册 多账号享受不到福利（严重者提现封号） 注册后登录 …"
+    },
+    {
+     "title": "美元 - 维基百科，自由的百科全书",
+     "url": "https://zh.wikipedia.org/wiki/%E7%BE%8E%E5%85%83",
+     "snippet": "美元通常可以使用符号“ $ ”来表示，而用来表示美分的标志是“ ¢ ”。 国际标准化组织 为美元规定的 ISO 4217 标准代号为 USD。 一美 …"
+    },
+    {
+     "title": "为什么把美元叫“美刀”？ - 知乎",
+     "url": "https://www.zhihu.com/question/24213655",
+     "snippet": "把“美元”叫做“美刀”，可能不只是因为dollar的发音与“刀”相近，或许还有更直接的原因。 表示“美元”的单词其实有两个，一个是dollar， …"
+    },
+    {
+     "title": "1 USD 到 CNY - 美元 到 人民币 汇率",
+     "url": "https://www.xe.com/zh-cn/currencyconverter/convert/?Amount=1&From=USD&To=CNY",
+     "snippet": "我们的货币排名显示最热门的 中国人民币 汇率是 CNY 兑 USD 汇率。 人民币的货币代码为 CNY。 货币符号为 ¥。 无论是跨境支付还 …"
+    }
+   ]
+  },
+  {
+   "query": "how to install docker on debian",
+   "language": "en",
+   "note": "SearXNG bing engine returned a result set unrelated to the query (upstream issue searxng#6937); every result below shares no meaningful token with the query.",
+   "results": [
+    {
+     "title": "11 Best Ear Wax Removal in Singapore To Clean Your Ears",
+     "url": "https://morebetter.sg/ear-wax-removal-cleaning-service-clinics-digging-syringing-singapore",
+     "snippet": "Sep 8, 2026 · The Raffles ENT Centre provides a wide range of ENT services, along with a basic ear examination. They have areas …"
+    },
+    {
+     "title": "Impacted Earwax Treatment In Singapore - Ascent ENT Group",
+     "url": "https://ascentent.com/ear-hearing-balance-specialist-singapore/impacted-earwax-treatment-singapore/",
+     "snippet": "Safe, effective earwax removal in Singapore by accredited ENT specialists. Convenient locations."
+    },
+    {
+     "title": "Earwax removal and ENT services, Singapore | Zenith Medical",
+     "url": "https://punggolgp.com/portfolio/gp/ear-syringing/",
+     "snippet": "Earwax removal, ear syringing, ear suction, ear cleaning and other ENT services at Zenith Medical Clinic, Punggol, Singapore. Also …"
+    },
+    {
+     "title": "Painless Ear Wax Removal Singapore | Ear Cleaning - Dr Leslie Koh",
+     "url": "https://drlesliekoh.com.sg/treatment/ear-wax-removal-singapore/",
+     "snippet": "Our team of experienced ENT specialists are here to provide you with safe, effective, and painless ear wax removal in Singapore. …"
+    },
+    {
+     "title": "Professional Ear Cleaning Singapore: Book Now",
+     "url": "https://thehearingcentre.sg/blog/professional-ear-cleaning-singapore",
+     "snippet": "Jun 26, 2025 · Book professional ear cleaning in Singapore for safe wax removal. Maintain ear hygiene and prevent infections with …"
+    },
+    {
+     "title": "Ear Wax Removal Singapore: Methods, Cost & ENT Advice",
+     "url": "https://entspecialistsingapore.com/ear-wax-removal-singapore/",
+     "snippet": "Aug 26, 2026 · Earwax usually clears naturally and only needs removal when it becomes impacted or causes symptoms. …"
+    },
+    {
+     "title": "Ear Wax Removal Singapore: From $65.40. Same-Day Appt (2026)",
+     "url": "https://atamed.sg/ear-wax-removal-singapore",
+     "snippet": "Sep 27, 2026 · Ear Irrigation (Syringing) – A controlled stream of warm water is used to gently flush out accumulated wax from the …"
+    },
+    {
+     "title": "Gentle Ear Irrigation Singapore | Limited Use | Safe Water-Based Cleaning",
+     "url": "https://earwaxremovalsingapore.com/earirrigation.html",
+     "snippet": "In our clinic, we use modern electronic irrigators that control water pressure and temperature precisely. This reduces the risk of …"
+    },
+    {
+     "title": "Ear Wax Removal in Singapore | Advantage Medical Group",
+     "url": "https://www.advantagemedical.sg/ear-wax-removal-singapore/",
+     "snippet": "In Singapore, ear wax removal services are available to help individuals maintain good ear hygiene and prevent potential ear …"
+    },
+    {
+     "title": "Ear Syringing Singapore | Ear Wax Removal & Microsuction",
+     "url": "https://www.entplus.sg/earwax-removal-singapore",
+     "snippet": "Ear syringing, flushing or microsuction? Compare the methods, learn which is safe for your ear, and see what a specialist …"
+    }
+   ]
+  },
+  {
+   "query": "how to install docker on debian",
+   "language": "en",
+   "note": "SearXNG bing engine returned a result set unrelated to the query (upstream issue searxng#6937); every result below shares no meaningful token with the query.",
+   "results": [
+    {
+     "title": "Find, add, or hide your Google Contacts on the map",
+     "url": "https://support.google.com/maps/answer/3131570?hl=en&co=GENIE.Platform%3DAndroid",
+     "snippet": "On your Android phone or tablet, open the Google Maps app . Search for an address. At the bottom, tap the address. Tap Label. …"
+    },
+    {
+     "title": "Android-puhelin ja ‑tabletti - Maps Ohjeet - Google Help",
+     "url": "https://support.google.com/maps/answer/144349?hl=fi&co=GENIE.Platform%3DAndroid",
+     "snippet": "Tässä artikkelissa kerrotaan perusasioista monista eri Google Maps ‑ominaisuuksista ja annetaan ohjeita niiden käyttöön. Voit …"
+    },
+    {
+     "title": "How can I fix my address on Google Maps : r/GoogleMaps - Reddit",
+     "url": "https://www.reddit.com/r/GoogleMaps/comments/1dfuexf/how_can_i_fix_my_address_on_google_maps/",
+     "snippet": "Jun 14, 2024 · Google maps has my address on the completely wrong side of town. I have no idea why or how but because of this …"
+    },
+    {
+     "title": "Current Location - Google Maps - Link to Directions",
+     "url": "https://stackoverflow.com/questions/15042283/current-location-google-maps-link-to-directions",
+     "snippet": "Feb 23, 2013 · I'm trying to do what seemed to be an easy thing but has resulted in some confusion. I'm trying to have a link going to …"
+    },
+    {
+     "title": "What parameters should I use in a Google Maps URL to go to a lat-lon ...",
+     "url": "https://stackoverflow.com/questions/2660201/what-parameters-should-i-use-in-a-google-maps-url-to-go-to-a-lat-lon",
+     "snippet": "In May 2017 Google announced the Google Maps URLs API that allows to construct universal cross-platform links. Now you can …"
+    },
+    {
+     "title": "Google Maps estimate walk time vs Actual Walk Time - Reddit",
+     "url": "https://www.reddit.com/r/GoogleMaps/comments/927hh4/google_maps_estimate_walk_time_vs_actual_walk_time/",
+     "snippet": "Jul 26, 2018 · Maps simply uses the average walk speed of a human, 5 km/h, to calculate walk times. Google cannot know that you …"
+    },
+    {
+     "title": "Maps Hjälp - Google Help",
+     "url": "https://support.google.com/maps/?hl=sv",
+     "snippet": "Officiellt hjälpcenter för Maps. Här hittar du tips om produkten och vägledning för hur du använder den. Här finns även svar på andra …"
+    },
+    {
+     "title": "Nápověda Mapy - Google Help",
+     "url": "https://support.google.com/maps/?hl=cs",
+     "snippet": "Oficiální Centrum nápovědy služby Mapy, kde můžete najít tipy a návody na používání této služby a další odpovědi na nejčastější …"
+    },
+    {
+     "title": "Find & improve your location’s accuracy in Google Maps",
+     "url": "https://support.google.com/maps/answer/2839911?hl=en&co=GENIE.Platform%3DDesktop",
+     "snippet": "In your browser, give Maps location permission. Manage your location settings in Chrome. If you use an Internet browser other than …"
+    },
+    {
+     "title": "Community Google Maps",
+     "url": "https://support.google.com/maps/community?hl=it",
+     "snippet": "Google Maps indica l'indirizzo di casa mia nel posto sbagliato come faccio a far correggere la posizione del mio indirizzo di casa? …"
+    }
+   ]
+  }
+ ]
+}
