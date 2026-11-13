@@ -6,7 +6,7 @@
 
 ### Added
 
-- **结果相关性自检与诚实标注（bd gsearch-rs-d8s）**：搜索结果与 query 零词元交集时**如实标出**，不再静默污染。实锤来源：SearXNG `bing` 引擎对中文查询返回完全无关的结果集（Bloomberg / 汇率 / 掏耳诊所），upstream [searxng#6937](https://github.com/searxng/searxng/issues/6937)（2026-11-13）
+- **结果相关性自检与诚实标注（bd gsearch-rs-d8s）**：搜索结果与 query 零词元交集时**如实标出**，不再静默污染。实锤来源：SearXNG `bing` 引擎对中文查询返回完全无关的结果集（Bloomberg / 汇率 / 掏耳诊所），upstream [searxng#6944](https://github.com/searxng/searxng/issues/6944)（2026-11-13，取代被维护者关闭的 #6937）
   - **判定**：query 词元（拉丁词 ≥3 字符去英文停用词 + 中文**不重叠 2-gram** 去中文停用二元组；中文查询通常无空格，不按空格分词）与每条结果 `title + snippet` 求交集 → `off_topic`（零交集）/ `weak`（未全覆盖，或结果文本与 query 不同族——**判不了 ≠ 判无关**，跨语言结果不冤枉）/ `ok`（全覆盖）；query 词元 < 2 条**不判定**（短 query 不冤枉）
   - **逐族判定（不制造「假零交集」）**：拉丁族与 CJK 族**分开**判定——某族在该条结果文本里不可比（如英文页里没有中文可比）→ 该族**跳过**，不拿它的零命中凑「零交集」（判不了 ≠ 判无关）；所有可比族都零交集 → `off_topic`；任一可比族有交集 → `weak`/`ok`（不指控）。跨文字族行（西里尔/希腊等）只要结果集里存在拉丁文本即同档判定，不再因字形族不同分档；整集无任何拉丁字母时拉丁族整体跳过（拉丁 query × 全俄语结果集不指控）
   - **整集判定**：off_topic ≥ 2 条**且**占结果集比例 ≥ `--relevance-threshold`（默认 `0.5`，可配 `0.0..1.0`，越界取值零网络 rc=2）→ 逐条下发 `relevance` 标签 + `run.status=off_topic_results`（**新增态**，与 `searxng_degraded` / `filtered_empty` / `no_results` 三态语义分立：有结果但结果无关 ≠ 没找到 ≠ 源故障）+ `run.message` 一行人读说明

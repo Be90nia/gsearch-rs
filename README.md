@@ -108,7 +108,7 @@ JSON 的浪费是**结构性**的：每条结果固定多付 `"title":` `"url":`
 
 #### 结果相关性自检与诚实标注（bd gsearch-rs-d8s）
 
-**问题**：上游引擎可能返回与 query 完全无关的结果集——实锤：SearXNG `bing` 引擎对中文查询返回 Bloomberg / 美元汇率 / 新加坡掏耳诊所 / Chess.com（upstream [searxng#6937](https://github.com/searxng/searxng/issues/6937)，2026-11-13）。每条标题与 URL 都长得像正常 SERP，客户端无从察觉 → **静默污染**。
+**问题**：上游引擎可能返回与 query 完全无关的结果集——实锤：SearXNG `bing` 引擎对中文查询返回 Bloomberg / 美元汇率 / 新加坡掏耳诊所 / Chess.com（upstream [searxng#6944](https://github.com/searxng/searxng/issues/6944)，2026-11-13，取代被关闭的 #6937）。每条标题与 URL 都长得像正常 SERP，客户端无从察觉 → **静默污染**。
 
 **做法**：拿 query 词元与每条结果的 `title + snippet` 求交集，判档位：
 

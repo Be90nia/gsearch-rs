@@ -229,20 +229,27 @@ DDG html 端点：
 | SearXNG 解析错位 | **排除** | 直接抓同一批 `li.b_algo`，内容与 SearXNG 输出逐条一致 |
 | 广告落地页混入 | **排除** | 那些 `b_algo` 内 `b_ad` / `b_adTop` / `sb_ad` 标记计数 = **0** |
 | UA 伪造/过时 | **排除** | 随机 Firefox、固定 Chrome 156、不覆盖 UA 三组行为相同 |
-| 语言/市场不匹配 | **排除** | `mkt=en-SG/en-US/zh-CN` × `language=en/zh-CN/zh-hans` 六个组合全部复现 |
 | CDN 缓存键不含 query | **排除** | 加 `&cvid=<随机>`、`&form=QBLH&sp=-1` 无改善 |
+| **TLS 指纹** | **排除（此前误判，见下）** | 同一 URL、同一 IP、同一 UA，只换客户端（`urllib` vs `curl_cffi impersonate=chrome`）→ 结果**完全一致**；原 #6937 报告里两组客户端实际用的 URL 不同（一个带 `mkt` 一个不带），把"市场参数"误归因成"指纹" |
 
-**分水岭 = TLS 指纹**（同容器、同 IP、同 URL、同 UA，只换客户端）：
+**真正的分水岭 = 请求是否带市场参数**（2026-11-13 复测，交错对照、每组 3-4 轮，同一 IP、同一时刻、同一 query `how to install docker on debian`）：
 
-| 客户端 | 结果 |
-|---|---|
-| `curl_cffi` `impersonate="chrome"` | **正确** —— Install Docker Engine on Debian \| Docker Docs、How to Install Docker on Debian 13, 12 and 11… |
-| `curl_cffi` + UA 覆盖为 Chrome 156 / Firefox 159 / 不覆盖 | 均**正确** |
-| Python 原生 `urllib`（无 impersonation） | **垃圾** —— 上面那批无关结果 |
-| **SearXNG 自己的** `searx.network.get(url)`（默认 impersonate=chrome） | **正确** |
-| **SearXNG 自己的** `searx.network.get(url, impersonate="none")` | **垃圾** —— DeFi Yield Aggregators… |
+| 请求参数 | 上游 `bing.py` 对该 locale 的处理 | 命中正确结果 |
+|---|---|---|
+| `setlang=en`（en-US 时只剩这个） | `cc` 被**跳过** | **0/4**，且每次结果集都不同（知乎首页 / Meta / Google 技巧…） |
+| `setlang=en&cc=us` | 手动补回被跳过的 cc | **4/4** ✅ |
+| `setlang=en&mkt=en-US` | web 引擎**从不**发 mkt | **4/4** ✅ |
+| `setlang=de&cc=de` / `ja&cc=jp` / `en&cc=gb` / `fr&cc=fr` | `cc` **发送** | 3/3 ✅ |
+| `setlang=zh` / `zh&cc=cn` / `ru&cc=ru` | `cc` 被跳过 | 0/3（无关或空） |
 
-**上游 issue**：`searxng/searxng#6937`（2026-11-13 提交，OPEN）——已把上述证据链贴进去，并指出 `bing.py` **没有**像 `google.py`（`chrome99_android`）、`duckduckgo_web.py`（`firefox`）那样显式 pin `params["impersonate"]`，而是依赖全局默认；请 maintainer 查引擎实际发出的 impersonate 值。相关：#4964（同一症状、closed 但从未定位）、#5461、#2977、#6931、#5882。
+**机理（源码级）**：`searx/engines/bing.py` 的 `request()` 里
+```python
+if cc and cc not in ("us", "cn", "ru"):  # bing just sends junk for these
+    query_params["cc"] = cc
+```
+把 `us`/`cn`/`ru` 的 `cc` 硬跳过，而 **web 引擎从不调用 `get_locale_params()`**（`bing_news`/`bing_videos` 都调用、会发 `mkt`）→ en-US / zh-CN / ru-RU 这三个市场的请求**不带任何市场标识**，Bing 就返回与 query 无关的填充结果；带上 `cc` 或 `mkt` 立刻正常。
+
+**上游 issue 状态**：`searxng/searxng#6937`（2026-11-13 提交）被 maintainer 以 "heavy AI / completely unreadable" 关闭——**该报告的指纹结论本身也是错的**。维护者称将改为 reopen PR #6671（其作者即 maintainer 本人，该 PR 已把 `setlang`+`cc` 引入并同样跳过 us/cn/ru）。已按"短、结论先行、人话"重写为新 issue 草稿（`docs/research/searxng-bing-upstream-issue-draft.md`），并在草稿中显式更正指纹结论。相关：#4964（同一症状、closed 但从未定位）、#5461、#2977、#6931、#5882。
 
 **本地处置（已执行）**：把 `bing` 从 `keep_only` 白名单摘除（**只摘 web 主力那条**，`bing images/videos/news` 保留——那三条路径今天未测，证据不足不扩面）。
 - 备份：`settings.yml.bak-20261113-bing`；回滚 = 拷回 + `docker restart searxng`
