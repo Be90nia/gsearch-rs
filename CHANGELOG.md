@@ -2,7 +2,7 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本遵循语义化版本。
 
-## [Unreleased]
+## [0.4.1]
 
 ### Added
 
@@ -20,6 +20,8 @@
 
 ### Fixed
 
+- **`site:` 限定符零结果不再「静默」（bd gsearch-rs-eu8）**：query 含 `site:`（含排除形态 `-site:`）且**最终零结果**时，`--json` 的 `run.message` 与 stderr 诊断行追加解释 + 可执行下一步（去掉 `site:` 纯词重试 / 换更短的 `site` 值）——用户不再把「引擎不支持 `site:` 或正超时」读成「该站真没这内容」。实测（2026-11-13，实例 192.168.89.249）：引擎健康时 `site:github.com rust` 35 条全在 github.com（限定符生效），引擎降级时同一查询 0 条；客户端**原样透传** `site:`（回归锁 `tests/site_qualifier_diag.rs` 证明吞限定符的不是 gsearch）。**不编造引擎数**——写「部分引擎」而非「N 个引擎」（SearXNG 只给 `unresponsive_engines`，那是「引擎没答上来」不是「忽略了限定符」）。**正常查询输出逐字节不变**（不含 `site:` 时诊断行原样返回；回归锁 `tests/cli_golden_bytes.rs`）；退出码与 `run.status` 语义不变（零结果仍 rc=2 / `no_results`）
+- **fetch 超时不再只留「0 字节」（bd gsearch-rs-0qw）**：超时失败时 stderr 另给一行 `[hint] fetch 超时…`，明说「0 字节产出是超时所致（非 stdout 缓冲）」+ 直接给出放宽预算的命令。**根因澄清（实测）**：盲测八报的「重定向 0 字节 vs `| tee` 全量」在当前树不可复现——重定向与管道的产物字节数**一致**（回归锁 `tests/fetch_redirect_flush.rs`：本地回环伺服大 body，落盘字节数 == 管道路径且非空）；当时的 10s 是 fetch 客户端当时的硬编码超时（`FETCH_TIMEOUT_SECS = 10`，现已 30s 默认 + `--timeout` 1..=300 + `--retry`）。另：批量 fetch 每条产物后显式 flush stdout，进程被 kill 时已完成条目不留在缓冲区
 - **布尔 flag 显式值（跨项目实证 bug）**：此前所有布尔 flag 是 clap `SetTrue`，**空格形式的 `false` 会被当成第二个位置参数**——`gsearch search "x" --humanize false` 曾**静默变成 batch 搜索**（多查一个词、结果翻倍、不报错）；等号形式 `--humanize=false` 则报 "unexpected value"。成因是别的 agent 按 Python/argparse 习惯写 `--flag false`（证据：D:/Project/Xray-core-rust 项目会话原文 + v0.4.0 实测复现）。现全部布尔 flag 支持 `--flag` / `--flag true` / `--flag=true` / `--flag false` 四种写法（`num_args(0..=1)` + `default_missing_value("true")` + `ArgAction::Set`），裸 flag 语义不变；`--no-humanize false` = 不禁用（反向 flag 语义正确）。新增回归锁 `bool_flags_accept_explicit_values`（纯解析层、零网络）。⚠ 副作用：flag 写在查询词**前面**时（`search --humanize "x"`），查询词会被当作 flag 的值 → 明确报错；flag 写在查询词之后即可
 
 ## [0.4.0]
