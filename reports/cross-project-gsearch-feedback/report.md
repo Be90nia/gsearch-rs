@@ -81,6 +81,8 @@ gsearch 0.4.0 (git:v0.3.0-5-g4cd981d)  ← 本项目当前
 
 **建议**：用 v0.4.0 覆盖 `D:\Sdk\gsearch\gsearch.exe`（保留其 `gsearch.json` 与 `profiles/`，先备份旧 exe；可秒级回滚）。**需用户拍板**——因为这是 breaking 变更落到其他项目的头上（虽然实测它们的用法是"读输出"，md 反而更省 token）。
 
+> **✅ 已执行（2026-11-13，用户拍板 upgrade）**：旧版备份为 `D:\Sdk\gsearch\gsearch.exe.bak-v0.3.0-20261113`（v0.3.0，已验证可运行），新版覆盖后实测 `--version` = `0.4.0`、`gsearch.json` 与 `profiles/` 完整保留、`--humanize false` 单查询（B1 修复生效）。**未加部署脚本**（用户拍板「不要」）——下次升级仍需手动同步。
+
 ## 3.5 立项原点：别的项目当时**根本没有可用的搜索**（第一手证据）
 
 server_api 项目 2026-08-26 的会话 `01a03bac-7d51-7000-a712-45d5f1ef8027`（**同一 session 在 gsearch-rs 记忆里的标题是「规划 gsearch-rs 项目」**——即 gsearch-rs 的立项就发生在别的项目里）完整记录了搜索能力真空：
