@@ -169,8 +169,11 @@ https://github.com/sahenjp/RustXNG —— **provider profile 分层**（standard
 
 **变更**：UA 恒定为 gsearch-rs 自己的 Chrome（`src/browser.rs:12` 同款）：
 ```
-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36
+Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.8078.80 Safari/537.36
 ```
+
+> **版本更正（2026-11-13 晚）**：初版写死 `Chrome/138.0.0.0`——那是我照抄的旧版本号，**落后真实 Chrome 18 个大版本**（本机 Chrome 实为 `156.0.8078.80`，2026-11 当前版）。已改为真实版本号，改前锚点留在 `useragents.json.bak-20261113-chrome138`。
+> **但要说清**：这次更正的意义是"别用假版本号"，**不是"修好了 bing"**——§6.5 证明 bing 错位的分水岭是 **TLS 指纹**，UA 字符串的版本新旧不影响它。
 
 **落地方式**（持久化，watchtower 重建镜像不丢）：
 - 文件：`/mnt/docker/searxng/useragents.json`（新）
@@ -203,8 +206,50 @@ DDG html 端点：
 ### 6.4 仍未解决（需另立项）
 
 1. **brave / google 引擎**：必须换出口 IP（加不同后端节点或让容器走本机 v2rayN 的 us1/us2 节点）。本机 v2rayN 有 96 节点 / 4 后端，但**内核未启动**（GUI 在跑、xray 子进程与 10808 监听都没有）。
-2. **中文查询错位**：三次连跑「如何用Python读取CSV」，**每次混入 1 条完全无关结果**（Apache Gluten / Mount Faber Leisure / Sheraton Singapore）——即 SearXNG bing 引擎的**中文查询错位**（老缺陷，记忆里 2026-10-22 已实证）。英文查询两次跑完全一致，无此问题。对应动作：给 bing 降权 / 补中文垂直引擎（sogou、csdn、baidu）。
+2. ~~**中文查询错位**~~ → **已解决（2026-11-13，见 §6.5）**：根因不是"中文分词"而是 **bing 引擎整体返回无关 SERP**；把故障的 `bing` 从 keep_only 白名单摘除后，同一查询连跑 3 次：25 条结果前 5 条全部相关、**零无关条目**、三次结果稳定（改前每次混 1 条 Apache Gluten / Mount Faber Leisure / Sheraton Singapore）。
 3. **本机代理链路**：v2rayN 内核没起 → 本机 Chrome 无法访问墙外站 → gsearch 的 Google 真浏览器兜底当前不可用（实测 `net::ERR_CONNECTION_TIMED_OUT`）。
+
+### 6.5 bing 引擎返回无关结果：完整诊断链（本轮最有价值的技术产出）
+
+**现象**：SearXNG 的 `bing` 引擎对同一个 query 连续返回**与 query 完全无关**的结果集，且**每次都不同**：
+
+| 连续请求 | 返回内容 |
+|---|---|
+| run 1 | 新加坡掏耳诊所（11 Best Ear Wax Removal in Singapore…） |
+| run 2 | Bloomberg（Bloomberg Anywhere / Log in to BAUTH / 彭博專業服務…） |
+| run 3 | Lee Dong Wook 影视资料（MyDramaList / Wikipedia…） |
+| run 4 | 知乎《日瓦戈医生》译本 / 长期在纽约生活是怎样一种体验 |
+| run 5 | Chess.com |
+
+**排除链（每条都有原始证据）**：
+
+| 怀疑 | 结论 | 证据 |
+|---|---|---|
+| 查询没送达 bing | **排除** | 原始 HTML 的 `<title>` = `how to install docker on debian - Search`，搜索框 `sb_form_q` 原样回显 query，页面含 'docker' 20 次 |
+| SearXNG 解析错位 | **排除** | 直接抓同一批 `li.b_algo`，内容与 SearXNG 输出逐条一致 |
+| 广告落地页混入 | **排除** | 那些 `b_algo` 内 `b_ad` / `b_adTop` / `sb_ad` 标记计数 = **0** |
+| UA 伪造/过时 | **排除** | 随机 Firefox、固定 Chrome 156、不覆盖 UA 三组行为相同 |
+| 语言/市场不匹配 | **排除** | `mkt=en-SG/en-US/zh-CN` × `language=en/zh-CN/zh-hans` 六个组合全部复现 |
+| CDN 缓存键不含 query | **排除** | 加 `&cvid=<随机>`、`&form=QBLH&sp=-1` 无改善 |
+
+**分水岭 = TLS 指纹**（同容器、同 IP、同 URL、同 UA，只换客户端）：
+
+| 客户端 | 结果 |
+|---|---|
+| `curl_cffi` `impersonate="chrome"` | **正确** —— Install Docker Engine on Debian \| Docker Docs、How to Install Docker on Debian 13, 12 and 11… |
+| `curl_cffi` + UA 覆盖为 Chrome 156 / Firefox 159 / 不覆盖 | 均**正确** |
+| Python 原生 `urllib`（无 impersonation） | **垃圾** —— 上面那批无关结果 |
+| **SearXNG 自己的** `searx.network.get(url)`（默认 impersonate=chrome） | **正确** |
+| **SearXNG 自己的** `searx.network.get(url, impersonate="none")` | **垃圾** —— DeFi Yield Aggregators… |
+
+**上游 issue**：`searxng/searxng#6937`（2026-11-13 提交，OPEN）——已把上述证据链贴进去，并指出 `bing.py` **没有**像 `google.py`（`chrome99_android`）、`duckduckgo_web.py`（`firefox`）那样显式 pin `params["impersonate"]`，而是依赖全局默认；请 maintainer 查引擎实际发出的 impersonate 值。相关：#4964（同一症状、closed 但从未定位）、#5461、#2977、#6931、#5882。
+
+**本地处置（已执行）**：把 `bing` 从 `keep_only` 白名单摘除（**只摘 web 主力那条**，`bing images/videos/news` 保留——那三条路径今天未测，证据不足不扩面）。
+- 备份：`settings.yml.bak-20261113-bing`；回滚 = 拷回 + `docker restart searxng`
+- 实测：摘除后同一中文查询连跑 3 次 → 25 条结果前 5 条全部相关、零无关条目、三次稳定
+- 待上游回复后再决定是否加回
+
+**这条诊断对 gsearch 自己的意义**：这类"**看起来完全正常的无关结果**"是结果层诚实标注的典型场景——已立项 `bd gsearch-rs-d8s`（P1）：复用仓内 `title_overlap`/`tokenize` 做相关性自检，结果带 `relevance` 标记、整集可疑时用**新 status 值**（不与 `searxng_degraded`/`filtered_empty`/`no_results` 混用）、`meta` 带计数；回归 fixture 已落盘 `tests/fixtures/off_topic_searxng_20261113.json`（4 case / 40 条真实 off_topic）。
 
 ## 7. 托管 API 侧机制（10 家，2026 主流）
 
