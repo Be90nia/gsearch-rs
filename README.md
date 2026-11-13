@@ -136,6 +136,21 @@ JSON 的浪费是**结构性**的：每条结果固定多付 `"title":` `"url":`
   - **子串匹配的已知假命中**：词元按子串匹配（不切词边界）→ `rust` 会命中 `Distrust`、`cat` 会命中 `education` → 方向是**漏判**（少指控），不修（改动会牵连召回）
   - **可疑集与人工 CAPTCHA 同时成立时**：`run.message` 走 off_topic 分支，CAPTCHA 的人读提示被吞（`run.captcha_solved` 独立字段仍在，信息未丢）
 
+#### `site:` 限定符零结果诊断（bd gsearch-rs-eu8）
+
+**问题**：`site:` 限定符在白名单 SearXNG 引擎间**支持不一**——不支持的引擎把限定符**静默吞掉**（当普通词搜），支持 `site:` 的引擎又可能正超时/限流；两者叠加的结果是「`site:` 查询 0 条」，而用户会读成「**该站真没有这内容**」。实测（2026-11-13，实例 192.168.89.249）：引擎健康时 `site:github.com rust` 返回 35 条**全在 github.com**（限定符生效）；引擎降级时同一查询 0 条（用户无从分辨是「没这内容」还是「引擎没答」）。
+
+**做法**：query 含 `site:`（含排除形态 `-site:`）且**最终零结果**时，在 `--json` 的 `run.message` 与 stderr 诊断行（两者同源）追加一段解释 + 可执行下一步：
+
+```
+查询无结果（SearXNG 源健康，非基础设施故障）；建议换词或缩短查询重试；site: 限定符可能被白名单引擎静默忽略或未生效（部分引擎不支持 site:，支持 site: 的引擎也可能正超时/限流），零结果未必代表该站无此内容；建议去掉 site: 用纯词重试，或换更短的 site 值（site:github.com 而非 site:github.com/org/repo）
+```
+
+- **不编造引擎数**：写「部分引擎」而非「N 个引擎」——SearXNG 的 JSON 响应只给 `unresponsive_engines`（引擎名 + 超时/限流原因），那是「这次引擎没答上来」而非「引擎忽略了 `site:`」，拿它的个数当 N 等于编数字
+- **只在零结果时出现**：有结果时 `run.message` 缺席（正常查询的 stdout 与诊断行逐字节不变）；`meta.site_warn`（含 `site:` 即给的提示键）语义不变
+- **退出码语义不变**：零结果仍 `rc=2`，`run.status` 仍是 `no_results` / `filtered_empty`——这是「结果为空 + 附带解释」，不是新错误态
+- **回归锁**：`tests/site_qualifier_diag.rs`（假 SearXNG 回环，零外网）：客户端**原样透传** `site:`（证明吞限定符的不是 gsearch）、含 `site:` 零结果给出诊断、不含 `site:` 的零结果诊断行逐字节不变
+
 #### read 失败显式化
 
 `search --browse N` 读失败（越界 / postproc 错）**恒 exit 1**（不再静默 exit 0），各路径的呈现：
@@ -231,6 +246,7 @@ gsearch fetch --json-keys "crate.max_version,crate.max_stable_version" \
 - **`--include <selector>`**：逗号分隔 CSS selector，**所有命中容器**分别提取正文后以 `\n\n---\n\n` 拼接（块首尾空白剥除、换行归一 LF，无源码缩进/CRLF 伪影）；命中时跳过 JS 壳判定，`meta.include_hit=true` + `meta.include_hits=N`（命中数）；未命中回退全文并打 `meta.include_hit=false`——回退全文补走 host 默认路由的剥离（github nav / docs.rs 侧栏不比无 `--include` 时更脏），命中用户 selector 时原样保留。**语义边界**：命中元素只取其内部文本（不含兄弟节点）——rustdoc/docs.rs 页面段落是标题的兄弟节点（`<h2 id="errors">Errors</h2><p>正文…</p>`），`#errors` 只返回标题；取段落正文用 `#errors ~ p`（后续兄弟）或父容器 `div.docblock`（用户明确要什么就是什么）。selector 语法错直接 Err（不伪装成"未命中"）
 - **`--max-chars <N>`（默认 50000）**：`text` 字段字符预算——超限截断并在 `meta.truncated=true` / `meta.omitted` 如实标注（大页面是 token 放血口，agent 按预算取数）
 - **`--timeout <secs>`（默认 30，范围 1..=300）+ `--retry <n>`（默认 1，范围 0..=3）**：慢站（如 GitHub 偶发握手慢）给握手留更长窗口；失败时 backoff 1s/2s/4s 重试，stderr 一行 `第 N/总 N 次重试（Xs 后）: <url>`。确定性错误（私网门拒 / scheme / PDF / 二进制）不重试；HTTP 4xx（除 408/429）也不重试——客户端错不会因等待修复
+- **超时失败时 stderr 另给一行 `[hint] fetch 超时…`**（bd gsearch-rs-0qw）：明说「**0 字节产出是超时所致（非 stdout 缓冲）**」+ 直接给出放宽预算的命令（`--timeout 300 --max-chars N`）。实测澄清：重定向（`> file`）与管道（`| tee`）的产物字节数**一致**（回归锁 `tests/fetch_redirect_flush.rs`：本地回环伺服大 body，落盘字节数 == 管道路径且非空）；stdout 每条产物后显式 flush，进程被 kill 时已完成的内容仍落盘
 - **host 级默认 include**：未传 `--include` 时按 host 自动路由——`github.com` 走 skeleton 容器优先级链 + nav 剥离（命中后 `meta.auto_include_applied="github"`），`docs.rs` 走 `<main>`（命中后 `meta.auto_include_applied="docs.rs"`）。用户显式 `--include "..."` 不被覆盖，但 host 判定恒保留：`auto_include_applied` 仍标注 host 想命中的 label + `meta.include_overridden_by_user=true` 标注覆盖事实，且用户 selector 未命中的回退全文仍走 host 剥离；host 未命中（未知 host / 裸 host）→ ...
 - **`<summary>` 折叠按钮文本剥离**：fetch 提取路径全局剥 `<summary>…</summary>`（docs.rs 的 "Expand description" 等折叠按钮文本不进正文；非 HTML 源文保真不碰）
 - **`--raw`（逃生门）**：`text` = HTTP 响应体原样（零提取/零清洗，`meta.format="raw"`）——精确性自证用，对比提取器动了什么全靠它；提取漏斗全部跳过（host 路由/include/锚点裁剪/JS 壳判定），`--max-chars` 仍截断（meta 如实）；与 `--markdown`/`--include`/`--json-keys` 互斥

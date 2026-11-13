@@ -532,6 +532,79 @@ pub fn off_topic_diag(off_topic: usize, total: usize) -> String {
     )
 }
 
+// ===== bd gsearch-rs-eu8：site: 限定符被静默吞掉的诚实诊断 =====
+
+/// 检测 site: 限定符（前导 word boundary 简单匹配，不解析完整搜索语法）。
+/// 也支持 site: 含子域路径形态（如 site:github.com/tokio-rs/tokio）与排除形态 `-site:`。
+/// 引号内的 site: 视为字面字符串（多数引擎如此）→ 不命中。
+pub fn contains_site_qualifier(query: &str) -> bool {
+    // 简易 token 化：以空白/引号切词，找 site: 起首的 token
+    let bytes = query.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // 跳过空白
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        // 跳引号
+        if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+            let q = bytes[i];
+            i += 1;
+            while i < bytes.len() && bytes[i] != q {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // 找 token 结尾
+        let start = i;
+        while i < bytes.len()
+            && bytes[i] != b' '
+            && bytes[i] != b'\t'
+            && bytes[i] != b'"'
+            && bytes[i] != b'\''
+        {
+            i += 1;
+        }
+        let token_bytes = &bytes[start..i];
+        // site: 限定符（含前缀 - 排除形态）
+        if token_bytes.len() > 5 && token_bytes[..5].eq_ignore_ascii_case(b"site:") {
+            return true;
+        }
+        if token_bytes.len() > 6
+            && token_bytes[0] == b'-'
+            && token_bytes[1..6].eq_ignore_ascii_case(b"site:")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// site: 零结果诊断（bd gsearch-rs-eu8）——「部分引擎不支持 site:」的诚实表述。
+///
+/// 为什么不给「被忽略的引擎数 N」：SearXNG 的 JSON 响应只暴露 `unresponsive_engines`
+/// （引擎名 + 超时/限流原因），那是「这次引擎没答上来」而非「引擎忽略了 site:」——
+/// 两者不是一回事，拿它的个数当 N 等于编数字。故只说「部分引擎」。
+///
+/// 两种机制都会让「site: 查询零结果」看起来像「该站没这内容」：① 不支持 site: 的引擎把
+/// 限定符静默吞掉（按普通词搜）；② 支持 site: 的引擎正超时/限流（本次实测：引擎健康时
+/// `site:github.com rust` 35 条全在 github.com，引擎降级时同一查询 0 条）。
+pub const SITE_QUALIFIER_NOTE: &str = "site: 限定符可能被白名单引擎静默忽略或未生效（部分引擎不支持 site:，支持 site: 的引擎也可能正超时/限流），\
+     零结果未必代表该站无此内容；建议去掉 site: 用纯词重试，或换更短的 site 值（site:github.com 而非 site:github.com/org/repo）";
+
+/// 零结果诊断组装：query 含 site: 限定符时补上「限定符可能被忽略」的解释与可执行下一步；
+/// 不含 site: 时原样返回 base（正常查询的 stdout 与诊断行逐字节不变）。
+pub fn zero_result_diag(query: &str, base: &str) -> String {
+    if !contains_site_qualifier(query) {
+        return base.to_string();
+    }
+    if base.is_empty() {
+        return SITE_QUALIFIER_NOTE.to_string();
+    }
+    format!("{base}；{SITE_QUALIFIER_NOTE}")
+}
+
 pub async fn try_searxng(cfg: &SearchConfig) -> SearxngAttempt {
     let Some(base) = crate::config::load().searxng_url.clone() else {
         return SearxngAttempt::NotConfigured;
@@ -907,7 +980,49 @@ pub(crate) fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_captcha, unusual_traffic, SearxFail, SEARXNG_CIRCUIT_MSG, FILTERED_EMPTY_MSG, NO_RESULTS_MSG};
+    use super::{
+        contains_site_qualifier, is_captcha, unusual_traffic, zero_result_diag, SearxFail,
+        FILTERED_EMPTY_MSG, NO_RESULTS_MSG, SEARXNG_CIRCUIT_MSG, SITE_QUALIFIER_NOTE,
+    };
+
+    /// contains_site_qualifier：基础边界——词形态、空白、引号、前后置。
+    #[test]
+    fn contains_site_qualifier_boundary_cases() {
+        assert!(contains_site_qualifier("site:foo"));
+        assert!(contains_site_qualifier("site:github.com/a/b refactor"));
+        assert!(contains_site_qualifier("foo site:github.com"));
+        assert!(contains_site_qualifier("a -site:test.com"));
+        // 引号内 site: 视为字面字符串，不命中
+        assert!(!contains_site_qualifier(r#""site:foo.com" bar"#));
+        assert!(!contains_site_qualifier(""));
+        assert!(!contains_site_qualifier("rust tokio"));
+        assert!(!contains_site_qualifier("website:foo"));
+        assert!(!contains_site_qualifier("sit:foo"));
+        // 多词含 site: 也命中（site:bar 是合法限定符）
+        assert!(contains_site_qualifier("foo site:bar baz qux"));
+    }
+
+    /// bd gsearch-rs-eu8：零结果诊断——含 site: 时补解释与下一步；不含时逐字节原样返回。
+    #[test]
+    fn zero_result_diag_adds_site_explanation_only_for_site_queries() {
+        // 无 site:：原样返回（正常查询的诊断行逐字节不变）
+        assert_eq!(zero_result_diag("rust async", NO_RESULTS_MSG), NO_RESULTS_MSG);
+        assert_eq!(zero_result_diag("rust async", ""), "");
+
+        // 含 site:：解释 + 可执行下一步，且不编造引擎数
+        let msg = zero_result_diag("site:github.com rust", NO_RESULTS_MSG);
+        assert!(msg.starts_with(NO_RESULTS_MSG), "原零结果语义必须保留: {msg}");
+        assert!(msg.contains("site:"), "须点名限定符: {msg}");
+        assert!(msg.contains("建议"), "须给可执行下一步: {msg}");
+        assert!(
+            !msg.contains("site: 被") && !msg.contains("个引擎"),
+            "不得编造被忽略的引擎数: {msg}"
+        );
+        // 排除形态 -site: 同样命中
+        assert!(zero_result_diag("rust -site:github.com", NO_RESULTS_MSG).contains("site:"));
+        // base 为空时只给 site: 解释（不留前导分隔符）
+        assert_eq!(zero_result_diag("site:github.com rust", ""), SITE_QUALIFIER_NOTE);
+    }
 
     /// o1p：源健康零结果三态映射——recency 过滤后空与查询无果分立，均非 degraded。
     #[test]

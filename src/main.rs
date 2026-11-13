@@ -454,56 +454,13 @@ fn first_blank_query(queries: &[String]) -> Option<&str> {
 /// 错误只说"查询无结果"无解释）。检测 query 含 site: 限定符时返回可行动建议；
 /// 缺席 = 无 site:（语义与 proxy/recency 一致，键整体缺席不污染正常查询）。
 fn site_warn_for(query: &str) -> Option<String> {
-    if !contains_site_qualifier(query) {
+    if !gsearch::search::contains_site_qualifier(query) {
         return None;
     }
     Some(
         "查询含 site: 限定符——白名单 SearXNG 引擎常忽略或仅特定引擎支持；\
          建议拆词（site:github.com → 加 inurl: 限定或换纯词）或用 -site test 排查引擎命中".to_string(),
     )
-}
-
-/// 检测 site: 限定符（前导 word boundary 简单匹配，不解析完整搜索语法）。
-/// 也支持 site: 含子域路径形态（如 site:github.com/tokio-rs/tokio）。
-fn contains_site_qualifier(query: &str) -> bool {
-    // 简易 token 化：以空白/引号切词，找 site: 起首的 token
-    let bytes = query.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // 跳过空白
-        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
-            i += 1;
-        }
-        // 跳引号
-        if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
-            let q = bytes[i];
-            i += 1;
-            while i < bytes.len() && bytes[i] != q {
-                i += 1;
-            }
-            i += 1;
-            continue;
-        }
-        // 找 token 结尾
-        let start = i;
-        while i < bytes.len() && bytes[i] != b' ' && bytes[i] != b'\t' && bytes[i] != b'"' && bytes[i] != b'\'' {
-            i += 1;
-        }
-        let token_bytes = &bytes[start..i];
-        // site: 限定符（含前缀 - 排除形态）
-        if token_bytes.len() > 5
-            && token_bytes[..5].eq_ignore_ascii_case(b"site:")
-        {
-            return true;
-        }
-        if token_bytes.len() > 6
-            && token_bytes[0] == b'-'
-            && token_bytes[1..6].eq_ignore_ascii_case(b"site:")
-        {
-            return true;
-        }
-    }
-    false
 }
 
 /// 盲测六 isatty 拍板：humanize 生效档 = 显式 flag 优先，都未传时跟随 stdout 是否 TTY——
@@ -723,6 +680,14 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
         (gsearch::types::RunStatus::Ok, "本次搜索经过了人工 CAPTCHA 验证".into())
     } else {
         (gsearch::types::RunStatus::Ok, String::new())
+    };
+    // bd gsearch-rs-eu8：零结果且 query 含 site: 限定符 → 补一行「限定符可能被白名单引擎静默忽略」
+    // 的解释 + 可执行下一步（run.message 与 stderr 诊断行同源，两处一起出现）。
+    // 不含 site: 时 zero_result_diag 原样返回 → 正常态 stdout 与诊断行逐字节不变。
+    let run_message = if results.is_empty() {
+        gsearch::search::zero_result_diag(&query, &run_message)
+    } else {
+        run_message
     };
     let browse_solo_json = json_mode && browse_n.is_some();
     let headings_solo = browse_n.is_some() && args.headings_only;
@@ -973,7 +938,8 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
                 Err(fail) => match &fail {
                     gsearch::search::SearxFail::HealthyEmpty => {
                         let (s, m) = gsearch::search::SearxFail::empty_status(recency);
-                        (s, m.to_string(), vec![])
+                        // bd gsearch-rs-eu8：batch 的零结果同样补 site: 解释（与单查询同规则）
+                        (s, gsearch::search::zero_result_diag(&query, m), vec![])
                     }
                     gsearch::search::SearxFail::SourceError(reason) => (
                         gsearch::types::RunStatus::Error,
@@ -1567,7 +1533,7 @@ async fn fetch_public_ip() -> anyhow::Result<String> {
 mod tests {
     use super::check_exit_ip_drift;
     use super::resolve_humanize;
-    use super::{contains_site_qualifier, first_blank_query, site_warn_for, Cli, Command, RecencyArg};
+    use super::{first_blank_query, site_warn_for, Cli, Command, RecencyArg};
     use clap::Parser;
 
     /// P1 site: 检测：含 site: 限定符的 query 返回 Some(warn)；其他 None。
@@ -1589,23 +1555,6 @@ mod tests {
         assert!(site_warn_for(r#""site:foo.com" bar"#).is_none(), "引号内视为字面字符串");
         // 不命中：相似前缀（sit:）
         assert!(site_warn_for("sit:foo bar").is_none());
-    }
-
-    /// contains_site_qualifier：基础边界——词形态、空白、引号、前后置。
-    #[test]
-    fn contains_site_qualifier_boundary_cases() {
-        assert!(contains_site_qualifier("site:foo"));
-        assert!(contains_site_qualifier("site:github.com/a/b refactor"));
-        assert!(contains_site_qualifier("foo site:github.com"));
-        assert!(contains_site_qualifier("a -site:test.com"));
-        // 引号内 site: 视为字面字符串，不命中
-        assert!(!contains_site_qualifier(r#""site:foo.com" bar"#));
-        assert!(!contains_site_qualifier(""));
-        assert!(!contains_site_qualifier("rust tokio"));
-        assert!(!contains_site_qualifier("website:foo"));
-        assert!(!contains_site_qualifier("sit:foo"));
-        // 多词含 site: 也命中（site:bar 是合法限定符）
-        assert!(contains_site_qualifier("foo site:bar baz qux"));
     }
 
     /// 5a5：首跑无记录→None 且落盘；同 IP→静默；换 IP→WARN 文案含新旧 IP。

@@ -368,13 +368,36 @@ async fn fetch_one(url: &str, opts: &FetchOpts, client: &reqwest::Client) -> Res
                 let msg = format!("{e:#}");
                 let has_budget = attempt < total_attempts - 1;
                 if !should_retry(&msg, has_budget) {
+                    warn_timeout(&e, opts);
                     return Err(e);
                 }
                 last_err = Some(e);
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow!("fetch 重试耗尽")))
+    let last = last_err.unwrap_or_else(|| anyhow!("fetch 重试耗尽"));
+    warn_timeout(&last, opts);
+    Err(last)
+}
+
+/// 超时失败时给一行可执行提示（bd gsearch-rs-0qw）。
+///
+/// 「0 字节产出」的真因是**请求超时**（预算耗尽、响应没读完），不是 stdout 缓冲——
+/// 重定向（`> file`）与管道（`| tee`）的字节数一致（回归锁 `tests/fetch_redirect_flush.rs`）。
+/// 提示直接给出放宽预算的命令，别让用户对着 0 字节猜缓冲区。
+fn warn_timeout(e: &anyhow::Error, opts: &FetchOpts) {
+    let timed_out = e.chain().any(|c| {
+        c.downcast_ref::<reqwest::Error>()
+            .is_some_and(|re| re.is_timeout())
+    });
+    if !timed_out {
+        return;
+    }
+    eprintln!(
+        "[hint] fetch 超时（本次预算 --timeout {}s，上限 {}s）：0 字节产出是超时所致（非 stdout 缓冲）；\
+         大页面/慢站放宽预算重试：--timeout {} --max-chars {}",
+        opts.timeout_secs, FETCH_TIMEOUT_MAX_SECS, FETCH_TIMEOUT_MAX_SECS, opts.max_chars
+    );
 }
 
 /// 单次 fetch 尝试（不含重试 loop）：抓响应 → 提取 → 组装 Fetched。
@@ -763,6 +786,8 @@ async fn cmd_fetch_batch(
                 ),
                 Err(e) => println!("## {url}\n\n出错: {e:#}"),
             }
+            // 每条落盘：进程被 kill（SIGTERM/任务管理器）时已完成条目的产物不留在缓冲区里
+            flush_stdout();
         }
     }
     flush_stdout();
