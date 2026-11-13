@@ -748,7 +748,10 @@ mod tests {
         assert!(has_parent_traversal(std::path::Path::new("..")));
         assert!(!has_parent_traversal(std::path::Path::new("sub/out.bin")));
         assert!(!has_parent_traversal(std::path::Path::new("D:/out/x.bin")));
-        assert!(!has_parent_traversal(std::path::Path::new("D:/out/../x.bin")), "绝对路径显式放行");
+        // 绝对路径显式放行——用当前目录构造真·绝对路径。"D:/out/../x.bin" 在 Unix 上没有
+        // 盘符前缀(is_absolute=false)且含 .. 段 → 本断言在 macOS/Linux 必红(CI 长期红既有债)。
+        let abs_with_parent = std::env::current_dir().unwrap().join("out").join("..").join("x.bin");
+        assert!(!has_parent_traversal(&abs_with_parent), "绝对路径显式放行");
     }
 
     /// i9a：-o 末段带扩展名 = 文件；纯目录名 = 目录；--output-file 优先；都缺省 = CWD 目录。
