@@ -206,9 +206,56 @@ DDG html 端点：
 2. **中文查询错位**：三次连跑「如何用Python读取CSV」，**每次混入 1 条完全无关结果**（Apache Gluten / Mount Faber Leisure / Sheraton Singapore）——即 SearXNG bing 引擎的**中文查询错位**（老缺陷，记忆里 2026-10-22 已实证）。英文查询两次跑完全一致，无此问题。对应动作：给 bing 降权 / 补中文垂直引擎（sogou、csdn、baidu）。
 3. **本机代理链路**：v2rayN 内核没起 → 本机 Chrome 无法访问墙外站 → gsearch 的 Google 真浏览器兜底当前不可用（实测 `net::ERR_CONNECTION_TIMED_OUT`）。
 
-## 7. 托管 API 侧机制（未完成）
+## 7. 托管 API 侧机制（10 家，2026 主流）
 
-本轮第三路 librarian（托管 API：Parallel/Exa/Tavily/Perplexity/Brave/Firecrawl/Linkup）跑满 35 分钟未收敛，已终止。**该节缺失**——但硬数据已从独立基准 README 直接取得（Exa deep 83.0% / TinyFish 79.0% / Perplexity low 77.3% / Firecrawl 76.0% search-only 70.3%；token 效率 Firecrawl 7,456 最省、Linkup 57,791 垫底），且反方对榜单可信度的证伪（§3.1）不依赖托管 API 机制细节。
+> 机制提取自各家官方 docs（2026 版）。**注意**：这些机制大多是**托管服务内部实现**，我们不能照搬服务，但**参数形态与分流逻辑可以照搬**。
+
+### 7.1 最值得抄的参数设计（成本低、且与 §3.2 的 query 侧证据完全吻合）
+
+| 家 | 机制 | 为什么提升质量 | 对 gsearch-rs 的可借鉴点（成本） |
+|---|---|---|---|
+| **Parallel** | `objective`（自然语言目标）+ `search_queries`（1–5 个 3–6 词关键词）**双字段分离**；官方明说最常见错误是同一串既当目标又当唯一查询 | 把"要什么"和"搜什么"解耦 → 查询词更聚焦，召回更准 | **加一个"目标/关键词"分离的查询参数**（低）——正好落在 §3.2「retrieval gap 来自 query 侧」这条最确定的收益线上 |
+| **Parallel** | 四档 mode：`turbo`/`fast`(~200–700ms) → `basic`（扩展摘要）→ `advanced`（多跳 + 更强召回压缩管线） | 延迟/成本/质量三维旋钮 | **档位化**：我们已有 `fast/standard` 分档雏形（openserp 也有），可做 `--fast` / `--deep`（低） |
+| **Exa** | `contents.highlights`：用抽取模型**只回与 query 相关的段落**——官方测 500 字符 highlights 准确度 ≈ 前 8000 字符全文而 **token 少 16 倍**；长技术文档 500 字符 highlights 达 60% 准确而全文仅 6% | 从"截全文"升级为"按 query 抽取" | **把 `--snippet-len` 从定长截断升级为 query 相关抽取**（中）——这是我们省 token 硬指标的下一台阶 |
+| **Tavily** | `max_age_hours`（**抓取时效**）与 `time_range`（**发布时间**）分离；`include_domains_mode` = restrict（硬过滤）/ prefer（软偏好）双模 | `time_range` 匹配发布日会误杀持续更新页（天气/价格）；域名可软硬分级 | **我们已有 `time_range`，缺"抓取时效"与"域名软偏好"**（低）——`site:` 被部分引擎忽略那个坑（P1 盲测八）也能靠 prefer 缓解 |
+| **Linkup** | 查询写法分两段：「要检索什么证据」与「如何据此推理」；`depth` 四档（flash/fast 不调 LLM 直查索引 → standard 单轮 agentic → deep 多轮迭代 + JS 渲染） | 官方明说分两段比"直接问答案式问题"命中率高 | 与 Parallel 的 objective/queries 同源（低）；**单轮/多轮分级**（中）——但 §3.2 说多轮 fan-out 收益可疑，**只做单轮** |
+| **Firecrawl** | `categories` 走**专用索引**：research（限 arxiv/nature/pubmed）/ developer（GitHub issue+PR+README+文档站）/ gov（法条判例） | 垂直索引比通用 SERP 准得多 | **领域路由**（低）——§2.2 argo 的规则路由同款，落到 SearXNG 侧就是"按查询类型选引擎子集" |
+| **Firecrawl** | Search Highlights 默认开：把站点 description 换成 query 相关正文段落，**取不到高亮自动回退原摘要** | 既提质又不因高亮失败丢结果 | **"默认高亮 + 失败回退"契约**（中）——我们 md 输出已有"缺席语义"，可加一层 |
+| **Brave** | **Goggles 自定义重排**：内联 `$site=` / `$discard` / `$boost=` / `$downrank=`，可只留官方文档站并排除 UGC | 不改引擎就能改排序 | **站点加权/排除规则**（低）——直接缓解"site: 被静默吞掉"与中文错位 |
+| **Brave** | 上下文预算**四维可调**（urls / tokens / snippets / 每 URL tokens+snippets）+ `context_threshold_mode` strict/balanced/lenient | 按查询复杂度缩放预算 | 我们 `--limit`/`--snippet-len` 是二维，**可加"每 URL 预算"与"总量预算"**（低） |
+| **TinyFish** | `purpose` 参数：额外传"为什么搜/用途"作为排序信号 | 意图入检索 | 与 objective 同族（低） |
+| **You.com** | `extraction_mode` 三档：snippets（100–200 词）/ highlights（query 感知抽取）/ full_page | 内容深度分级暴露 | 与 Exa highlights 同族（中） |
+| **Perplexity** | `search_context_size`（low/medium/high）控抽取量；`search_mode="academic"` 学术路由；`search_recency_filter`/`search_domain_filter`（≤20 域） | 深度与时效可控 | context_size 档位 ↔ 我们抓取深度（低） |
+
+### 7.2 代价与门槛（决定哪些不可抄）
+
+| 家 | 定价/门槛 |
+|---|---|
+| Parallel | turbo/fast $1/1000、basic/advanced $5/1000、额外结果 $1/1000；advanced ~3s；EU 端点仅 basic |
+| Exa | API key + 新号免费额度；lite 只吃索引不实时抓 |
+| Tavily | basic/fast/ultra-fast 1 credit、advanced 2 credits；**keyless 免费但限流**，注册后 1000 credits/月 |
+| Linkup | flash/fast/standard $0.005，sourcedAnswer/structured $0.006，deep $0.05 |
+| Firecrawl | 无 key 可起步（限流更严）；gov 类别不加 credit |
+| Brave | 需 Search 计划 API key |
+| Perplexity | $5/1000 请求，Fast $1/1000；Agent API web_search $0.0025/次 |
+| Serper | 一次性 2500 次免费；预付 $50 起，credit 6 个月过期 |
+| You.com | $5/1000 calls，默认 10 req/s，新号 $100 额度 |
+| TinyFish | **每天免费 12,000 次**（00:00 UTC 重置），个人 30 req/min |
+
+→ 全部需要 key 或额度；**唯一与我们的"零 key 单 exe"冲突的就是它们**。
+
+### 7.3 独立基准的量化对照（2026-09-15 快照，100 私有 ticket × 3 轮，模型固定 gpt-5.6-sol）
+
+- **search & fetch**：Exa deep 83.0±1.0｜Exa auto 81.7｜TinyFish 79.0｜Perplexity high 77.7｜Parallel advanced 77.0｜Firecrawl 76.0｜Tavily advanced 60.0｜Linkup standard 48.3
+- **search only**：Perplexity low **77.3**｜Firecrawl 70.3｜Parallel fast 66.7｜Exa fast 66.3｜**Brave LLM Context 43.0**
+- **token 效率**：Firecrawl 7,456 最省，TinyFish 7,469，Perplexity 8,765；Linkup 57,791（≈4.5×）却垫底
+- **multi-hop**：Parallel basic F1 46.5｜Exa deep 45.4｜**raw Google SERP 0.4±0.6（precision 0.7%）**
+
+### 7.4 未查到 / 未核实
+
+- Parallel / Exa 的具体检索算法未公开（只给行为不给排序模型）；Brave Goggles 的权重实现未公开。
+- Perplexity / You.com / Serper 的官方文档站在本机直读失败，相关条目依据官方文档索引摘要 + changelog + 第三方实测交叉拼出，**字段名与额度建议二次核对**。
+- Exa/Brave 的 highlights 效果数字为**厂商自测**，跨引擎不可直接比较。
 
 ## 8. 未做 / 风险
 
