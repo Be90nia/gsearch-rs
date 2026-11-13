@@ -12,7 +12,7 @@
 - **基准 commit**：`ae1d59540270455f510f33ef231e2e362a1d68cb`（2026-11-13T11:34:08+08:00，`git log -1 --format=%cI HEAD`）
 - **捕获时间**：2026-11-13T07:20:08Z（UTC）
 - **数据源**：本地回环假 SearXNG（载荷见 `cli_golden_payloads.json`，零外网、零浏览器）——同一个假服务器同时喂给新旧两个二进制
-- **归一规则**：**只动两项**——① **换行符 CRLF→LF**（期望文件是某一次捕获的字节，落盘后可能被 git 的 `core.autocrlf` 改写成 CRLF，而 stdout 是程序直接写的字节；不归一则 Windows 检出的工作区与 Linux/macOS CI 上逐字节必红。比对时**两侧各自归一**：读入的期望文件 + 实际 stdout）；② **耗时字段**——JSON 的 `"elapsed_ms":<数字>` → `"elapsed_ms":0`；md meta 头的 `elapsed: <数字>.<数字>s` → `elapsed: 0.0s`（两者是同一个 `meta.elapsed_ms` 的两种渲染）。**除此之外不屏蔽任何字段**（键序、键集、格式、浮点字面量、字符串、空白全部参与逐字节比对）
+- **归一规则**：**只动三项**——① **换行符 CRLF→LF**（期望文件是某一次捕获的字节，落盘后可能被 git 的 `core.autocrlf` 改写成 CRLF，而 stdout 是程序直接写的字节；不归一则 Windows 检出的工作区与 Linux/macOS CI 上逐字节必红。比对时**两侧各自归一**：读入的期望文件 + 实际 stdout）；② **耗时字段**——JSON 的 `"elapsed_ms":<数字>` → `"elapsed_ms":0`；md meta 头的 `elapsed: <数字>.<数字>s` → `elapsed: 0.0s`（两者是同一个 `meta.elapsed_ms` 的两种渲染）；③ **版本号字段**——JSON 的 `"version":"<任意>"` → `"version":"0.0.0"`（版本号随发版变化，**不该参与「正常态输出是否变化」的判定**；期望文件里是捕获当时的 `0.4.0`，此后每次 bump 版本都会把逐字节锁打红——2026-11-13 bump 到 0.4.1 时 CI ubuntu 即因此红过一次）。**除此之外不屏蔽任何字段**（键序、键集、格式、浮点字面量、字符串、空白全部参与逐字节比对）
   - 独立断言：`tests/cli_golden_bytes.rs::newline_normalization_makes_crlf_and_lf_equivalent` —— 把期望文件的换行换成另一种形态（LF ⇄ CRLF）后比对**仍**通过 ⇒ 归一生效，且正常态输出**没有别的隐含平台差异**（键序/键集/浮点/字符串全等）
 - **正常态缺席语义**：正常态的 meta **没有** `off_topic` 键、结果**没有** `relevance` 键（不是 `0`、不是 `null`）——这正是本 golden 要锁住的东西
 

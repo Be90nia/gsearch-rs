@@ -140,7 +140,7 @@ fn run_cli_bin(binary: &str, base: &str, query: &str, json: bool) -> (String, St
     )
 }
 
-/// 归一：**只**动两项——① 换行符 CRLF→LF；② 耗时字段。
+/// 归一：**只**动三项——① 换行符 CRLF→LF；② 耗时字段；③ 版本号字段。
 /// 其余（键序 / 键集 / 浮点字面量 / 字符串 / 空白）全部参与逐字节比对。
 ///
 /// ① 换行符：期望文件是某一次捕获的字节，落盘后可能被 git 的 `core.autocrlf` 改写
@@ -175,7 +175,21 @@ fn normalize(s: &str) -> String {
         tail = &after[end..];
     }
     md.push_str(tail);
-    md
+
+    // JSON：`"version":"<任意>"` → `"version":"0.0.0"`（版本号随发版变化，
+    // 不该参与「正常态输出是否变化」的判定——否则每次 bump 版本都会把逐字节锁打红）
+    let mut ver = String::new();
+    let mut tail = md.as_str();
+    while let Some(i) = tail.find("\"version\":\"") {
+        let marker = "\"version\":\"";
+        ver.push_str(&tail[..i + marker.len()]);
+        let after = &tail[i + marker.len()..];
+        let end = after.find('"').map(|p| p + 1).unwrap_or(0);
+        ver.push_str("0.0.0");
+        tail = &after[end..];
+    }
+    ver.push_str(tail);
+    ver
 }
 
 /// 从 JSON 文本取指定成员的直属键（按出现顺序）——serde_json::Value 的 Map 是 BTreeMap
