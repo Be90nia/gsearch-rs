@@ -114,7 +114,7 @@ enum Command {
         /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
         #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
-        /// 跳过正文前 K 个空行分隔块再输出（p8r：默认 md 形态生效；--json/--full/--headings-only
+        /// 跳过正文前 K 个空行分隔块再输出（p8r：默认 md 与 --full 形态生效；--json/--headings-only
         /// 不消费，stderr 提示）
         #[arg(long)]
         from: Option<usize>,
@@ -485,15 +485,17 @@ impl SearchArgs {
 }
 
 /// `--from K` 是否被当前输出形态消费（bd gsearch-rs-0z8：静默失效必须出提示，禁止）。
-/// 仅 `--browse N` 的默认 md 形态消费（跳过正文前 K 个空行分隔块）；`--full`（innerText 无分块）/
-/// `--json` / `--headings-only` / `--read N`（snippet 形态）都不消费。
+/// 仅 `--browse N` 消费：默认 md 与 --full 都走 md_page_section 统一输出点按空行切块
+/// （full/from 统一后 read_full 透传 from，且 dispatch 中 full 优先于 headings_only）；
+/// `--json`（read_full 走 JSON 装配）/ `--headings-only` / `--read N`（snippet-only，
+/// 不启浏览器，--full 在该形态本就不生效）都不消费。
 fn from_is_consumed(browse: bool, full: bool, json: bool, headings_only: bool) -> bool {
-    browse && !full && !json && !headings_only
+    browse && !json && (!headings_only || full)
 }
 
 /// `--from K` 在当前形态不消费时的 stderr 提示（与 browse 侧 general.rs 同款文案口径）。
 fn warn_from_not_consumed() {
-    eprintln!("[hint] --from K 仅 --browse N 默认 md 形态生效（跳过正文前 K 个空行分隔块）；当前形态（--read N snippet / --full / --json / --headings-only / batch 多查询）不消费 --from");
+    eprintln!("[hint] --from K 仅 --browse N（默认 md / --full）生效（跳过正文前 K 个空行分隔块）；当前形态（--read N snippet / --json / --headings-only / batch 多查询）不消费 --from");
 }
 
 async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode> {
@@ -542,8 +544,8 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     let cfg = gsearch::search::SearchConfig { query: query.clone(), limit: args.limit, recency };
     // v0.4.0：默认 md 排版；--json 强制 JSON；--human 显式要 md（与默认同）
     let json_mode = args.json && !args.human;
-    // p8r 同型（bd gsearch-rs-0z8）：--from K 仅 --browse N 默认 md 形态消费；其余形态
-    // （--read N 的 snippet 形态 / --browse N 的 --full|--json|--headings-only）不消费 → stderr
+    // p8r 同型（bd gsearch-rs-0z8）：--from K 消费于 --full 与 --browse N 默认 md 形态；其余形态
+    // （--read N 的 snippet 形态 / --json / --headings-only / batch 多查询）不消费 → stderr
     // 一行提示，禁止静默失效（与 browse 侧 general.rs 同款处理）。
     if args.from.unwrap_or(0) > 0
         && !from_is_consumed(args.browse.is_some(), args.full, json_mode, args.headings_only)
@@ -1810,13 +1812,26 @@ mod tests {
         assert!(!json.contains("\"message\""), "ok 值类检查 message 键应缺席: {json}");
     }
 
-    /// bd gsearch-rs-0z8：--from 仅 `--browse N` 默认 md 形态消费；其余形态必须出提示（禁静默）。
+    /// bd gsearch-rs-0z8 + full/from 统一：仅 --browse N 消费（默认 md 与 --full 经同一
+    /// md_page_section 输出点；full 优先于 headings_only）；其余形态必须出提示（禁静默）。
     #[test]
-    fn from_is_consumed_only_in_browse_default_md() {
+    fn from_is_consumed_in_full_and_browse_default_md() {
         assert!(from_is_consumed(true, false, false, false), "--browse N 默认 md 形态消费");
-        assert!(!from_is_consumed(true, true, false, false), "--full 不消费");
+        assert!(from_is_consumed(true, true, false, false), "--browse N --full 消费");
+        assert!(
+            from_is_consumed(true, true, false, true),
+            "--browse N --full --headings-only：dispatch 中 full 优先，实际消费"
+        );
         assert!(!from_is_consumed(true, false, true, false), "--json 不消费");
+        assert!(
+            !from_is_consumed(true, true, true, false),
+            "--json --full 也不消费（JSON 装配无 md 切块）"
+        );
         assert!(!from_is_consumed(true, false, false, true), "--headings-only 不消费");
+        assert!(
+            !from_is_consumed(false, true, false, false),
+            "--read N --full 不消费（snippet-only 不启浏览器，仍须出提示）"
+        );
         assert!(!from_is_consumed(false, false, false, false), "--read N snippet 形态不消费");
     }
 

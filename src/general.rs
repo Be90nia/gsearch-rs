@@ -27,13 +27,20 @@ const DL_SNIFF_SECS: u64 = 4;
 /// v97 direct 直链总超时：流式 GET 大文件慢网场景，独立于 fetch 的 10s。
 const DL_DIRECT_TIMEOUT_SECS: u64 = 300;
 
+/// browse 侧 `--from K` 不消费的形态：--json（stdout 契约逐字节）/ --headings-only（无正文块）。
+/// --full 与默认 md 都经 md_page_section 统一输出点消费 from。
+fn browse_from_not_consumed(opts: &BrowseOpts) -> bool {
+    opts.json || opts.headings_only
+}
+
 /// M9 `browse <url>` 选项集。与 postproc::ReadOpts 字段一致（agent 心智统一）。
 #[derive(Debug, Clone, Default)]
 pub struct BrowseOpts {
     pub full: bool,
     pub json: bool,
     pub headings_only: bool,
-    /// p8r：默认 md 形态跳过正文前 K 个空行分隔块；--json/--full/--headings-only 不消费（stderr 提示）。
+    /// p8r：默认 md 与 --full 形态跳过正文前 K 个空行分隔块（统一输出点按空行切块）；
+    /// --json/--headings-only 不消费（stderr 提示）。
     pub from: usize,
     /// xih：正文以 markdown 输出（渲染后 HTML 转换，隐含全文模式）。--json 时 content_text
     /// 字段换源为 markdown，meta.format="markdown" 标注；无 flag 输出逐字节不变。
@@ -129,11 +136,11 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
         }
     };
     let url = url.as_str(); // 规范化后仍按 &str 流转，后续代码零改动
-    // p8r：--from 只消费于默认 md 形态（跳过正文前 K 个空行分隔块）。--json 的 stdout 契约
-    // 逐字节不变、--full 的 innerText 无空行分块、--headings-only 无正文——都不消费该 flag，
-    // 显式 stderr 提示，禁止静默失效。
-    if opts.from > 0 && (opts.json || opts.full || opts.headings_only) {
-        eprintln!("[hint] --from K 仅默认 md 形态生效（跳过正文前 K 个空行分隔块）；当前输出形态不消费 --from");
+    // p8r：--from 消费于默认 md 与 --full 形态（统一输出点 md_page_section 按空行切块，
+    // --full 的 innerText 空行同样分块）。--json 的 stdout 契约逐字节不变、--headings-only
+    // 无正文块——都不消费该 flag，显式 stderr 提示，禁止静默失效。
+    if opts.from > 0 && browse_from_not_consumed(opts) {
+        eprintln!("[hint] --from K 仅默认 md 与 --full 形态生效（跳过正文前 K 个空行分隔块）；当前输出形态不消费 --from");
     }
     let started = std::time::Instant::now();
     let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
@@ -826,5 +833,24 @@ mod tests {
             "https://x.com/dashboard",
             false,
         ));
+    }
+
+    /// full/from 统一：browse 侧不消费名单只剩 --json/--headings-only；--full 与默认 md 都
+    /// 经 md_page_section 统一输出点消费 from（不再出「不消费」hint）。
+    #[test]
+    fn browse_from_not_consumed_only_json_and_headings() {
+        assert!(!browse_from_not_consumed(&BrowseOpts::default()), "默认 md 形态消费");
+        assert!(
+            !browse_from_not_consumed(&BrowseOpts { full: true, ..Default::default() }),
+            "--full 消费"
+        );
+        assert!(
+            browse_from_not_consumed(&BrowseOpts { json: true, ..Default::default() }),
+            "--json 不消费"
+        );
+        assert!(
+            browse_from_not_consumed(&BrowseOpts { headings_only: true, ..Default::default() }),
+            "--headings-only 不消费"
+        );
     }
 }

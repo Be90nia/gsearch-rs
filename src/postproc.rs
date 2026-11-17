@@ -38,54 +38,6 @@ fn pick<'a>(results: &'a [SearchResult], n: usize, flag: &str) -> Result<&'a str
         return Err(anyhow!("--{flag} {n} 越界（结果数 {}）", results.len()));
     }
     Ok(&results[n - 1].url)
-    /// p8r：md_page_section 契约（browse 默认 md 路径接线所依赖）——from=0 输出与旧
-    /// `println!("# {t}\n\n{body}")` 逐字节一致；from=K 跳过正文前 K 个空行分隔块；
-    /// from 越过块数 → 正文为空（不 panic、不回退全文）。
-    #[test]
-    fn md_page_section_from_skips_blocks() {
-        let body = "b1\n\nb2\n\nb3";
-        assert_eq!(md_page_section("t", body, 0), "# t\n\nb1\n\nb2\n\nb3\n");
-        assert_eq!(md_page_section("t", body, 1), "# t\n\nb2\n\nb3\n");
-        assert_eq!(md_page_section("t", body, 2), "# t\n\nb3\n");
-        assert_eq!(md_page_section("t", body, 3), "# t\n\n\n");
-    }
-
-    /// p8r：md_page_section 契约（browse 默认 md 路径接线所依赖）——from=0 输出与旧
-    /// `println!("# {t}\n\n{body}")` 逐字节一致；from=K 跳过正文前 K 个空行分隔块；
-    /// from 越过块数 → 正文为空（不 panic、不回退全文）。
-    #[test]
-    fn md_page_section_from_skips_blocks() {
-        let body = "b1\n\nb2\n\nb3";
-        assert_eq!(md_page_section("t", body, 0), "# t\n\nb1\n\nb2\n\nb3\n");
-        assert_eq!(md_page_section("t", body, 1), "# t\n\nb2\n\nb3\n");
-        assert_eq!(md_page_section("t", body, 2), "# t\n\nb3\n");
-        assert_eq!(md_page_section("t", body, 3), "# t\n\n\n");
-    }
-
-    /// p8r：md_page_section 契约（browse 默认 md 路径接线所依赖）——from=0 输出与旧
-    /// `println!("# {t}\n\n{body}")` 逐字节一致；from=K 跳过正文前 K 个空行分隔块；
-    /// from 越过块数 → 正文为空（不 panic、不回退全文）。
-    #[test]
-    fn md_page_section_from_skips_blocks() {
-        let body = "b1\n\nb2\n\nb3";
-        assert_eq!(md_page_section("t", body, 0), "# t\n\nb1\n\nb2\n\nb3\n");
-        assert_eq!(md_page_section("t", body, 1), "# t\n\nb2\n\nb3\n");
-        assert_eq!(md_page_section("t", body, 2), "# t\n\nb3\n");
-        assert_eq!(md_page_section("t", body, 3), "# t\n\n\n");
-    }
-
-    /// p8r：md_page_section 契约（browse 默认 md 路径接线所依赖）——from=0 输出与旧
-    /// `println!("# {t}\n\n{body}")` 逐字节一致；from=K 跳过正文前 K 个空行分隔块；
-    /// from 越过块数 → 正文为空（不 panic、不回退全文）。
-    #[test]
-    fn md_page_section_from_skips_blocks() {
-        let body = "b1\n\nb2\n\nb3";
-        assert_eq!(md_page_section("t", body, 0), "# t\n\nb1\n\nb2\n\nb3\n");
-        assert_eq!(md_page_section("t", body, 1), "# t\n\nb2\n\nb3\n");
-        assert_eq!(md_page_section("t", body, 2), "# t\n\nb3\n");
-        assert_eq!(md_page_section("t", body, 3), "# t\n\n\n");
-    }
-
 }
 
 /// `--open N`：默认浏览器开窗。
@@ -620,6 +572,7 @@ pub async fn read_full(
     let (txt, truncated, omitted, _) = read_full_text(&page, read_max_chars()).await?;
     if !opts.json {
         // v0.4.0 md 形态：内容段 meta 头 + `# <页面标题>` + 正文（format=full——innerText 源）。
+        // full/from 统一：--from K 经 md_page_section 按空行切块消费，与 browse --full 同款。
         let fields = gsearch::output::content_meta_fields(
             "full",
             truncated,
@@ -627,7 +580,7 @@ pub async fn read_full(
             started.elapsed().as_millis(),
         );
         gsearch::output::print_meta_header(&fields);
-        print!("{}", md_page_section(&title, &txt, 0));
+        print!("{}", md_page_section(&title, &txt, opts.from));
     }
     Ok(txt)
 }
@@ -1197,6 +1150,35 @@ mod tests {
         let v2: serde_json::Value =
             serde_json::from_str(&render_read(&plain, true, false, 0, false, 0, 0, false)).unwrap();
         assert!(v2["meta"].get("dup_paragraphs").is_none(), "无重复不得出键: {v2}");
+    }
+
+    /// p8r：md_page_section 契约（browse 默认 md 路径接线所依赖）——from=0 输出与旧
+    /// `println!("# {t}\n\n{body}")` 逐字节一致；from=K 跳过正文前 K 个空行分隔块；
+    /// from 越过块数 → 正文为空（不 panic、不回退全文）。
+    #[test]
+    fn md_page_section_from_skips_blocks() {
+        let body = "b1\n\nb2\n\nb3";
+        assert_eq!(md_page_section("t", body, 0), "# t\n\nb1\n\nb2\n\nb3\n");
+        assert_eq!(md_page_section("t", body, 1), "# t\n\nb2\n\nb3\n");
+        assert_eq!(md_page_section("t", body, 2), "# t\n\nb3\n");
+        assert_eq!(md_page_section("t", body, 3), "# t\n\n\n");
+    }
+
+    /// full/from 统一：--full 的 innerText 正文与默认 md 同按空行分块，同一消费点生效——
+    /// browse --full / search --read N --full 传 opts.from 后首块被跳过（PARA-01 语义）。
+    #[test]
+    fn md_page_section_consumes_from_for_full_innertext_shape() {
+        let inner_text = "PARA-01\n\nPARA-02\n\nPARA-03\n\nPARA-04\n\nPARA-05";
+        assert_eq!(
+            md_page_section("t", inner_text, 2),
+            "# t\n\nPARA-03\n\nPARA-04\n\nPARA-05\n",
+            "--full 形态 from=2 跳过前两块"
+        );
+        assert_eq!(
+            md_page_section("t", inner_text, 0),
+            "# t\n\nPARA-01\n\nPARA-02\n\nPARA-03\n\nPARA-04\n\nPARA-05\n",
+            "from=0 输出全文（无 --from 行为不变）"
+        );
     }
 
     /// FixG20 OO：dup_paragraph_groups 单元——三连重复归同组、trim 后相同算重复、
