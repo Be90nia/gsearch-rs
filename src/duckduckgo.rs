@@ -1,7 +1,8 @@
 //! af9：DuckDuckGo html 直连第二源（SearXNG → DDG → Google 回退链的第二层）。
 //! `POST https://html.duckduckgo.com/html/` 表单（q [+ df]），第一页免 vqd token（9 月预研结论），
-//! 纯 HTTP 不起浏览器。与 SearXNG 局域网 no_proxy 相反：公网出口走系统/透明代理
-//!（curl 原生感知 HTTPS_PROXY 等环境代理）。
+//! 纯 HTTP 不起浏览器。与 SearXNG 局域网 no_proxy 相反：公网出口走代理
+//! （curl 原生感知 HTTPS_PROXY 等环境代理；bd gsearch-rs-1uc 起 GSEARCH_PROXY 显式接线，
+//! 否则回退链这一跳在墙内裸连必超时）。
 
 use std::collections::HashSet;
 
@@ -20,16 +21,25 @@ static DDG_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537
 
 /// 首页收集（第二源不翻页：翻页需 vqd token，超出首页的量由 Google 链兜底）。
 /// Ok(零条) = 正常响应但解析不出条目（零结果/风控页/改版），调用方按「DDG 未命中」继续回退链。
-pub async fn collect(cfg: &SearchConfig) -> Result<Vec<SearchResult>> {
+///
+/// bd gsearch-rs-1uc：代理感知——`net` 携回退链的代理上下文。代理端点不可达时直接按
+/// 「代理不可达」失败归因（不空烧一次请求预算）；代理可达时 curl 显式走 `--proxy`
+/// （curl 只原生读 HTTPS_PROXY 等环境变量，**不认 GSEARCH_PROXY** → 必须显式接线，
+/// 否则墙内裸连必超时 → SearXNG 一挂整条回退链全断）。
+pub async fn collect(cfg: &SearchConfig, net: &crate::search::FallbackNet) -> Result<Vec<SearchResult>> {
+    if let Some(why) = net.blocked() {
+        anyhow::bail!("{why}");
+    }
     let body = form_body(&cfg.query, cfg.recency);
-    let text = curl_post("https://html.duckduckgo.com/html/", &body).await?;
+    let proxy = net.curl_proxy();
+    let text = curl_post("https://html.duckduckgo.com/html/", &body, proxy.as_deref()).await?;
     Ok(parse_limited(&text, cfg.limit))
 }
 
-/// DDG html POST（curl 子进程）：环境代理感知与 reqwest 语义对齐（HTTPS_PROXY 系环境
-/// 变量 curl 原生读取，透明代理场景零配置）。
-async fn curl_post(url: &str, body: &str) -> Result<String> {
-    let args = curl_args(url, body);
+/// DDG html POST（curl 子进程）：`--proxy` 显式传代理（curl 不认 GSEARCH_PROXY），
+/// HTTPS_PROXY 系环境变量仍由 curl 原生读取（透明代理场景零配置）。
+async fn curl_post(url: &str, body: &str, proxy: Option<&str>) -> Result<String> {
+    let args = curl_args(url, body, proxy);
     let out = tokio::process::Command::new("curl")
         .args(&args)
         .output()
@@ -41,17 +51,25 @@ async fn curl_post(url: &str, body: &str) -> Result<String> {
 /// curl 参数构造（抽纯函数供单测锁）；不走 shell，body 含 & 无需引号。
 /// 不显式传 Content-Type：--data-raw 自动生成时 curl 把它排在 Content-Length 之后
 ///（khn 实测：-H 显式提供会把它提前，DDG anomaly 风控按头序识别直接 202）。
-fn curl_args(url: &str, body: &str) -> Vec<String> {
-    vec![
+/// 代理（bd gsearch-rs-1uc）：`--proxy` 显式传（curl 不认 GSEARCH_PROXY）；socks5 已在
+/// 调用方归一成 socks5h（域名交代理侧解析）。经代理时预算放宽到 10s——隧道握手叠加出口
+/// 延迟，5s 会误杀本可用的请求；无代理时参数与旧版逐字一致。
+fn curl_args(url: &str, body: &str, proxy: Option<&str>) -> Vec<String> {
+    let mut args = vec![
         "-sS".into(),
         "--max-time".into(),
-        "5".into(),
+        if proxy.is_some() { "10" } else { "5" }.into(),
         "-A".into(),
         DDG_UA.into(),
         "--data-raw".into(),
         body.into(),
-        url.into(),
-    ]
+    ];
+    if let Some(p) = proxy {
+        args.push("--proxy".into());
+        args.push(p.into());
+    }
+    args.push(url.into());
+    args
 }
 
 /// khn：curl 子进程结果分类（纯函数，单测锁）。Err 一律走调用方回退链——超时
@@ -65,8 +83,8 @@ fn classify_curl_result(exit: Option<i32>, body: String) -> Result<String> {
             }
             Ok(body)
         }
-        Some(28) => anyhow::bail!("curl exit 28：DDG 直连超时（5s 预算）"),
-        Some(c) => anyhow::bail!("curl exit {c}：DDG 直连传输失败"),
+        Some(28) => anyhow::bail!("curl exit 28：DDG 请求超时（预算内未返回）"),
+        Some(c) => anyhow::bail!("curl exit {c}：DDG 传输失败"),
         None => anyhow::bail!("curl 被信号终止"),
     }
 }
@@ -329,7 +347,7 @@ mod tests {
     /// 后）才是 curl 原生指纹，显式 -H 会把它提前被 DDG 风控识别（202）。
     #[test]
     fn curl_args_carry_ua_timeout_body_url() {
-        let args = super::curl_args("https://html.duckduckgo.com/html/", "q=rust");
+        let args = super::curl_args("https://html.duckduckgo.com/html/", "q=rust", None);
         let at = |name: &str| args.iter().position(|a| a == name).expect(name);
         assert_eq!(args[at("-A") + 1], super::DDG_UA);
         assert_eq!(args[at("--max-time") + 1], "5");
@@ -339,5 +357,20 @@ mod tests {
             !args.iter().any(|a| a.starts_with("Content-Type")),
             "显式 Content-Type 会破坏 curl 原生头序被 DDG 识别"
         );
+        assert!(
+            !args.iter().any(|a| a == "--proxy"),
+            "无代理时不得带 --proxy（直连语义不变）"
+        );
+    }
+
+    /// bd gsearch-rs-1uc：配了代理 → curl 显式 `--proxy`（curl 不认 GSEARCH_PROXY，
+    /// 裸连在墙内必超时 → 回退链整条失效）；经代理时预算放宽到 10s（隧道握手 + 出口延迟）。
+    #[test]
+    fn curl_args_add_proxy_when_configured() {
+        let args = super::curl_args("https://html.duckduckgo.com/html/", "q=rust", Some("socks5h://127.0.0.1:10808"));
+        let at = |name: &str| args.iter().position(|a| a == name).expect(name);
+        assert_eq!(args[at("--proxy") + 1], "socks5h://127.0.0.1:10808");
+        assert_eq!(args[at("--max-time") + 1], "10");
+        assert_eq!(args.last().unwrap(), "https://html.duckduckgo.com/html/", "URL 仍是末位参数");
     }
 }

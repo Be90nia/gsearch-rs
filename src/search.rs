@@ -615,50 +615,291 @@ pub async fn try_searxng(cfg: &SearchConfig) -> SearxngAttempt {
             captcha_solved: false,
             provider: "searxng",
         }),
-        Err(fail) => {
-            let reason = fail.describe();
-            // af9：第二源插层——SearXNG 挂/零结果先试 DDG html（纯 HTTP 免浏览器），
-            // 命中则以 provider=duckduckgo 直接返回；仍空才走 Google 预检回退/熔断老链。
-            match crate::duckduckgo::collect(cfg).await {
-                Ok(results) if !results.is_empty() => {
-                    eprintln!("SearXNG {base} 查询失败（{reason}），已回退 DuckDuckGo html 直连");
-                    return SearxngAttempt::Results(SearchOutcome::Results {
-                        results,
-                        captcha_solved: false,
-                        provider: "duckduckgo",
-                    });
+        Err(fail) => fallback_after_failure(&base, cfg, fail).await,
+    }
+}
+
+/// SearXNG 失败后的回退链（DDG 插层 → Google 预检 → 决策）：网络 I/O 全在这段，
+/// 决策由纯函数 `decide_after_fail` 出（bd gsearch-rs-aws：决策层可单测）。
+async fn fallback_after_failure(base: &str, cfg: &SearchConfig, fail: SearxFail) -> SearxngAttempt {
+    let reason = fail.describe();
+    // af9：第二源插层——SearXNG 挂/零结果先试 DDG html（纯 HTTP 免浏览器），
+    // 命中则以 provider=duckduckgo 直接返回；仍空才走 Google 预检回退/熔断老链。
+    // bd gsearch-rs-1uc：DDG 与 Google 预检都读代理配置——裸连在墙内必然不通 →
+    // SearXNG 一挂两跳全断 = 整条回退链失效（假熔断）。
+    let net = FallbackNet::probe(fallback_proxy()).await;
+    let ddg = match crate::duckduckgo::collect(cfg, &net).await {
+        Ok(results) if !results.is_empty() => {
+            eprintln!("SearXNG {base} 查询失败（{reason}），已回退 DuckDuckGo html 直连");
+            DdgOutcome::Hit(results)
+        }
+        Ok(_) => {
+            eprintln!("DDG html 直连零结果，继续 Google 回退链");
+            DdgOutcome::Empty
+        }
+        Err(e) => {
+            eprintln!("DDG html 直连失败（{e:#}），继续 Google 回退链");
+            DdgOutcome::Failed(format!("{e:#}"))
+        }
+    };
+    let precheck = google_fallback_precheck(&net).await;
+    let decision = decide_after_fail(fail, ddg, precheck.clone());
+    match &decision {
+        // 预检通过 = Google 可达 → 回退 warn（沿用既有措辞）
+        SearxngAttempt::FallbackGoogle(_) => warn_searxng_fallback(base, &reason),
+        // 熔断：真因含 Google 预检归因（代理不可达 ≠ 目标站不可达）
+        SearxngAttempt::CircuitBroken(why) => eprintln!("{}", circuit_diag(why)),
+        // o1p：源健康 + 兜底全空 + Google 不可达——不是熔断，按源健康定态；
+        // 预检失败仍留痕（禁静默：代理挂了要让用户看见）。
+        SearxngAttempt::HealthyEmpty => {
+            if let Precheck::Unreachable(why) = &precheck {
+                eprintln!("Google 回退预检失败（{why}）——SearXNG 源健康零结果，不熔断");
+            }
+        }
+        _ => {}
+    }
+    decision
+}
+
+// ===== bd gsearch-rs-1uc / aws：回退链代理感知 + 决策层纯函数 =====
+
+/// 回退链代理来源：GSEARCH_PROXY（与 main.rs 的 env 默认值同源）。
+/// CLI `--proxy` 走 main.rs 的参数通道，未铺到回退链（接线需改 main.rs，本单非目标）。
+pub fn fallback_proxy() -> Option<String> {
+    proxy_from_env_value(std::env::var("GSEARCH_PROXY").ok())
+}
+
+/// 代理值归一（纯函数）：设了但空白 = 未设（对齐 config.rs 的 env 合并语义）。
+pub fn proxy_from_env_value(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// curl 侧代理 URL 归一：socks5:// → socks5h://（域名交代理侧解析，与 Chrome SOCKS5 行为一致；
+/// 本地 DNS 被污染时仍可通）。同 main.rs doctor 的代理探测同款（那边是内联副本，本单不动 main.rs）。
+pub fn curl_proxy_url(proxy: &str) -> String {
+    match proxy.strip_prefix("socks5://") {
+        Some(rest) => format!("socks5h://{rest}"),
+        None => proxy.to_string(),
+    }
+}
+
+/// 代理端点解析（host, port）——TCP 探针用。剥 userinfo（user:pass@）；IPv6 认方括号；
+/// 无端口按 curl 默认代理端口 1080 补齐。解析不出 → None（归因为「代理地址无法解析」）。
+pub fn proxy_endpoint(proxy: &str) -> Option<(String, u16)> {
+    let rest = proxy.split_once("://").map(|(_, r)| r).unwrap_or(proxy);
+    let hostport = rest.rsplit('@').next().unwrap_or(rest);
+    let (host, port) = if let Some(end) = hostport.strip_prefix('[') {
+        let (h, tail) = end.split_once(']')?;
+        (h.to_string(), tail.strip_prefix(':').unwrap_or("").to_string())
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.to_string()),
+            None => (hostport.to_string(), String::new()),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = if port.is_empty() { "1080" } else { port.as_str() };
+    Some((host, port.parse().ok()?))
+}
+
+/// 代理端点可达性（回退链归因用：代理不可达 ≠ 目标站不可达）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyReach {
+    /// 未配代理（直连语义）。
+    None,
+    /// 代理端点 TCP 可达。
+    Reachable,
+    /// 代理端点不可达（携归因文本）。
+    Unreachable(String),
+}
+
+/// 回退链的网络上下文（代理感知）——代理端点只探一次（调用方探好传下来，
+/// DDG 与 Google 预检共用同一结论）。
+#[derive(Debug, Clone)]
+pub struct FallbackNet {
+    /// 代理 URL 原串（None = 直连）。
+    proxy: Option<String>,
+    /// 代理端点可达性。
+    reach: ProxyReach,
+}
+
+impl FallbackNet {
+    /// 直连语义（无代理）。
+    pub fn direct() -> Self {
+        Self { proxy: None, reach: ProxyReach::None }
+    }
+
+    /// 探测代理端点（TCP 1s 封顶）后建上下文；None = 无代理 → 直连语义。
+    pub async fn probe(proxy: Option<String>) -> Self {
+        let Some(p) = proxy else {
+            return Self::direct();
+        };
+        let reach = match proxy_endpoint(&p) {
+            Some((host, port)) => {
+                match tokio::time::timeout(
+                    Duration::from_millis(1000),
+                    tokio::net::TcpStream::connect((host.as_str(), port)),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => ProxyReach::Reachable,
+                    Ok(Err(e)) => ProxyReach::Unreachable(format!(
+                        "代理不可达（{p}）：TCP 连接 {host}:{port} 失败（{e}）"
+                    )),
+                    Err(_) => ProxyReach::Unreachable(format!(
+                        "代理不可达（{p}）：TCP 连接 {host}:{port} 超时（1s 预算）"
+                    )),
                 }
-                Ok(_) => eprintln!("DDG html 直连零结果，继续 Google 回退链"),
-                Err(e) => eprintln!("DDG html 直连失败（{e:#}），继续 Google 回退链"),
             }
-            if google_fallback_precheck().await {
-                warn_searxng_fallback(&base, &reason);
-                // o1p：None = 源健康零结果（HealthyEmpty 无故障真因），供回退空时三态定态
-                let fault = matches!(fail, SearxFail::SourceError(_)).then_some(reason);
-                SearxngAttempt::FallbackGoogle(fault)
-            } else if matches!(fail, SearxFail::HealthyEmpty) {
-                // o1p：源健康 + 兜底全空 + Google 不可达——不是熔断，按源健康定态；
-                // filtered_empty/no_results 的判定与诊断行由调用方按 recency 打（此处无 recency 上下文）。
-                SearxngAttempt::HealthyEmpty
-            } else {
-                eprintln!("{}", circuit_diag(&reason));
-                SearxngAttempt::CircuitBroken(reason)
-            }
+            None => ProxyReach::Unreachable(format!("代理地址无法解析（{p}）")),
+        };
+        Self { proxy: Some(p), reach }
+    }
+
+    /// curl 用的代理 URL（已归一 socks5h）；无代理 = None。
+    pub fn curl_proxy(&self) -> Option<String> {
+        self.proxy.as_deref().map(curl_proxy_url)
+    }
+
+    /// 代理侧故障的归因文本（Some = 代理不可达/不可用，别再打目标站）。
+    pub fn blocked(&self) -> Option<&str> {
+        match &self.reach {
+            ProxyReach::Unreachable(why) => Some(why.as_str()),
+            _ => None,
         }
     }
 }
 
-/// Google 回退预检——TCP 连 www.google.com:443，1.5s 封顶（与 doctor 第 5 项同款探测）。
-/// ponytail: 直连探测不感知 GSEARCH_PROXY（显式代理场景可能假熔断）；本部署走透明代理直出，无此形态。
-async fn google_fallback_precheck() -> bool {
-    matches!(
-        tokio::time::timeout(
+/// Google 回退预检结果（代理感知 + 归因可区分）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Precheck {
+    /// 可达（直连或经代理）——可回退 Google 直爬。
+    Ok,
+    /// 不可达 + 归因（直连不通 / 代理不可达 / 经代理仍不通）。
+    Unreachable(String),
+}
+
+/// Google 回退预检——无代理时 TCP 连 www.google.com:443（1.5s 封顶，与 doctor 第 5 项同款探测）；
+/// 配了代理时改经代理探测（curl `--proxy`，house 同款 verify.rs/doctor）：墙内直连必然不通，
+/// 直连探测会假熔断（bd gsearch-rs-1uc）。
+async fn google_fallback_precheck(net: &FallbackNet) -> Precheck {
+    if let Some(why) = net.blocked() {
+        return Precheck::Unreachable(why.to_string());
+    }
+    match net.curl_proxy() {
+        None => match tokio::time::timeout(
             Duration::from_millis(1500),
             tokio::net::TcpStream::connect(("www.google.com", 443)),
         )
-        .await,
-        Ok(Ok(_))
-    )
+        .await
+        {
+            Ok(Ok(_)) => Precheck::Ok,
+            Ok(Err(e)) => Precheck::Unreachable(format!("直连 www.google.com:443 失败（{e}）")),
+            Err(_) => Precheck::Unreachable("直连 www.google.com:443 超时（1.5s 预算）".to_string()),
+        },
+        Some(p) => proxy_precheck(&p).await,
+    }
+}
+
+/// 经代理探测 Google 可达（curl 子进程，house 同款 verify.rs / doctor 代理探测）：
+/// curl 只原生读 HTTPS_PROXY 等环境变量，**不认 GSEARCH_PROXY** → 必须显式 `--proxy`。
+async fn proxy_precheck(proxy: &str) -> Precheck {
+    let out = tokio::process::Command::new("curl")
+        .args([
+            "-sS",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "4",
+            "--proxy",
+            proxy,
+            "--",
+            "https://www.google.com/generate_204",
+        ])
+        .output()
+        .await;
+    match out {
+        Ok(out) if out.status.success() => Precheck::Ok,
+        Ok(out) => {
+            let code = out.status.code().unwrap_or(-1);
+            let first = String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            Precheck::Unreachable(format!(
+                "经代理访问 Google 失败（curl exit {code}{}）",
+                if first.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {first}")
+                }
+            ))
+        }
+        Err(e) => Precheck::Unreachable(format!("代理探测失败（curl 不可用：{e}）")),
+    }
+}
+
+/// DDG 插层结果（决策层输入；网络 I/O 全在调用方）。
+#[derive(Debug)]
+pub enum DdgOutcome {
+    /// 命中（非空结果集）→ 直接返回 provider="duckduckgo"。
+    Hit(Vec<SearchResult>),
+    /// 正常响应但零结果。
+    Empty,
+    /// 失败（携归因，如「代理不可达」）。
+    Failed(String),
+}
+
+/// 回退链决策（**纯函数**，bd gsearch-rs-aws）：输入 = SearXNG 失败分类 + DDG 插层结果 +
+/// Google 预检结果；输出 = 回退决策。零 I/O——网络事实在调用方测好后喂进来 → 决策表可单测
+/// （b39 遗留盲区：`try_searxng` 的 Err 分支直连两个硬网络依赖，分支选择无法自动化）。
+///
+/// | DDG | 预检 | SearXNG | 决策 |
+/// |---|---|---|---|
+/// | 命中 | — | 任意 | Results(provider="duckduckgo") |
+/// | 空/失败 | 通 | 健康零结果 | FallbackGoogle(None) |
+/// | 空/失败 | 通 | 故障 | FallbackGoogle(Some(真因)) |
+/// | 空/失败 | 不通 | 健康零结果 | HealthyEmpty |
+/// | 空/失败 | 不通 | 故障 | CircuitBroken(SearXNG 真因 + 预检归因) |
+pub fn decide_after_fail(fail: SearxFail, ddg: DdgOutcome, precheck: Precheck) -> SearxngAttempt {
+    let (ddg_hit, ddg_err) = match ddg {
+        DdgOutcome::Hit(results) => (Some(results), None),
+        DdgOutcome::Empty => (None, None),
+        DdgOutcome::Failed(e) => (None, Some(e)),
+    };
+    if let Some(results) = ddg_hit {
+        return SearxngAttempt::Results(SearchOutcome::Results {
+            results,
+            captcha_solved: false,
+            provider: "duckduckgo",
+        });
+    }
+    // o1p：None = 源健康零结果（HealthyEmpty 无故障真因），供回退空时三态定态
+    let reason = fail.describe();
+    let fault = matches!(fail, SearxFail::SourceError(_)).then_some(reason);
+    match precheck {
+        Precheck::Ok => match fault {
+            Some(reason) => SearxngAttempt::FallbackGoogle(Some(reason)),
+            None => SearxngAttempt::FallbackGoogle(None),
+        },
+        Precheck::Unreachable(why) => match fault {
+            Some(reason) => {
+                let ddg_note = match ddg_err {
+                    Some(e) => format!("；DDG 插层失败：{e}"),
+                    None => String::new(),
+                };
+                SearxngAttempt::CircuitBroken(format!(
+                    "{reason}{ddg_note}；Google 回退预检失败：{why}"
+                ))
+            }
+            // o1p：源健康 + Google 不可达——不是熔断，按源健康定态（预检归因由调用方打 stderr）
+            None => SearxngAttempt::HealthyEmpty,
+        },
+    }
 }
 
 /// SearXNG-only 收集内核（单查询与 batch 共用）：翻页凑 limit。

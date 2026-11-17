@@ -175,7 +175,7 @@ gsearch search "rust async runtime" "tokio tutorial" --limit 3
 
 #### SearXNG 熔断与零结果三态（searxng_degraded / filtered_empty / no_results）
 
-单查询回退链为 **SearXNG → DDG html → Google**：SearXNG 挂/零结果时先试 DDG html 直连（纯 HTTP 免浏览器，命中时 `meta.provider=duckduckgo`、stderr 一行接管提示）；DDG 也空才做 Google 直连预检（TCP 1.5s）：不通则**熔断**——跳过回退秒级返回，`run.status=searxng_degraded`、exit 2、stderr 一行诊断（基础设施降级 ≠ 查询无资料，agent 应换短 query / `doctor` / 直接 `fetch` 已知源，而非当空结果处理）。
+单查询回退链为 **SearXNG → DDG html → Google**：SearXNG 挂/零结果时先试 DDG html 直连（纯 HTTP 免浏览器，命中时 `meta.provider=duckduckgo`、stderr 一行接管提示）；DDG 也空才做 Google 回退预检（**代理感知**：无代理 = 直连 TCP 1.5s；配了 `GSEARCH_PROXY` = 经代理探测，`socks5://` 自动改写 `socks5h://` 交代理侧解 DNS）：不通则**熔断**——跳过回退秒级返回，`run.status=searxng_degraded`、exit 2、stderr 一行诊断（基础设施降级 ≠ 查询无资料，agent 应换短 query / `doctor` / 直接 `fetch` 已知源，而非当空结果处理）。**代理不可达与目标站不可达分立归因**：代理端点 TCP 不通时 stderr / `run.message` 明说「代理不可达」，不混成「目标站超时」（bd gsearch-rs-1uc）。
 IP 可达时回退 Google 直爬（**未配置 SearXNG 的裸环境回退时 stderr 一行 `[hint] SearXNG 未配置…`**，给出 `GSEARCH_SEARXNG_URL` 配置出口；isatty 自动档下管道调用默认已是快档）；**若回退也零结果，按 SearXNG 主源健康度定态（o1p 三态，stderr 诊断行与 `run.status`/`run.message` 同步）**：
 
 - SearXNG **故障**（HTTP 4xx/5xx、超时、解析失败）→ `run.status=searxng_degraded`，message 尾部透传真因（如 `HTTP 400 Bad Request`）

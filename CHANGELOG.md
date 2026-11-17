@@ -2,6 +2,12 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本遵循语义化版本。
 
+## [Unreleased]
+
+### Fixed
+
+- **回退链代理感知：SearXNG 一挂不再整条回退链失效（bd gsearch-rs-1uc / gsearch-rs-aws）**：此前回退链两跳都**裸连**——DDG html 直连走 `curl` 子进程但 curl **不认 `GSEARCH_PROXY`**（只原生读 `HTTPS_PROXY` 等环境变量），Google 回退预检更是硬直连 `www.google.com:443` → 墙内直连必然不通 → SearXNG 一挂两跳全断 = `run.status=searxng_degraded`、rc=2、零结果（浏览器路径本身带代理，故只有这两跳裸连）。现：① **DDG 显式 `--proxy`**（`socks5://` 改写 `socks5h://` 交代理侧解 DNS，与 Chrome SOCKS5 行为一致）；② **Google 预检改经代理探测**（curl 子进程，house 同款 `verify.rs` / doctor，零新依赖）；③ **代理端点 TCP 不可达时先归因再打目标站**——stderr / `run.message` 明说「代理不可达」而非「目标站超时/不可达」。回退链决策层抽成**纯函数** `decide_after_fail`（网络 I/O 留在调用方，喂进决策层）→ 五态决策表首次可自动化（`tests/fallback_decide.rs`，10 例；bd gsearch-rs-b39 遗留盲区闭环）。**无代理时行为与参数逐字不变**（curl 参数集、`--max-time 5` 预算原样；经代理时预算放宽到 10s 抵消隧道握手 + 出口延迟）；JSON 信封键集零变化
+
 ## [0.4.1]
 
 ### Added
