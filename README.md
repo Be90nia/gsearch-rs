@@ -489,6 +489,18 @@ git clone <repo> && cd gsearch-rs && cargo build --release
 
 单 exe + Chrome 即可运行，不装 Python/venv/Node。Linux/macOS 同样只需本地有 Chrome 或 Edge。
 
+### gsearch-cli Skill 安装（AI agent 用户）
+
+本仓附带 agent skill：[`skills/gsearch-cli/SKILL.md`](skills/gsearch-cli/SKILL.md)——写给 AI agent 的决策指南（何时选哪个 provider、退出码语义、常见坑、`--from` 分页语义）。装到你的 agent skills 目录即可被自动触发：
+
+```bash
+# Claude Code / Codex / 其它按目录约定加载 skill 的 agent
+mkdir -p ~/.claude/skills/gsearch-cli && cp skills/gsearch-cli/SKILL.md ~/.claude/skills/gsearch-cli/
+mkdir -p ~/.codex/skills/gsearch-cli  && cp skills/gsearch-cli/SKILL.md ~/.codex/skills/gsearch-cli/
+```
+
+`skills/` 目录按 agent skills 通用约定组织（`SKILL.md` + name/description frontmatter）。skill 正文只写决策逻辑——**参数真相运行时取 `gsearch --help`**，skill 不抄参数表，不会随版本漂移。
+
 ## 设计
 
 项目根 [`docs/PLAN.md`](docs/PLAN.md) 为权威设计文档。
