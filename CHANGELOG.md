@@ -1,4 +1,5 @@
 # Changelog
+- **`browse --from K` 分页生效（bd gsearch-rs-p8r）**：顶层 `browse` 的 `--from` 此前在**所有**输出形态静默失效。现默认 md 形态消费 `--from K`（跳过正文前 K 个空行分隔块，`md_page_section` 同语义，长文尾部可达）；`--json`（stdout 契约逐字节不变）/ `--full`（innerText 无空行分块）/ `--headings-only`（无正文）不消费该 flag 时 stderr 一行提示，禁止静默。**AdaptiveRead 摘要窗口语义修正**：`--from K` 从「在已裁摘要（长文仅 5 段）上再砍前 K 段，`--from 5` 即越界」改为「跳过全文前 K 段取最多 take_n 段的滑动窗口」（`search --browse N` 同受益）；实现新增 `AdaptiveRead.all_paragraphs` 字段（`#[serde(skip)]`，不进 JSON）。无 `--from` 的输出与修复前逐字节一致（回归锁 `tests/cli_golden_bytes.rs` + 修复前后二进制 A/B 实测）
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本遵循语义化版本。
 
