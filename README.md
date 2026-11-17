@@ -438,11 +438,11 @@ gsearch search "rust"                              # 默认 auto：优先 Chrome
 - **Chrome / Edge**：路径是否找到；Edge 缺仅给 WARN（仍可跑）
 - **profile 可写**：在默认 / 自定义 profile 目录建一个临时探针文件做读写验证
 - **出口 IP**：明文 HTTP GET `http://ipv4.icanhazip.com/` 取公网 IP。**撞码时可以这里查 IP 被封状况**。当前 IP 记录到 `<profile>/last_exit_ip`；下次检查发现变化时附加 `exit_ip_drift` 一行 `[WARN]`（VPN/代理切换或 IP 信誉重置信号）——首次无记录或 IP 未变则静默
-- **网络连通**：TCP connect `www.google.com:443`，2 秒超时
+- **网络连通（分级）**：TCP connect `www.google.com:443`，2 秒超时；直连不通且配了代理（`--proxy` / `GSEARCH_PROXY`）时再经代理探一次（curl；socks5 交代理侧解析域名）——直连通或经代理通都判 `[OK]`（value 标注是否经代理）；仍不通时**按主路径健康度分级**：SearXNG 主路径可达 → `[WARN]`「直连不可达（需代理或出口受限）」（**不判整体不通**：与 `[OK] searxng` 并存不再把整体拉成 FAIL），主路径亦不可用（未配 SearXNG / 探测失败）→ `[FAIL]`
 - **GSEARCH_PROFILE**：环境变量检查，缺/空用默认；路径不存在仅 WARN（首次启动会建）
 - **SearXNG probe**（配置 searxng_url 时）：GET `{url}/search?q=probe&format=json` 报 results 数与 unresponsive_engines；可达但零结果标 `[WARN]`（引擎降级/IP 信誉嫌疑）。**探针超时 8s**——实例查询墙钟下界约 3s（引擎被上游熔断时 SearXNG 等满 `outgoing.request_timeout` 才回），短超时会把健康实例误报成「探测失败」
 
-任意 FAIL 退出码 1；WARN 整体可用；都 OK 退出 0。CI 或首次安装后跑一次可快速定位是浏览器路径、profile 权限、网络出口哪一类故障。
+任意 FAIL 退出码 1；WARN 整体可用；都 OK 退出 0。CI 或首次安装后跑一次可快速定位是浏览器路径、profile 权限、网络出口哪一类故障。**`network` 项分级后**：仅「直连被封但代理可用 / SearXNG 主路径健康」时 doctor 退出码为 **0**（此前恒为 1，见 bd gsearch-rs-u45）——「Google 直连不通」不再等同于「工具不可用」。
 
 ### `gsearch verify`（URL 健康检查）
 
