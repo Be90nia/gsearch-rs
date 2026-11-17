@@ -1,7 +1,7 @@
 //! M6 通用代理子命令（PLAN §3.5）：browse 正文 / login 人工登录 / dl CDP 下载。
 //! 与 search 后处理（postproc.rs）平行，是独立使用入口，共享 browser.rs 的 profile/启动链路。
 //!
-//! M9：`browse <url>` 默认 AdaptiveRead，`--full/--json/--headings-only/--from K` 互斥选择（与 `search --read` 同步）。
+//! v0.4.0：`browse <url>` 默认 md 全文（meta 头 + `# 标题` + 正文）；`--json` = AdaptiveRead JSON（v0.3.0 契约逐字节一致）；`--from K` 默认 md 形态跳过正文前 K 个空行分隔块（p8r；其余形态 stderr 提示，不静默失效）。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -33,6 +33,7 @@ pub struct BrowseOpts {
     pub full: bool,
     pub json: bool,
     pub headings_only: bool,
+    /// p8r：默认 md 形态跳过正文前 K 个空行分隔块；--json/--full/--headings-only 不消费（stderr 提示）。
     pub from: usize,
     /// xih：正文以 markdown 输出（渲染后 HTML 转换，隐含全文模式）。--json 时 content_text
     /// 字段换源为 markdown，meta.format="markdown" 标注；无 flag 输出逐字节不变。
@@ -110,7 +111,7 @@ fn needs_empty_body_hint(summary_len: usize, headings_only: bool, omitted: usize
     summary_len == 0 && !headings_only && (omitted > 0 || raw_content_empty)
 }
 
-/// `browse <url>`：headless 渲染 → 默认 AdaptiveRead（M9），`--full` 纯 innerText（50000 cap，
+/// `browse <url>`：headless 渲染 → 默认 md 全文（v0.4.0；`--from K` 跳过正文前 K 块，p8r），`--full` 纯 innerText（50000 cap，
 /// fve：--json 走 0mf 同款信封 + content_text；与 --headings-only clap 互斥）。
 /// CAPTCHA 路径：撞码报错退出，提示用 login 手工验证。
 /// H2+M2：launch 后所有 ? 早返回路径（new_page / goto / evaluate / content / parse）由外层
@@ -128,6 +129,12 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
         }
     };
     let url = url.as_str(); // 规范化后仍按 &str 流转，后续代码零改动
+    // p8r：--from 只消费于默认 md 形态（跳过正文前 K 个空行分隔块）。--json 的 stdout 契约
+    // 逐字节不变、--full 的 innerText 无空行分块、--headings-only 无正文——都不消费该 flag，
+    // 显式 stderr 提示，禁止静默失效。
+    if opts.from > 0 && (opts.json || opts.full || opts.headings_only) {
+        eprintln!("[hint] --from K 仅默认 md 形态生效（跳过正文前 K 个空行分隔块）；当前输出形态不消费 --from");
+    }
     let started = std::time::Instant::now();
     let mut browser_opt: Option<chromiumoxide::browser::Browser> = None;
     let result: Result<()> = async {
@@ -276,7 +283,8 @@ pub async fn cmd_browse(url: &str, opts: &BrowseOpts) -> Result<ExitCode> {
             started.elapsed().as_millis(),
         );
         gsearch::output::print_meta_header(&fields);
-        println!("# {heading}\n\n{body}");
+        // p8r：--from K 消费点（跳过正文前 K 个空行分隔块）；print! 非 println!——section 自带结尾换行
+        print!("{}", postproc::md_page_section(&heading, &body, opts.from));
         browser_opt = Some(browser);
         Ok(())
     }
