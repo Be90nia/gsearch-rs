@@ -265,6 +265,8 @@ gsearch doctor --human
 
 撞码时第一跑 `doctor` 看出口 IP——被 Google 封了换 IP / proxy 即可。
 
+**网络连通项分级**：`network` 检查先直连 `www.google.com:443`（2 秒超时）；直连不通且配了代理（`--proxy` / `GSEARCH_PROXY`）时再经代理探一次（curl，socks5 交代理侧解析域名）——任一通路可达即 `[OK]`（值里标注是否经代理）；都不可达时，**SearXNG 主路径健康 → `[WARN]`「直连不可达（需代理或出口受限）」**（不影响整体退出码），只有主路径也不可用（未配 SearXNG / 探测失败）才 `[FAIL]`。
+
 ---
 
 ## 9. 日志与调试

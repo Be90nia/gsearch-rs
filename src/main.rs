@@ -411,7 +411,7 @@ async fn main() -> ExitCode {
             general::cmd_dl(&url, output.as_deref(), output_file.as_deref(), browser.into(), proxy.clone()).await
         }
         Command::Shell => shell::run_shell().await,
-        Command::Doctor { human, json, .. } => cmd_doctor(json && !human).await,
+        Command::Doctor { human, json, .. } => cmd_doctor(json && !human, proxy.clone()).await,
         Command::Verify { url, human, json, timeout, urls_file, .. } => {
             gsearch::verify::cmd_verify(&url, json && !human, proxy.as_deref(), timeout, urls_file.as_deref())
         }
@@ -484,6 +484,18 @@ impl SearchArgs {
     }
 }
 
+/// `--from K` 是否被当前输出形态消费（bd gsearch-rs-0z8：静默失效必须出提示，禁止）。
+/// 仅 `--browse N` 的默认 md 形态消费（跳过正文前 K 个空行分隔块）；`--full`（innerText 无分块）/
+/// `--json` / `--headings-only` / `--read N`（snippet 形态）都不消费。
+fn from_is_consumed(browse: bool, full: bool, json: bool, headings_only: bool) -> bool {
+    browse && !full && !json && !headings_only
+}
+
+/// `--from K` 在当前形态不消费时的 stderr 提示（与 browse 侧 general.rs 同款文案口径）。
+fn warn_from_not_consumed() {
+    eprintln!("[hint] --from K 仅 --browse N 默认 md 形态生效（跳过正文前 K 个空行分隔块）；当前形态（--read N snippet / --full / --json / --headings-only / batch 多查询）不消费 --from");
+}
+
 async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode> {
     // o1p：空 query 在客户端可知即非法——前置拒绝，不再白烧 6-11s 完整回退链
     if let Some(q) = first_blank_query(&args.query) {
@@ -530,6 +542,14 @@ async fn cmd_search(args: SearchArgs, proxy: Option<String>) -> Result<ExitCode>
     let cfg = gsearch::search::SearchConfig { query: query.clone(), limit: args.limit, recency };
     // v0.4.0：默认 md 排版；--json 强制 JSON；--human 显式要 md（与默认同）
     let json_mode = args.json && !args.human;
+    // p8r 同型（bd gsearch-rs-0z8）：--from K 仅 --browse N 默认 md 形态消费；其余形态
+    // （--read N 的 snippet 形态 / --browse N 的 --full|--json|--headings-only）不消费 → stderr
+    // 一行提示，禁止静默失效（与 browse 侧 general.rs 同款处理）。
+    if args.from.unwrap_or(0) > 0
+        && !from_is_consumed(args.browse.is_some(), args.full, json_mode, args.headings_only)
+    {
+        warn_from_not_consumed();
+    }
     // zc6：SearXNG 单次尝试四态——Results 直接用；CircuitBroken 熔断早退；
     // NotConfigured/FallbackGoogle 走原 Google 链（IP 正常时行为与旧版一致）。
     let searxng = gsearch::search::try_searxng(&cfg).await;
@@ -917,6 +937,10 @@ async fn cmd_search_batch(args: SearchArgs) -> Result<ExitCode> {
     }
     // v0.4.0：默认 md 排版；--json 强制 JSON；--human 显式要 md（与默认同）
     let json_mode = args.json && !args.human;
+    // batch 无浏览器路径（--browse 被拒）→ --from K 在此形态恒不消费，同样出提示（禁静默）。
+    if args.from.unwrap_or(0) > 0 {
+        warn_from_not_consumed();
+    }
     let started = std::time::Instant::now();
     let recency = args.recency.map(gsearch::search::Recency::from);
     let outcomes = gsearch::search::run_batch(&args.query, args.limit, recency).await;
@@ -1239,7 +1263,7 @@ fn record_check(
     checks.push(DoctorCheck { name, status, message, value });
 }
 
-async fn cmd_doctor(json: bool) -> Result<ExitCode> {
+async fn cmd_doctor(json: bool, proxy: Option<String>) -> Result<ExitCode> {
     let started = std::time::Instant::now();
     let mut checks: Vec<DoctorCheck> = Vec::new();
     let mut fail = 0;
@@ -1317,30 +1341,13 @@ async fn cmd_doctor(json: bool) -> Result<ExitCode> {
         record_check(&mut checks, &mut fail, &mut warn, "exit_ip_drift", DoctorStatus::Warn, drift, None);
     }
 
-    // 5) 网络连通（TCP connect google.com:443，2s 超时）
-    let (st, msg, val) = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        tokio::net::TcpStream::connect(("www.google.com", 443)),
-    )
-    .await
-    {
-        // 8lp③：值类检查——目标进 value
-        Ok(Ok(_)) => (
-            DoctorStatus::Ok,
-            String::new(),
-            Some("www.google.com:443".to_string()),
-        ),
-        Ok(Err(e)) => (
-            DoctorStatus::Fail,
-            format!("网络不可达 (www.google.com:443): {e}"),
-            None,
-        ),
-        Err(_) => (
-            DoctorStatus::Fail,
-            "网络连接超时 (www.google.com:443)".to_string(),
-            None,
-        ),
-    };
+    // 5) 网络连通（公网出口可达性）——分级（bd gsearch-rs-u45）
+    //    直连 google:443 不通 ≠ 整体不通：配了代理则经代理探测；仍不通时按主路径（SearXNG）健康度
+    //    分级——主路径健康 → WARN（表达「直连不可达（需代理或出口受限）」），主路径亦不可用 → FAIL。
+    //    SearXNG 探测因此提前到此处执行（分级需要「主路径是否可达」），记录仍在第 7 位（输出顺序不变）。
+    let searxng_probe = probe_searxng_check().await;
+    let reach = probe_network_reach(proxy.as_deref()).await;
+    let (st, msg, val) = classify_network(reach, searxng_probe.reachable);
     record_check(&mut checks, &mut fail, &mut warn, "network", st, msg, val);
 
     // 6) 生效 profile 来源检查（env > 配置文件 > default）
@@ -1374,54 +1381,17 @@ async fn cmd_doctor(json: bool) -> Result<ExitCode> {
     };
     record_check(&mut checks, &mut fail, &mut warn, "profile_source", st, msg, val);
 
-    // 7) SearXNG 健康度（ptb）：查询级探测抓「端点活但零结果」盲区——doctor 只查 TCP 查不出
-    let (st, msg, val) = if let Some(f) = gsearch::config::parse_failure() {
-        // vw2：配置解析失败时 searxng_url 必然丢失，SKIP「未配置」是谎报——显式 FAIL（rc=1 走既有 fail 汇总）
-        (
-            DoctorStatus::Fail,
-            format!(
-                "配置文件存在但解析失败（已忽略，回退默认）: {} ({})",
-                f.path.display(),
-                f.error
-            ),
-            None,
-        )
-    } else {
-        match gsearch::config::load().searxng_url.clone() {
-            None => (
-                DoctorStatus::Skip,
-                "SearXNG: 未配置（GSEARCH_SEARXNG_URL / gsearch.json searxng_url），跳过".to_string(),
-                None,
-            ),
-            Some(base) => {
-                let (st, msg, val) = match gsearch::searxng::probe(&base).await {
-                    Ok(p) if p.results > 0 => (
-                        DoctorStatus::Ok,
-                        format!(
-                            "SearXNG: HTTP {}, results={}, unresponsive_engines={} ({base})",
-                            p.http_status, p.results, p.unresponsive_engines
-                        ),
-                        None,
-                    ),
-                    Ok(p) => (
-                        DoctorStatus::Warn,
-                        format!(
-                            "SearXNG 可达但零结果（引擎降级/IP 信誉嫌疑）：HTTP {}, results=0, unresponsive_engines={} ({base})",
-                            p.http_status, p.unresponsive_engines
-                        ),
-                        None,
-                    ),
-                    Err(e) => (
-                        DoctorStatus::Warn,
-                        format!("SearXNG 探测失败: {e} ({base})"),
-                        None,
-                    ),
-                };
-                (st, msg, val)
-            }
-        }
-    };
-    record_check(&mut checks, &mut fail, &mut warn, "searxng", st, msg, val);
+    // 7) SearXNG 健康度（ptb）：查询级探测抓「端点活但零结果」盲区——doctor 只查 TCP 查不出。
+    //    探测已在第 5 项前完成（network 分级需要「主路径是否可达」），此处只记录——输出顺序不变。
+    record_check(
+        &mut checks,
+        &mut fail,
+        &mut warn,
+        "searxng",
+        searxng_probe.status,
+        searxng_probe.message,
+        searxng_probe.value,
+    );
 
     let elapsed_ms = started.elapsed().as_millis();
     if json {
@@ -1448,25 +1418,214 @@ async fn cmd_doctor(json: bool) -> Result<ExitCode> {
         ];
         gsearch::output::print_meta_header(&fields);
         for c in &checks {
-            let tag = match c.status {
-                DoctorStatus::Ok => "[OK]",
-                DoctorStatus::Warn => "[WARN]",
-                DoctorStatus::Fail => "[FAIL]",
-                DoctorStatus::Skip => "[SKIP]",
-            };
-            // 值类检查（message 缺席）取 value 作正文，散文检查取 message。
-            let detail = if !c.message.is_empty() {
-                c.message.clone()
-            } else {
-                c.value.clone().unwrap_or_default()
-            };
-            println!("- {tag} {}: {detail}", c.name);
+            println!("{}", doctor_check_line(c));
         }
     }
     if fail > 0 {
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// doctor 人读形态的一行（`- [OK] <检查名>: <说明>`）——与 JSON 形态**同源**（同一个
+/// DoctorCheck）：标签由 status 四态映射，正文取 message（散文检查）或 value（值类检查）。
+fn doctor_check_line(c: &DoctorCheck) -> String {
+    let tag = match c.status {
+        DoctorStatus::Ok => "[OK]",
+        DoctorStatus::Warn => "[WARN]",
+        DoctorStatus::Fail => "[FAIL]",
+        DoctorStatus::Skip => "[SKIP]",
+    };
+    let detail = if !c.message.is_empty() {
+        c.message.clone()
+    } else {
+        c.value.clone().unwrap_or_default()
+    };
+    format!("- {tag} {}: {detail}", c.name)
+}
+
+/// doctor 第 7 项（SearXNG）的探测结论。
+/// `reachable` = 搜索主路径是否可用：端点有响应即可用（零结果也算——引擎降级仍能搜）；
+/// 探测失败 / 未配置 / 配置解析失败 = 不可用。network 检查据此分级（bd gsearch-rs-u45）。
+struct SearxngProbe {
+    status: DoctorStatus,
+    message: String,
+    value: Option<String>,
+    reachable: bool,
+}
+
+/// SearXNG 健康度探测（doctor 第 7 项）。独立成函数：network 检查的分级需要先知道主路径
+/// 是否可达（探测提前执行），记录顺序仍在第 7 位——人读/JSON 输出逐字节不变。
+async fn probe_searxng_check() -> SearxngProbe {
+    if let Some(f) = gsearch::config::parse_failure() {
+        // vw2：配置解析失败时 searxng_url 必然丢失，SKIP「未配置」是谎报——显式 FAIL（rc=1 走既有 fail 汇总）
+        return SearxngProbe {
+            status: DoctorStatus::Fail,
+            message: format!(
+                "配置文件存在但解析失败（已忽略，回退默认）: {} ({})",
+                f.path.display(),
+                f.error
+            ),
+            value: None,
+            reachable: false,
+        };
+    }
+    let Some(base) = gsearch::config::load().searxng_url.clone() else {
+        return SearxngProbe {
+            status: DoctorStatus::Skip,
+            message: "SearXNG: 未配置（GSEARCH_SEARXNG_URL / gsearch.json searxng_url），跳过".to_string(),
+            value: None,
+            reachable: false,
+        };
+    };
+    match gsearch::searxng::probe(&base).await {
+        Ok(p) if p.results > 0 => SearxngProbe {
+            status: DoctorStatus::Ok,
+            message: format!(
+                "SearXNG: HTTP {}, results={}, unresponsive_engines={} ({base})",
+                p.http_status, p.results, p.unresponsive_engines
+            ),
+            value: None,
+            reachable: true,
+        },
+        Ok(p) => SearxngProbe {
+            status: DoctorStatus::Warn,
+            message: format!(
+                "SearXNG 可达但零结果（引擎降级/IP 信誉嫌疑）：HTTP {}, results=0, unresponsive_engines={} ({base})",
+                p.http_status, p.unresponsive_engines
+            ),
+            value: None,
+            reachable: true,
+        },
+        Err(e) => SearxngProbe {
+            status: DoctorStatus::Warn,
+            message: format!("SearXNG 探测失败: {e} ({base})"),
+            value: None,
+            reachable: false,
+        },
+    }
+}
+
+/// network 检查的探测目标（Google 代表公网出口）。
+const NET_TARGET: &str = "www.google.com:443";
+
+/// network 检查的探测结论。
+enum NetReach {
+    /// 可达（label = 人读/JSON 的值文案）
+    Reachable { label: String },
+    /// 直连不通（未配代理，或经代理也不通）
+    Unreachable {
+        /// 是否试过代理（文案区分「没配代理」与「代理也不通」）
+        proxy_tried: bool,
+        /// 直连失败的具体原因（超时 / 连接错误）
+        detail: String,
+    },
+}
+
+/// network 检查的探测：直连 TCP(2s) 优先（沿用旧语义与预算）；直连不通且配了代理则经代理再探一次。
+async fn probe_network_reach(proxy: Option<&str>) -> NetReach {
+    let direct = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect(("www.google.com", 443)),
+    )
+    .await;
+    let detail = match direct {
+        Ok(Ok(_)) => {
+            return NetReach::Reachable {
+                label: NET_TARGET.to_string(),
+            };
+        }
+        Ok(Err(e)) => format!("直连不可达 ({NET_TARGET}): {e}"),
+        Err(_) => format!("直连不可达 ({NET_TARGET}): 连接超时"),
+    };
+    let Some(p) = proxy else {
+        return NetReach::Unreachable {
+            proxy_tried: false,
+            detail,
+        };
+    };
+    let label = format!("{NET_TARGET}（经代理可达：{}）", gsearch::util::redact_proxy(p));
+    let p = p.to_string();
+    // curl 是同步子进程 → 放阻塞池，别占住 async worker。
+    match tokio::task::spawn_blocking(move || probe_via_proxy(&p)).await {
+        Ok(Ok(())) => NetReach::Reachable { label },
+        Ok(Err(e)) => NetReach::Unreachable {
+            proxy_tried: true,
+            detail: format!("{detail}；代理也不通（{e}）"),
+        },
+        Err(e) => NetReach::Unreachable {
+            proxy_tried: true,
+            detail: format!("{detail}；代理探测失败（{e}）"),
+        },
+    }
+}
+
+/// 经代理探测公网出口：curl 子进程（house 同款——verify.rs 依赖系统 curl 走 `--proxy`，零新依赖）。
+/// Ok = 经代理可达；Err = 不通 / curl 不可用。
+/// socks5:// → socks5h://：域名交给代理侧解析（与 Chrome SOCKS5 行为一致；本地 DNS 被污染时仍可通）。
+fn probe_via_proxy(proxy: &str) -> Result<()> {
+    let proxy = match proxy.strip_prefix("socks5://") {
+        Some(rest) => format!("socks5h://{rest}"),
+        None => proxy.to_string(),
+    };
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sS",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "4",
+            "--proxy",
+            &proxy,
+            "--",
+            "https://www.google.com/generate_204",
+        ])
+        .output()
+        .with_context(|| "curl 不可用（代理探测依赖系统 curl，Windows 10+ 自带）")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let code = out.status.code().unwrap_or(-1);
+    let err = String::from_utf8_lossy(&out.stderr);
+    let first = err.lines().next().unwrap_or("").trim();
+    Err(anyhow!(
+        "curl exit {code}{}",
+        if first.is_empty() {
+            String::new()
+        } else {
+            format!(": {first}")
+        }
+    ))
+}
+
+/// network 检查的分级（纯函数，便于单测）。
+/// 直连不通**不判整体 FAIL**：主路径（SearXNG）健康 → WARN（表达「直连不可达（需代理或出口受限）」）；
+/// 主路径亦不可用 → FAIL（真无出口）。
+fn classify_network(reach: NetReach, main_path_ok: bool) -> (DoctorStatus, String, Option<String>) {
+    match reach {
+        NetReach::Reachable { label } => (DoctorStatus::Ok, String::new(), Some(label)),
+        NetReach::Unreachable {
+            proxy_tried,
+            detail,
+        } => {
+            let status = if main_path_ok {
+                DoctorStatus::Warn
+            } else {
+                DoctorStatus::Fail
+            };
+            let proxy_note = if proxy_tried { "（经代理也不通）" } else { "" };
+            let tail = if main_path_ok {
+                "需代理或出口受限——SearXNG 主路径可达，整体网络可用"
+            } else {
+                "需代理或出口受限——SearXNG 主路径亦不可用（无可用出口）"
+            };
+            (
+                status,
+                format!("{detail}{proxy_note}：{tail}"),
+                None,
+            )
+        }
     }
 }
 
@@ -1535,7 +1694,10 @@ async fn fetch_public_ip() -> anyhow::Result<String> {
 mod tests {
     use super::check_exit_ip_drift;
     use super::resolve_humanize;
-    use super::{first_blank_query, site_warn_for, Cli, Command, RecencyArg};
+    use super::{
+        DoctorCheck, DoctorStatus, NET_TARGET, NetReach, classify_network, doctor_check_line,
+        first_blank_query, from_is_consumed, site_warn_for, Cli, Command, RecencyArg,
+    };
     use clap::Parser;
 
     /// P1 site: 检测：含 site: 限定符的 query 返回 Some(warn)；其他 None。
@@ -1578,6 +1740,85 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+
+    /// bd gsearch-rs-u45：network 分级——直连不通**不判整体 FAIL**（主路径健康 → WARN，
+    /// 文案表达「需代理或出口受限」）；主路径亦不可用 → FAIL；直连通 / 经代理通 → OK。
+    #[test]
+    fn classify_network_grades_by_main_path() {
+        // 直连通：OK 值类检查（message 缺席、数据进 value——8lp③ 契约不变）
+        let (st, msg, val) = classify_network(
+            NetReach::Reachable {
+                label: NET_TARGET.to_string(),
+            },
+            false,
+        );
+        assert!(matches!(st, DoctorStatus::Ok));
+        assert_eq!(val.as_deref(), Some(NET_TARGET));
+        assert!(msg.is_empty(), "ok 值类检查 message 应缺席: {msg}");
+
+        // 直连不通 + 主路径（SearXNG）健康 → WARN，不判 FAIL
+        let (st, msg, val) = classify_network(
+            NetReach::Unreachable {
+                proxy_tried: false,
+                detail: format!("直连不可达 ({NET_TARGET}): 连接超时"),
+            },
+            true,
+        );
+        assert!(matches!(st, DoctorStatus::Warn), "主路径健康时不得判 FAIL: {msg}");
+        assert!(msg.contains("需代理或出口受限"), "WARN 文案须说明需代理/出口受限: {msg}");
+        assert!(val.is_none(), "非 ok 不出 value");
+
+        // 直连不通 + 主路径亦不可用 → FAIL（真无出口）
+        let (st, msg, _) = classify_network(
+            NetReach::Unreachable {
+                proxy_tried: true,
+                detail: format!("直连不可达 ({NET_TARGET}): 连接超时"),
+            },
+            false,
+        );
+        assert!(matches!(st, DoctorStatus::Fail), "主路径不可用时应 FAIL: {msg}");
+        assert!(msg.contains("经代理也不通"), "FAIL 文案须区分代理已试仍不通: {msg}");
+    }
+
+    /// bd gsearch-rs-u45：doctor 人读与 JSON 两形态**同源**——行标签 ↔ JSON status 一致，
+    /// 值类检查（message 缺席）由 value 拼回正文，JSON 侧 message 键真缺席。
+    #[test]
+    fn doctor_human_line_and_json_status_agree() {
+        let warn = DoctorCheck {
+            name: "network",
+            status: DoctorStatus::Warn,
+            message: "直连不可达 (www.google.com:443)：需代理或出口受限".to_string(),
+            value: None,
+        };
+        let line = doctor_check_line(&warn);
+        assert!(line.starts_with("- [WARN] network: "), "{line}");
+        assert!(line.contains("需代理或出口受限"), "{line}");
+        let json = serde_json::to_string(&warn).unwrap();
+        assert!(json.contains("\"status\":\"warn\""), "{json}");
+        assert!(json.contains("直连不可达"), "{json}");
+
+        let ok = DoctorCheck {
+            name: "network",
+            status: DoctorStatus::Ok,
+            message: String::new(),
+            value: Some("www.google.com:443（经代理可达：socks5h://127.0.0.1:10808）".to_string()),
+        };
+        let line = doctor_check_line(&ok);
+        assert!(line.starts_with("- [OK] network: www.google.com:443"), "{line}");
+        let json = serde_json::to_string(&ok).unwrap();
+        assert!(json.contains("\"status\":\"ok\""), "{json}");
+        assert!(!json.contains("\"message\""), "ok 值类检查 message 键应缺席: {json}");
+    }
+
+    /// bd gsearch-rs-0z8：--from 仅 `--browse N` 默认 md 形态消费；其余形态必须出提示（禁静默）。
+    #[test]
+    fn from_is_consumed_only_in_browse_default_md() {
+        assert!(from_is_consumed(true, false, false, false), "--browse N 默认 md 形态消费");
+        assert!(!from_is_consumed(true, true, false, false), "--full 不消费");
+        assert!(!from_is_consumed(true, false, true, false), "--json 不消费");
+        assert!(!from_is_consumed(true, false, false, true), "--headings-only 不消费");
+        assert!(!from_is_consumed(false, false, false, false), "--read N snippet 形态不消费");
+    }
 
     /// o1p：空串/纯空白 query 前置拒绝——单查与 batch 两入口共用的入口校验纯函数。
     #[test]
