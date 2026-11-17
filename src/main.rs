@@ -114,6 +114,8 @@ enum Command {
         /// 显式 JSON 输出（v0.4.0 起默认 md 排版）。
         #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
+        /// 跳过正文前 K 个空行分隔块再输出（p8r：默认 md 形态生效；--json/--full/--headings-only
+        /// 不消费，stderr 提示）
         #[arg(long)]
         from: Option<usize>,
         #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true", action = clap::ArgAction::Set, group = "browse_mode")]
@@ -318,7 +320,7 @@ struct SearchArgs {
     /// 调低更敏感。正常查询不触发判定 → 输出与本特性引入前逐字节一致。
     #[arg(long, default_value_t = gsearch::search::DEFAULT_RELEVANCE_THRESHOLD, value_parser = clap::value_parser!(f64))]
     relevance_threshold: f64,
-    /// `--browse N --from K`：摘要段从第 K 段开始（1-based；默认 0 = 从首段）
+    /// `--browse N --from K`：跳过前 K 段后取最多 take_n 段的滑动窗口（p8r 语义修正；默认 0 = 原摘要）
     #[arg(long)]
     from: Option<usize>,
     /// `--browse N --headings-only`：只输出目录（最省 token fast path）

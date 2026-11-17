@@ -36,6 +36,10 @@ pub struct AdaptiveRead {
     pub headings: Vec<Heading>,
     /// 按文章长度动态选的段落全文：<10 段全给，10-50 给前 10 段，>50 给前 5 段。
     pub summary_paragraphs: Vec<String>,
+    /// p8r：全量段落（含空段，段号与 paragraph_index 1:1 对齐）——`--from K` 滑动窗口的基底。
+    /// 仅渲染层消费；`#[serde(skip)]` 保 v0.3.0 JSON 输出逐字节不变（cli_golden_bytes 契约）。
+    #[serde(skip)]
+    pub all_paragraphs: Vec<String>,
     /// 全文章段落首句 + 字数（agent 可针对性 `--from K` 拿指定段）。
     pub paragraph_index: Vec<Paragraph>,
     /// 9as：<pre> 代码块全文（文档页签名/Example 段；--read 一次拿齐，免 --full 二跑）。
@@ -77,6 +81,17 @@ const LONG_THRESHOLD: usize = 50;
 const CODE_EXAMPLE_MAX_BLOCKS: usize = 2;
 const CODE_EXAMPLE_BLOCK_MAX_CHARS: usize = 1500;
 
+/// 摘要/窗口段数：短文（<SHORT_MAX）全给，中等（≤LONG_THRESHOLD）给 MEDIUM_TAKE，长文给 LONG_TAKE。
+fn summary_take_n(total: usize) -> usize {
+    if total < SHORT_MAX {
+        total
+    } else if total <= LONG_THRESHOLD {
+        MEDIUM_TAKE
+    } else {
+        LONG_TAKE
+    }
+}
+
 /// 从 HTML 提取 AdaptiveRead。url/title 由调用方拿到 HTML 后补（HTML <title> 不一定可信）。
 /// excerpt_chars：Some(N) = paragraph_index 每项附该段前 N 字符（html 已被调用方 cap 过
 /// read_max_chars，excerpt 总量天然受总 cap 约束）。
@@ -110,13 +125,7 @@ pub fn extract_adaptive(html: &str, excerpt_chars: Option<usize>) -> AdaptiveRea
         .collect();
 
     let total = all_paragraphs.len();
-    let take_n = if total < SHORT_MAX {
-        total
-    } else if total <= LONG_THRESHOLD {
-        MEDIUM_TAKE
-    } else {
-        LONG_TAKE
-    };
+    let take_n = summary_take_n(total);
     let summary_paragraphs: Vec<String> = all_paragraphs
         .iter()
         .take(take_n)
@@ -158,6 +167,7 @@ pub fn extract_adaptive(html: &str, excerpt_chars: Option<usize>) -> AdaptiveRea
         title: String::new(),
         headings,
         summary_paragraphs,
+        all_paragraphs,
         paragraph_index,
         code_examples,
     }
@@ -282,7 +292,9 @@ fn first_sentence(p: &str) -> String {
     p.trim().to_string()
 }
 
-/// 渲染三段（目录 + 摘要 + 段落索引）。`from_offset` 是 `--from K`，对摘要起点偏移。
+/// 渲染三段（目录 + 摘要 + 段落索引）。`from_offset` 是 `--from K`：
+/// 0 = 原摘要逐字节不变；K > 0 = 跳过全文前 K 段、从第 K+1 段起取最多 take_n 段的滑动窗口
+/// （p8r：窗口大小不随 K 缩水，长文尾部可达；K 越过全量段数 → 明确越界标注）。
 pub fn format_adaptive(read: &AdaptiveRead, from_offset: usize) -> String {
     let mut out = String::new();
     out.push_str(&format!("=== {} | {} ===\n", read.url, read.title));
@@ -305,19 +317,24 @@ pub fn format_adaptive(read: &AdaptiveRead, from_offset: usize) -> String {
         out.push('\n');
     }
 
-    // [摘要]（按 from 偏移）
-    let summary: Vec<&String> = read
-        .summary_paragraphs
-        .iter()
-        .skip(from_offset)
-        .collect();
+    // [摘要]（--from K = 跳过全文前 K 段取最多 take_n 段的滑动窗口；0 = 原摘要）
+    let summary: Vec<&String> = if from_offset == 0 {
+        read.summary_paragraphs.iter().collect()
+    } else {
+        read.all_paragraphs
+            .iter()
+            .skip(from_offset)
+            .take(summary_take_n(read.all_paragraphs.len()))
+            .filter(|p| !p.is_empty())
+            .collect()
+    };
     if summary.is_empty() {
         if read.summary_paragraphs.is_empty() {
             out.push_str("[摘要]\n(无段落)\n\n");
         } else {
             out.push_str(&format!(
-                "[摘要]\n(--from {from_offset} 越界，共 {} 段)\n\n",
-                read.summary_paragraphs.len()
+                "[摘要]\n(--from {from_offset} 越界，全文共 {} 段)\n\n",
+                read.all_paragraphs.len()
             ));
         }
     } else {
@@ -557,27 +574,59 @@ mod tests {
         assert!(out.contains("..另 80 段省略"));
     }
 
+    /// p8r：滑窗断言用摘要节切片（[摘要] 到 [段落索引] 之间）。
+    fn summary_section_of(out: &str) -> &str {
+        let start = out.find("[摘要").unwrap();
+        let end = out.find("[段落索引").unwrap();
+        &out[start..end]
+    }
+
+    /// p8r：--from K = 跳过全文前 K 段、从第 K+1 段起取最多 take_n 段的滑动窗口
+    /// （窗口大小不随 K 缩水；段落索引仍全量）。
     #[test]
-    fn format_adaptive_from_offset_skips_summary_lead() {
+    fn format_adaptive_from_window_slides() {
         let paras = empty_paragraphs(100);
         let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
         let html = build_html(&refs, &["h1Title"]);
         let mut read = extract_adaptive(&html, None);
         read.url = "u".into();
         read.title = "t".into();
-        // --from 3：摘要从第 3 段开始（共 LONG_TAKE - 3 = 2 段）
+        // --from 3：跳过 3 段，窗口 = 第 4..8 段（LONG_TAKE=5 段，不缩水）
         let out = format_adaptive(&read, 3);
-        // 段落索引仍然全量（段1 "Paragraph number 1" 必在索引段里）
-        assert!(out.contains("段1 "));
-        // 摘要段跳过 3 段，应只剩 "Paragraph number 4" 和 "5"
-        let summary_section_start = out.find("[摘要").unwrap();
-        let index_section_start = out.find("[段落索引").unwrap();
-        let summary_section = &out[summary_section_start..index_section_start];
-        assert!(!summary_section.contains("Paragraph number 1."));
-        assert!(!summary_section.contains("Paragraph number 2."));
-        assert!(!summary_section.contains("Paragraph number 3."));
+        let summary_section = summary_section_of(&out);
         assert!(summary_section.contains("Paragraph number 4."));
-        assert!(summary_section.contains("Paragraph number 5."));
+        assert!(summary_section.contains("Paragraph number 8."));
+        assert!(!summary_section.contains("Paragraph number 3."));
+        assert!(!summary_section.contains("Paragraph number 9."));
+        assert_eq!(
+            summary_section.matches("Paragraph number").count(),
+            LONG_TAKE,
+            "窗口大小恒 = take_n，不随 --from 缩水"
+        );
+        // 段落索引仍然全量（段1 在索引段里）
+        assert!(out.contains("段1 "));
+    }
+
+    /// p8r：--from 越界行为明确（越过全量段数 → 越界标注，不 panic、不回退全文）；
+    /// 尾部边界可达（--from 99 → 窗口只剩第 100 段）。
+    #[test]
+    fn format_adaptive_from_out_of_range_marks_boundary() {
+        let paras = empty_paragraphs(100);
+        let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
+        let html = build_html(&refs, &["h1Title"]);
+        let mut read = extract_adaptive(&html, None);
+        read.url = "u".into();
+        read.title = "t".into();
+        let out = format_adaptive(&read, 99999);
+        let summary_section = summary_section_of(&out);
+        assert!(summary_section.contains("越界"), "越界要有明确标注: {summary_section}");
+        assert!(summary_section.contains("100 段"), "标注全文段数: {summary_section}");
+        assert!(!summary_section.contains("Paragraph number"), "越界不得回退输出全文");
+        // 尾部可达：100 段 --from 99 → 窗口只剩第 100 段
+        let out = format_adaptive(&read, 99);
+        let summary_section = summary_section_of(&out);
+        assert!(summary_section.contains("Paragraph number 100."));
+        assert_eq!(summary_section.matches("Paragraph number").count(), 1);
     }
 
     /// e1i：--excerpt opt-in——Some(N) 填该段前 N 字符实际文本；None 时 excerpt 键

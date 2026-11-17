@@ -50,6 +50,18 @@ fn pick<'a>(results: &'a [SearchResult], n: usize, flag: &str) -> Result<&'a str
         assert_eq!(md_page_section("t", body, 3), "# t\n\n\n");
     }
 
+    /// p8r：md_page_section 契约（browse 默认 md 路径接线所依赖）——from=0 输出与旧
+    /// `println!("# {t}\n\n{body}")` 逐字节一致；from=K 跳过正文前 K 个空行分隔块；
+    /// from 越过块数 → 正文为空（不 panic、不回退全文）。
+    #[test]
+    fn md_page_section_from_skips_blocks() {
+        let body = "b1\n\nb2\n\nb3";
+        assert_eq!(md_page_section("t", body, 0), "# t\n\nb1\n\nb2\n\nb3\n");
+        assert_eq!(md_page_section("t", body, 1), "# t\n\nb2\n\nb3\n");
+        assert_eq!(md_page_section("t", body, 2), "# t\n\nb3\n");
+        assert_eq!(md_page_section("t", body, 3), "# t\n\n\n");
+    }
+
 }
 
 /// `--open N`：默认浏览器开窗。
